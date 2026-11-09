@@ -24,6 +24,7 @@ describe("format", () => {
     expect(formatCost(0.0012)).toBe("$0.0012");
     expect(formatCost(0)).toBe("$0.0000");
     expect(formatCost(123.456)).toBe("$123.46");
+    expect(formatCost(0.00001785)).toBe("$0.000018");
   });
   it("formats tokens compactly", () => {
     expect(formatTokens(950)).toBe("950");

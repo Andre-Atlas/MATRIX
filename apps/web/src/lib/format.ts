@@ -10,6 +10,8 @@ export function formatDuration(ms: number): string {
 export function formatCost(usd: number): string {
   if (!Number.isFinite(usd)) return "—";
   if (usd >= 100) return `$${usd.toFixed(2)}`;
+  // Real LLM calls often cost a fraction of 0.01 cent; keep two significant digits instead of "$0.0000".
+  if (usd > 0 && usd < 0.0001) return `$${usd.toPrecision(2)}`;
   return `$${usd.toFixed(4)}`;
 }
 
