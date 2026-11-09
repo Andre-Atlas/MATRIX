@@ -42,7 +42,7 @@ services:
 
   api:
     build: ../server
-    command: ["matrix-api"]
+    command: ["sh", "-c", "alembic upgrade head && exec matrix-api"]
     environment: &server-env
       MATRIX_DATABASE_URL: postgresql+psycopg://matrix:matrix@postgres:5432/matrix
       MATRIX_SPAN_STORE: clickhouse
@@ -50,6 +50,11 @@ services:
       MATRIX_ADMIN_TOKEN: ${MATRIX_ADMIN_TOKEN:-}
     ports:
       - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -61,10 +66,8 @@ services:
     command: ["matrix-worker"]
     environment: *server-env
     depends_on:
-      clickhouse:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
+      api:
+        condition: service_healthy  # migrations run in the api container first
 
   web:
     build: ../apps/web
