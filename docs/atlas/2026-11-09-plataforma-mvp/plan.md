@@ -35,25 +35,25 @@ F0 → F1 → F2 ∥ (T09–T11) → T12 → F5 → F3 → F6 → T18. Backend e
 
 ## Tarefas
 
-- [ ] **T01** `[arch] · C4` — ADRs: protocolo OTLP+OpenInference; armazenamento poliglota; fila de jobs; stack (FastAPI + Next.js); multi-tenant por chave de projeto.
-- [ ] **T02** `[core] · C2` — `server/` (uv, FastAPI, pytest, ruff), `sdk/python/`, `apps/web/` (Next.js + vitest), `deploy/compose.yaml`, `Makefile` (`make test`, `make dev`), `.github/workflows/ci.yml`.
-- [ ] **T03** `[arch] · C5` — decodificar OTLP protobuf/JSON; mapear atributos OpenInference (`openinference.span.kind`, `llm.*`, `input.*`, `output.*`, `retrieval.documents.*`, `tool.*`, `session.id`, `user.id`, mensagens e imagens); truncamento; `SpanStore` com `MemorySpanStore` e `ClickHouseSpanStore` (schema e migração); testes com fixtures OTLP reais.
-- [ ] **T04** `[core] · C4` — tabela de projetos e chaves (hash SHA-256, prefixo, `hmac.compare_digest`); dependência FastAPI; endpoints admin; CLI `matrix-admin`; teste de isolamento entre projetos.
-- [ ] **T05** `[core] · C3` — `prices.json` (input, output, cache read/write por 1M tokens) para modelos comuns; custo por span e por trace; override por variável de ambiente.
-- [ ] **T06** `[core] · C3` — endpoints de traces, sessões, stats e scores do contrato.
-- [ ] **T07** `[core] · C3` — `matrix_sdk.init(...)`, `score(...)`, `get_prompt(...)` (cache), exemplo instrumentado.
-- [ ] **T08** `[design] · C4` — páginas de traces, detalhe (waterfall com TTFT, grafo de agentes, painel do span: mensagens, documentos, ferramenta, mídia, atributos), sessões, visão geral.
-- [ ] **T09** `[arch] · C4` — SQLAlchemy: prompts, datasets, itens, experimentos, resultados, scores, anotações, regras, avaliações online, alertas, jobs; fila `jobs` com `FOR UPDATE SKIP LOCKED` (no SQLite, lock otimista).
-- [ ] **T10** `[core] · C4` — métricas determinísticas e com juiz (faithfulness por proposições, answer relevancy por perguntas reversas + embeddings, context precision, G-Eval); providers `openai`, `anthropic`, `fake`.
-- [ ] **T11** `[core] · C4` — `POST /experiments` enfileira; worker executa variantes × itens, pontua, resume, compara com baseline.
-- [ ] **T12** `[design] · C4` — páginas de datasets, botão "adicionar ao dataset" no span, criação de experimento e matriz com diff e regressões.
-- [ ] **T13** `[core] · C3` — fila de anotação, regras avaliadas na ingestão e na chegada de scores, export DPO e regressão.
-- [ ] **T14** `[design] · C3` — página da fila: trace, notas, correção, salvar como regressão/DPO.
-- [ ] **T15** `[core] · C3` — API de prompts com versões imutáveis e labels; SDK com cache TTL e refresh em segundo plano.
-- [ ] **T16** `[design] · C3` — páginas de prompts, versões, diff e mover label.
-- [ ] **T17** `[core] · C4` — avaliações online: amostragem determinística por trace, job de score, regras de alerta.
-- [ ] **T18** `[core] · C3` — `examples/rag_demo.py` gera tráfego; roteiro que verifica os 6 critérios de pronto.
+- [x] **T01** `[arch] · C4` — ADRs: protocolo OTLP+OpenInference; armazenamento poliglota; fila de jobs; stack (FastAPI + Next.js); multi-tenant por chave de projeto.
+- [x] **T02** `[core] · C2` — `server/` (uv, FastAPI, pytest, ruff), `sdk/python/`, `apps/web/` (Next.js + vitest), `deploy/compose.yaml`, `Makefile` (`make test`, `make dev`), `.github/workflows/ci.yml`.
+- [x] **T03** `[arch] · C5` — decodificar OTLP protobuf/JSON; mapear atributos OpenInference (`openinference.span.kind`, `llm.*`, `input.*`, `output.*`, `retrieval.documents.*`, `tool.*`, `session.id`, `user.id`, mensagens e imagens); truncamento; `SpanStore` com `MemorySpanStore` e `ClickHouseSpanStore` (schema e migração); testes com fixtures OTLP reais.
+- [x] **T04** `[core] · C4` — tabela de projetos e chaves (hash SHA-256, prefixo, `hmac.compare_digest`); dependência FastAPI; endpoints admin; CLI `matrix-admin`; teste de isolamento entre projetos.
+- [x] **T05** `[core] · C3` — `prices.json` (input, output, cache read/write por 1M tokens) para modelos comuns; custo por span e por trace; override por variável de ambiente.
+- [x] **T06** `[core] · C3` — endpoints de traces, sessões, stats e scores do contrato.
+- [x] **T07** `[core] · C3` — `matrix_sdk.init(...)`, `score(...)`, `get_prompt(...)` (cache), exemplo instrumentado.
+- [x] **T08** `[design] · C4` — páginas de traces, detalhe (waterfall com TTFT, grafo de agentes, painel do span: mensagens, documentos, ferramenta, mídia, atributos), sessões, visão geral.
+- [x] **T09** `[arch] · C4` — SQLAlchemy: prompts, datasets, itens, experimentos, resultados, scores, anotações, regras, avaliações online, alertas, jobs; fila `jobs` com `FOR UPDATE SKIP LOCKED` (no SQLite, lock otimista).
+- [x] **T10** `[core] · C4` — métricas determinísticas e com juiz (faithfulness por proposições, answer relevancy por perguntas reversas + embeddings, context precision, G-Eval); providers `openai`, `anthropic`, `fake`.
+- [x] **T11** `[core] · C4` — `POST /experiments` enfileira; worker executa variantes × itens, pontua, resume, compara com baseline.
+- [x] **T12** `[design] · C4` — páginas de datasets, botão "adicionar ao dataset" no span, criação de experimento e matriz com diff e regressões.
+- [x] **T13** `[core] · C3` — fila de anotação, regras avaliadas na ingestão e na chegada de scores, export DPO e regressão.
+- [x] **T14** `[design] · C3` — página da fila: trace, notas, correção, salvar como regressão/DPO.
+- [x] **T15** `[core] · C3` — API de prompts com versões imutáveis e labels; SDK com cache TTL e refresh em segundo plano.
+- [x] **T16** `[design] · C3` — páginas de prompts, versões, diff e mover label.
+- [x] **T17** `[core] · C4` — avaliações online: amostragem determinística por trace, job de score, regras de alerta.
+- [x] **T18** `[core] · C3` — `examples/rag_demo.py` gera tráfego; roteiro que verifica os 6 critérios de pronto.
 
 ## Estado para retomada
 
-Atualizado a cada fatia no ledger (seção "Progresso").
+Todas as tarefas concluídas; ver [report.md](report.md).

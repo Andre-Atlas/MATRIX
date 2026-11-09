@@ -48,3 +48,8 @@ Formato: `T<n> · [tag] · C<n> → modelo/esforço (papel)`.
 - T18 · [core] · C3 → sonnet/medium (implementer)
 - Revisão backend T09–T17 · C4 → opus/medium (security-reviewer): 4 HIGH (lease sem renovação, ReDoS na métrica regex, hooks de score ausentes no worker, sem limite de corpo nas rotas JSON), 2 MEDIUM. Sem IDOR nem SSRF.
 - Correção backend · C4 → opus/medium (implementer) — 1ª rodada
+- Correção backend concluída: 479 testes; `make demo` passa os 6 critérios.
+- Integração web × API real · C3 → sonnet/medium: contrato bateu; corrigidos navegação na mesma rota (remoção dos `loading.tsx`) e `formatCost` abaixo de $0.0001.
+- Ruling: `loading.tsx` removidos porque, com latência real, a navegação na mesma rota no Next 15.5.29 não atualizava a UI (reproduzido também em mock com 30 ms de atraso) — funcionalidade antes de skeleton — custo: sem indicador de carregamento até investigar/atualizar o Next.
+- Ruling: CI do servidor roda contra Postgres e ClickHouse reais e verifica `alembic check` — custo: ~1 min a mais por execução.
+- Nenhum escalonamento de nível foi necessário (nenhuma tarefa falhou duas vezes).
