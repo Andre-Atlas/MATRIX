@@ -1,0 +1,63 @@
+"""Evaluation engine (ADR-005): providers, judges and metrics. Pure library, no DB."""
+
+from matrix_server.evals.judge import (
+    HeuristicJudge,
+    Judge,
+    JudgeParseError,
+    LLMJudge,
+    extract_json,
+    logprob_weighted_score,
+)
+from matrix_server.evals.metrics import (
+    METRIC_TYPES,
+    EvalCase,
+    EvalDeps,
+    Metric,
+    MetricResult,
+    build_metric,
+    case_question,
+    evaluate_case,
+    register_metric,
+)
+from matrix_server.evals.providers import (
+    AnthropicProvider,
+    Completion,
+    Embedder,
+    FakeProvider,
+    HashingEmbedder,
+    LLMProvider,
+    OpenAICompatibleProvider,
+    OpenAIEmbedder,
+    ProviderError,
+    get_provider,
+    register_provider,
+)
+
+__all__ = [
+    "METRIC_TYPES",
+    "AnthropicProvider",
+    "Completion",
+    "Embedder",
+    "EvalCase",
+    "EvalDeps",
+    "FakeProvider",
+    "HashingEmbedder",
+    "HeuristicJudge",
+    "Judge",
+    "JudgeParseError",
+    "LLMJudge",
+    "LLMProvider",
+    "Metric",
+    "MetricResult",
+    "OpenAICompatibleProvider",
+    "OpenAIEmbedder",
+    "ProviderError",
+    "build_metric",
+    "case_question",
+    "evaluate_case",
+    "extract_json",
+    "get_provider",
+    "logprob_weighted_score",
+    "register_metric",
+    "register_provider",
+]
