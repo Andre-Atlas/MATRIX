@@ -138,4 +138,6 @@ def require_admin(request: Request) -> None:
     scheme, _, value = auth.partition(" ")
     provided = value.strip() if scheme.lower() == "bearer" else ""
     if not hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8")):
-        raise HTTPException(status_code=401, detail="invalid admin token", headers={"WWW-Authenticate": "Bearer"})
+        raise HTTPException(
+            status_code=401, detail="invalid admin token", headers={"WWW-Authenticate": "Bearer"}
+        )

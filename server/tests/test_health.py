@@ -19,7 +19,9 @@ def test_health(tmp_path):
 def test_create_project_then_ingest_end_to_end(tmp_path):
     app = _app(tmp_path)
     client = TestClient(app)
-    created = client.post("/api/v1/admin/projects", json={"name": "demo"}, headers={"Authorization": "Bearer adm"})
+    created = client.post(
+        "/api/v1/admin/projects", json={"name": "demo"}, headers={"Authorization": "Bearer adm"}
+    )
     assert created.status_code == 201
     key = created.json()["api_key"]
     project_id = created.json()["project"]["id"]

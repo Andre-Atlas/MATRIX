@@ -138,9 +138,6 @@ def compute_cost(
     cw = max(int(cache_write_tokens or 0), 0)
     uncached = max(inp - cr, 0)
     total = (
-        uncached * price.input
-        + cr * price.cache_read
-        + cw * price.cache_write
-        + out * price.output
+        uncached * price.input + cr * price.cache_read + cw * price.cache_write + out * price.output
     ) / 1_000_000
     return max(round(total, 8), 0.0)

@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 
-from matrix_server.api import admin, ingest
+from matrix_server.api import admin, ingest, query
 from matrix_server.config import Settings, get_settings
 from matrix_server.storage.db import init_db, make_engine, make_session_factory
 from matrix_server.storage.spans import build_span_store
@@ -23,4 +23,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(ingest.router)
     app.include_router(admin.router)
+    app.include_router(query.router)
     return app

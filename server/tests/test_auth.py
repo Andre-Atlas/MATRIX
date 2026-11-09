@@ -166,7 +166,11 @@ def test_current_project_missing_or_invalid_does_not_leak(session_factory, proje
     resp = client.get("/whoami")
     assert resp.status_code == 401
     bad = key[:-4] + "zzzz"
-    for headers in ({"Authorization": f"Bearer {bad}"}, {"x-matrix-api-key": bad}, {"Authorization": "Basic x"}):
+    for headers in (
+        {"Authorization": f"Bearer {bad}"},
+        {"x-matrix-api-key": bad},
+        {"Authorization": "Basic x"},
+    ):
         resp = client.get("/whoami", headers=headers)
         assert resp.status_code == 401
         assert bad not in resp.text and key.split("_")[1] not in resp.text
