@@ -1,0 +1,282 @@
+{
+  "version": 1,
+  "skills": {
+    "accessibility": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "e671c9f1bda721f4818ed62984d8471aab33263ed3fc8331c42d51f4b070e407"
+    },
+    "agent-architecture-audit": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "8db8e5f849a924a58080345423ad6ed5f383a3bbd7b6f8ba842cf2dc917ebda2"
+    },
+    "api-design": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "9b3dda8b2e808315bb308ee7d492dd0f5171f78a169120de1f06613964ef8a5d"
+    },
+    "architecture-decision-records": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "6445f8dea6792460ab29da38a9a055a2957b7fc73defebd663d3bf059b638c56"
+    },
+    "atlas-dispatch": {
+      "source": "../ATLAS",
+      "sourceType": "local",
+      "computedHash": "2b4a8a4e9340a5c19ccae6d83bee3927a69d12be056aa9488adb524ee58fe476"
+    },
+    "atlas-lane-architecture": {
+      "source": "../ATLAS",
+      "sourceType": "local",
+      "computedHash": "8ca0555a44e778eaea10a257a941acddfebfdbf0babd0ba08d3f65c8a9b527f5"
+    },
+    "atlas-lane-audit": {
+      "source": "../ATLAS",
+      "sourceType": "local",
+      "computedHash": "a0d6f8f30ca771ef59308f6396eb4daebb312c46ee91694da1cc26bf34dbb524"
+    },
+    "atlas-lane-design": {
+      "source": "../ATLAS",
+      "sourceType": "local",
+      "computedHash": "3c764fa3671803da5d55d889745e20516a24676a289205070015688e52a02a42"
+    },
+    "atlas-maestro": {
+      "source": "../ATLAS",
+      "sourceType": "local",
+      "computedHash": "88ca0f529690c360ecc070cea497f0f4b37c6adb71914cff27491b3326d9b0ee"
+    },
+    "backend-patterns": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "45bf0c6abd0549b56142690f49437bc59c7b4f55b62dc7717ef295ec6ed6617f"
+    },
+    "blueprint": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "c472e64befeb8291f2f3c44e2ff89fa9225b247321e8160347ae84609d783f1f"
+    },
+    "brainstorming": {
+      "source": "../superpowers",
+      "sourceType": "local",
+      "computedHash": "fc6339f0e5b48c63279bd4f6c6340db55301b69ccc37a13e1e52bd5b3062746c"
+    },
+    "brand-discovery": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "e9e5bba6b38ba0f9a7206d760c0469a6bac56629c2a68d0cadbc618442df0518"
+    },
+    "click-path-audit": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "5a3e02c991de328feb1f5e614697deb30a3965169d19a68b90036cedeffabaaa"
+    },
+    "coding-standards": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "94f8d33db00faef148fb7a9f88c2e37e4d2afe109cdb9978b06fe280892de405"
+    },
+    "contract-first": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "623f9f532257b79f6500915b54abc332b2fd19f5ae3a0da843ce39006acb6602"
+    },
+    "council": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "7c2d224f8613646bf39e0360c199a681e504f808891050046936d0bac33417e7"
+    },
+    "database-migrations": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "7b41cfe3b19defa8d84f14e28c2d73af807842f7fd28c5155ea3666b395fc948"
+    },
+    "design-system": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "2aeb537315bb54bbdc155aa369be3febe65b2d1bcccec0caa905971d33e78126"
+    },
+    "dev-team": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "436f635df13d548ea487db2fdc51fcbb0a5d56fdad091c6d319f23fdaa6964a4"
+    },
+    "dispatching-parallel-agents": {
+      "source": "../superpowers",
+      "sourceType": "local",
+      "computedHash": "b011107f17188e0b2898bb1856b5bac8b49537cc86e737c82126558a235bd62a"
+    },
+    "django-patterns": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "93fc4501b3dfc6fae1e40dc8b0114681838e308ddb865966bfcd57125df7b2d5"
+    },
+    "e2e-testing": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "ae1a9cb885532edccb80682df28f269ada8bda86deedd00b282a82b03e011b2e"
+    },
+    "executing-plans": {
+      "source": "../superpowers",
+      "sourceType": "local",
+      "computedHash": "ebf526e8565d02852f57f473bfb97c1baf142d4afe97dc6d169e966514382963"
+    },
+    "fastapi-patterns": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "88b3727902263469db5fb9a4f170714ab9e6d5e49d4c959d98420d009fca3e30"
+    },
+    "find-skills": {
+      "source": "Andre-Atlas/skills",
+      "ref": "13e4063a1cf913f5606d57d42ab83a86f5001e04",
+      "sourceType": "github",
+      "skillPath": "skills/find-skills/SKILL.md",
+      "computedHash": "913b9d37d0d54047dd65222bb8c67b2bf04e3cb87dcad1729068d7a8b2c8c396"
+    },
+    "finishing-a-development-branch": {
+      "source": "../superpowers",
+      "sourceType": "local",
+      "computedHash": "4f571e7befb8b0946d9d7770232c818812412e9ab1dfb811f847edfba1fc6275"
+    },
+    "frontend-a11y": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "da9365797c4e5668a8384e271f0398e8241f66c9c18389af11f87890a49c630f"
+    },
+    "frontend-design-direction": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "cc51d244e53ab937b6cca66f3a299e66b8517360312efe363028e2340ec78578"
+    },
+    "frontend-patterns": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "cda7d74619e78bc6c58e7f7f4fa7a9d831ec71ae4629550e4d7b53876692e4d3"
+    },
+    "git-workflow": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "f44e488fd739565c1613b8dcc84a0f0ed224905e380265c42feebcea97b8c489"
+    },
+    "hexagonal-architecture": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "9bcc7b90143ab607eb6dbac67df028c9d8c7303e787395da5b2ef311f52e55eb"
+    },
+    "intent-driven-development": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "d6e4de51ec724a67d51264b09d06d8208c8046453b8a46dbf9a8e9a2dea1d7c6"
+    },
+    "make-interfaces-feel-better": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "bd14931fa4a2739cc81633027dfc829d10034c81a6d63ebd4baa39512df28cfb"
+    },
+    "nextjs-turbopack": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "7c0a0cc66806d6594c385f4e80419a305027065b852d48fe2cf91540ebea660c"
+    },
+    "product-capability": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "126569a04b17b0f86c41f9566fc397c6c9ab3bd5895875165a5ff4bbc896a125"
+    },
+    "production-audit": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "3c38cf12fdb504f6ce53fa9d33f4f0fff1aee3df8e96fbb4fdb76831b5fd51ce"
+    },
+    "python-patterns": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "3ce7d51e18d3e2fa79635e569e73a8d269bc484ff1095fae7c414543f023e95e"
+    },
+    "python-testing": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "6e28d59012e98e0f8afe387807074730267047dddc1c1df2934fb5c061b21428"
+    },
+    "react-patterns": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "44d2c6304ff7ea20643a0203b74de9c7a42e1f70a2b73a5762500dea385dfc44"
+    },
+    "react-performance": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "7b5b19e9c15a6b442fa0e7a0a1cb7ced951ab5872a96ff876b099b6bdfc9ae86"
+    },
+    "react-testing": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "59bd15f26f018d6629557108f936ab691af887508ae71b9d339855e49e337012"
+    },
+    "receiving-code-review": {
+      "source": "../superpowers",
+      "sourceType": "local",
+      "computedHash": "59361179fc9225173e0c145ffd9bafbf9fdbf8b43ce3dc308497a0b4f83a6063"
+    },
+    "requesting-code-review": {
+      "source": "../superpowers",
+      "sourceType": "local",
+      "computedHash": "b095ac8c980339436b41de9989328f3f288f2e2a70452df28452bbeb6531d604"
+    },
+    "search-first": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "98f6910f64c6950f12effc903844a0aa82d964ae24af6160a5bdbfee45c8d066"
+    },
+    "security-review": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "90f2b514aa106496fd0911d2a0e0ef5aac28515ce218a82574984ad7d9d6b4d2"
+    },
+    "security-scan": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "5e79fba8b1645970faff3db070f1edf72de3a52011ba3a25bb8be5a61b0cd7ec"
+    },
+    "skill-scout": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "de5198258963565835175b4429f9c1ea7ac5c21c5ab0c3cc4646bb1826a83951"
+    },
+    "subagent-driven-development": {
+      "source": "../superpowers",
+      "sourceType": "local",
+      "computedHash": "71259c008c49ff734e64c61045f1aa235b9aa99642a9aca9398beb775f6c59c5"
+    },
+    "systematic-debugging": {
+      "source": "../superpowers",
+      "sourceType": "local",
+      "computedHash": "276fb0aadb002ab930cc2a56de89e16995a2e3e70b33587652bf0a5fb123148d"
+    },
+    "test-driven-development": {
+      "source": "../superpowers",
+      "sourceType": "local",
+      "computedHash": "3cfe4ebb6fa7288f668d87880d279c8e48f7a92b63415e296857060f5ce22e05"
+    },
+    "using-git-worktrees": {
+      "source": "../superpowers",
+      "sourceType": "local",
+      "computedHash": "48c8a1040e378e0cb7208107294e3afa9067b9370c3f33b49a443eb6b7528b0d"
+    },
+    "verification-before-completion": {
+      "source": "../superpowers",
+      "sourceType": "local",
+      "computedHash": "b529822bdac4b197b180fe12225cff86b930b65910435103c10622df7f041651"
+    },
+    "verification-loop": {
+      "source": "../ECC",
+      "sourceType": "local",
+      "computedHash": "8337a8925d3eb16e97080f6fd9166d7548e51f6fc70d06dcf67786a240da9c2a"
+    },
+    "writing-plans": {
+      "source": "../superpowers",
+      "sourceType": "local",
+      "computedHash": "c2647b5bf067be353a893e5a39a632cbbeb7ad81e61fa5ae227ece5490029073"
+    }
+  }
+}

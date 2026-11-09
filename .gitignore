@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.db
+node_modules/
+.next/
+apps/web/next-env.d.ts
+dist/
+.env
+.env.local
+coverage/
