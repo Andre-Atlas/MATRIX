@@ -1,0 +1,210 @@
+"""Worker handler for `online_eval.score` jobs: judge one sampled span and record a Score.
+
+Judge selection: the online eval's `model` ({provider, name}) when set, else the environment
+(`MATRIX_JUDGE_PROVIDER`, `MATRIX_JUDGE_MODEL`, default `fake`). Provider `fake` uses the offline
+heuristic judge. API keys are read from environment variables by the providers and never stored;
+`MATRIX_JUDGE_BASE_URL` (env only) points the OpenAI-compatible provider at another endpoint.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import threading
+from typing import Any
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from matrix_server.domain.spans import Span, SpanKind
+from matrix_server.evals import (
+    EvalCase,
+    EvalDeps,
+    HashingEmbedder,
+    LLMJudge,
+    OpenAIEmbedder,
+    build_metric,
+    evaluate_case,
+    get_provider,
+)
+from matrix_server.online_evals import JOB_KIND
+from matrix_server.storage.models import Job, OnlineEval, Score
+from matrix_server.workers.runner import register
+
+logger = logging.getLogger(__name__)
+
+MAX_COMMENT_CHARS = 1000
+MAX_CONTEXTS = 100
+
+_span_store: Any = None
+_span_store_lock = threading.Lock()
+
+
+def set_span_store(store: Any) -> None:
+    """Override the span store (tests, or a process that already built one)."""
+    global _span_store
+    with _span_store_lock:
+        _span_store = store
+
+
+def get_span_store() -> Any:
+    global _span_store
+    with _span_store_lock:
+        if _span_store is None:
+            from matrix_server.config import get_settings
+            from matrix_server.storage.spans import build_span_store
+
+            _span_store = build_span_store(get_settings())
+        return _span_store
+
+
+# --------------------------------------------------------------------------- case building
+
+
+def case_input(span: Span) -> dict[str, Any]:
+    if span.input is not None:
+        try:
+            parsed = json.loads(span.input)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            return parsed
+        return {"question": span.input}
+    for msg in reversed(span.input_messages):
+        if msg.role == "user" and msg.content:
+            return {"question": msg.content}
+    return {}
+
+
+def case_output(span: Span) -> str:
+    if span.output is not None:
+        return span.output
+    for msg in reversed(span.output_messages):
+        if msg.content:
+            return msg.content
+    return ""
+
+
+def build_case(span: Span, trace_spans: list[Span], trace_cost_usd: float | None = None) -> EvalCase:
+    contexts: list[str] = []
+    for s in sorted(trace_spans, key=lambda s: (s.start_time, s.span_id)):
+        if s.kind in (SpanKind.RETRIEVER, SpanKind.RERANKER):
+            contexts.extend(d.content for d in s.documents if d.content)
+    # A root span stands for the whole request: its cost is the trace total.
+    cost = trace_cost_usd if span.parent_span_id is None and trace_cost_usd is not None else span.cost_usd
+    return EvalCase(
+        input=case_input(span),
+        output=case_output(span),
+        contexts=contexts[:MAX_CONTEXTS],
+        latency_ms=span.duration_ms,
+        cost_usd=cost,
+    )
+
+
+# --------------------------------------------------------------------------- judge
+
+
+def build_deps(model: dict[str, Any] | None) -> EvalDeps:
+    if model:
+        provider_name, model_name = str(model.get("provider", "")), str(model.get("name", ""))
+    else:
+        provider_name = os.environ.get("MATRIX_JUDGE_PROVIDER", "fake")
+        model_name = os.environ.get("MATRIX_JUDGE_MODEL", "")
+    provider_name = provider_name.strip().lower() or "fake"
+    if provider_name == "fake":
+        return EvalDeps.offline()
+    base_url = os.environ.get("MATRIX_JUDGE_BASE_URL") or None
+    opts: dict[str, Any] = {"base_url": base_url} if provider_name == "openai" and base_url else {}
+    provider = get_provider(provider_name, **opts)
+    if not model_name:
+        raise ValueError("judge model name is not configured (MATRIX_JUDGE_MODEL)")
+    embedder: Any = OpenAIEmbedder(base_url=base_url) if provider_name == "openai" else HashingEmbedder()
+    return EvalDeps(judge=LLMJudge(provider, model_name), embedder=embedder)
+
+
+# --------------------------------------------------------------------------- handler
+
+
+def _existing_score(session: Session, project_id: str, trace_id: str, span_id: str, name: str) -> bool:
+    return (
+        session.scalars(
+            select(Score.id).where(
+                Score.project_id == project_id,
+                Score.trace_id == trace_id,
+                Score.span_id == span_id,
+                Score.name == name,
+            )
+        ).first()
+        is not None
+    )
+
+
+def _run_score_hooks(session: Session, project_id: str, score: Score) -> None:
+    """Score hooks run in the job's transaction; each one inside a savepoint so a failure only
+    undoes its own writes (logged by type only, never the payload)."""
+    from matrix_server.api.query import on_score_created
+
+    for hook in on_score_created[:]:
+        savepoint = session.begin_nested()
+        try:
+            hook(session, project_id, score)
+            if savepoint.is_active:
+                savepoint.commit()
+        except Exception as exc:  # noqa: BLE001 - a hook must never lose the score
+            if savepoint.is_active:
+                savepoint.rollback()
+            logger.error(
+                "score hook %s failed: %s", getattr(hook, "__qualname__", repr(hook)), type(exc).__name__
+            )
+
+
+@register(JOB_KIND)
+def handle_online_eval_score(session: Session, job: Job) -> None:
+    payload = job.payload or {}
+    online_eval_id, trace_id, span_id = (
+        payload.get("online_eval_id"),
+        payload.get("trace_id"),
+        payload.get("span_id"),
+    )
+    if not (isinstance(online_eval_id, str) and isinstance(trace_id, str) and isinstance(span_id, str)):
+        logger.warning("job %s: malformed online eval payload, skipped", job.id)
+        return
+    project_id = job.project_id
+    ev = session.scalars(
+        select(OnlineEval).where(OnlineEval.id == online_eval_id, OnlineEval.project_id == project_id)
+    ).first()
+    if ev is None or not ev.enabled:
+        return
+    if _existing_score(session, project_id, trace_id, span_id, ev.name):
+        return
+
+    found = get_span_store().get_trace(project_id, trace_id)
+    span = None
+    if found is not None:
+        summary, spans = found
+        span = next((s for s in spans if s.span_id == span_id), None)
+    if span is None:
+        # Spans are written before the ingest hook runs; a miss is a lagging store: retry later.
+        raise LookupError("span not found in the span store")
+
+    metric = build_metric({"type": ev.metric, "params": ev.params or {}})
+    case = build_case(span, spans, summary.total_cost_usd)
+    result = evaluate_case([metric], case, build_deps(ev.model))[metric.name]
+    if result.details.get("error"):
+        raise RuntimeError(f"metric evaluation failed: {result.reason[:200]}")
+    if result.value is None:
+        return  # not applicable (e.g. no contexts): nothing to record
+
+    score = Score(
+        project_id=project_id,
+        trace_id=trace_id,
+        span_id=span_id,
+        name=ev.name,
+        value=float(result.value),
+        comment=(result.reason or "")[:MAX_COMMENT_CHARS] or None,
+        source="llm",
+    )
+    session.add(score)
+    session.flush()
+    _run_score_hooks(session, project_id, score)
