@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import Link from "next/link";
+import { NavLink } from "@/components/nav-link";
 import "./globals.css";
 
 export const metadata: Metadata = { title: "MATRIX", description: "LLMOps observability" };
@@ -18,22 +18,29 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en">
       <body className="bg-zinc-950 text-sm text-zinc-200 antialiased">
+        <a
+          href="#main"
+          className="sr-only focus:not-sr-only focus:absolute focus:left-2 focus:top-2 focus:z-50 focus:rounded focus:bg-zinc-800 focus:px-3 focus:py-1.5"
+        >
+          Skip to content
+        </a>
         <div className="flex min-h-screen">
-          <aside className="w-48 shrink-0 border-r border-zinc-800 bg-zinc-900 p-3">
-            <div className="mb-4 px-2 text-xs font-semibold tracking-widest text-zinc-400">MATRIX</div>
-            <nav className="flex flex-col gap-0.5">
+          <aside className="w-44 shrink-0 border-r border-zinc-800 bg-zinc-900/60 p-3">
+            <div className="mb-4 flex items-center gap-2 px-2 text-xs font-semibold tracking-widest text-zinc-300">
+              <span aria-hidden className="h-2 w-2 rounded-sm bg-emerald-400" />
+              MATRIX
+            </div>
+            <nav aria-label="Primary" className="flex flex-col gap-0.5">
               {NAV.map((n) => (
-                <Link
-                  key={n.href}
-                  href={n.href}
-                  className="rounded px-2 py-1 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
-                >
+                <NavLink key={n.href} href={n.href}>
                   {n.label}
-                </Link>
+                </NavLink>
               ))}
             </nav>
           </aside>
-          <main className="min-w-0 flex-1 p-4">{children}</main>
+          <main id="main" className="min-w-0 flex-1 px-6 py-5">
+            {children}
+          </main>
         </div>
       </body>
     </html>

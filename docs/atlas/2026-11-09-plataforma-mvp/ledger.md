@@ -20,5 +20,14 @@
 
 Formato: `T<n> · [tag] · C<n> → modelo/esforço (papel)`.
 
+- T01 · [arch] · C4 → orquestrador inline (ADRs são decisões do plano)
+- T02 · [core] · C2 → sonnet/low (implementer) · revisão pelo orquestrador (scaffold sem lógica; `make test` e `make lint` verdes)
+- T03 · [arch] · C5 → opus/high (implementer)
+- T04 · [core] · C4 → opus/medium (implementer)
+- T05 · [core] · C3 → sonnet/medium (implementer)
+- T07 · [core] · C3 → sonnet/medium (implementer)
+- T03+T04+T05+T07 · revisão conjunta C5 → opus/high (reviewer + security-reviewer, gatilhos: entrada externa, credenciais)
+- T06 · [core] · C3 → sonnet/medium (implementer)
+- T08 · [design] · C4 → opus/medium (implementer)
+
 ## Progresso
-- T02 · [core] · C2 → sonnet/low (implementer) · revisão C2 → feita pelo orquestrador (scaffold sem lógica; `make test` e `make lint` verdes)

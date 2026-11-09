@@ -6,4 +6,54 @@ html,
 body {
   background: #09090b;
   color: #e4e4e7;
+  color-scheme: dark;
+}
+
+/* Visible keyboard focus everywhere; mouse clicks stay clean. */
+:focus-visible {
+  outline: 2px solid #34d399;
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* React Flow, dark and calm. */
+.react-flow {
+  --xy-background-color: #09090b;
+  --xy-edge-stroke: #52525b;
+  --xy-edge-label-background-color: #18181b;
+  --xy-edge-label-color: #e4e4e7;
+  --xy-attribution-background-color: transparent;
+  --xy-controls-button-background-color: #18181b;
+  --xy-controls-button-background-color-hover: #27272a;
+  --xy-controls-button-color: #d4d4d8;
+  --xy-controls-button-border-color: #3f3f46;
+}
+.react-flow__edge-textbg {
+  fill: #18181b;
+}
+.react-flow__edge-text {
+  fill: #fbbf24;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}
+.react-flow__attribution a {
+  color: #52525b;
+}
+.react-flow__node:focus-visible {
+  outline: none;
+}
+.react-flow__node:focus-visible > div {
+  outline: 2px solid #34d399;
+  outline-offset: 2px;
 }
