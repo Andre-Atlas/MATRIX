@@ -15,6 +15,7 @@ dependencies = [
   "httpx",
   "jsonschema",
   "psycopg[binary]",
+  "alembic>=1.20.1",
 ]
 
 [project.scripts]

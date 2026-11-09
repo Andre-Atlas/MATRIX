@@ -14,13 +14,34 @@ def run_api() -> None:
     )
 
 
-def _not_implemented() -> None:
-    print("not implemented yet")
-    sys.exit(1)
-
-
 def run_worker() -> None:
-    _not_implemented()
+    import logging
+    import signal
+    import socket
+    import threading
+
+    from matrix_server.config import Settings
+    from matrix_server.storage.db import init_db, make_engine, make_session_factory
+    from matrix_server.workers import runner
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    settings = Settings()
+    engine = make_engine(settings.database_url)
+    init_db(engine)
+    runner.load_handler_modules()
+    stop_event = threading.Event()
+
+    def _stop(signum, _frame) -> None:
+        logging.getLogger("matrix_server.worker").info("received %s, finishing current job", signum)
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+    worker_id = f"{socket.gethostname()}-{os.getpid()}"
+    try:
+        runner.run_forever(make_session_factory(engine), stop_event=stop_event, worker_id=worker_id)
+    finally:
+        engine.dispose()
 
 
 def _build_admin_parser() -> argparse.ArgumentParser:

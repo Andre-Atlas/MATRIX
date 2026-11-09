@@ -1,8 +1,8 @@
 """SQLAlchemy engine, session and declarative base for the relational store.
 
 The same models run on SQLite (tests, dev) and PostgreSQL (production), so only
-portable column types are used. Schema is created with `init_db` until Alembic
-migrations are introduced.
+portable column types are used. Production schema is managed by Alembic
+(`server/migrations`, `alembic upgrade head`); `init_db` (create_all) remains for tests and dev.
 """
 
 from __future__ import annotations
