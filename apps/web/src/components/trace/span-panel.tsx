@@ -1,6 +1,7 @@
 import { formatClock, formatCost, formatDuration, formatPayload, formatTokens, formatValue } from "@/lib/format";
 import type { Document, Media, Message, Span } from "@/lib/types";
 import { KindBadge, Mono, StatusBadge } from "@/components/ui";
+import { AddToDataset } from "@/components/evals/add-to-dataset";
 import { AttributesTable } from "./attributes-table";
 
 const LONG_CHARS = 1200;
@@ -181,7 +182,9 @@ export function SpanPanel({ span, traceStart }: { span: Span; traceStart: number
           <h2 className="mt-1.5 break-words font-semibold text-zinc-50">{span.name}</h2>
           <Mono className="text-[11px] text-zinc-500">{span.span_id}</Mono>
         </div>
-        <div className="shrink-0">{/* T12: dataset actions */}</div>
+        <div className="shrink-0">
+          <AddToDataset traceId={span.trace_id} spanId={span.span_id} />
+        </div>
       </header>
 
       {span.status === "error" && span.status_message && (

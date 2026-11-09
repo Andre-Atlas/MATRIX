@@ -35,6 +35,10 @@ export async function apiGet<T>(
 }
 
 export async function apiSend<T>(method: string, path: string, body?: unknown): Promise<T> {
+  if (process.env.MATRIX_MOCK === "1") {
+    const { mockSend } = await import("./mock-api");
+    return mockSend<T>(method, path, body);
+  }
   const res = await fetch(`${base()}${path}`, {
     method,
     headers: headers(true),

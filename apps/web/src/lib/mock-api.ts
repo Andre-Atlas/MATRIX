@@ -1,6 +1,7 @@
-// In-memory implementation of the read endpoints, used only when MATRIX_MOCK=1.
+// In-memory implementation of the API, used only when MATRIX_MOCK=1.
 import { ApiError } from "./api-error";
 import { mockDb } from "./mock-data";
+import { evalExportJsonl, evalGet, evalSend } from "./mock-evals";
 import type { ListResponse, OverviewStats, Score, SessionDetail, TraceDetail, TraceSummary } from "./types";
 
 type Params = Record<string, string | number | undefined>;
@@ -109,5 +110,48 @@ export async function mockGet<T>(path: string, params: Params = {}): Promise<T> 
     return detail as T;
   }
 
+  const evalResult = evalGet(p);
+  if (evalResult !== undefined) return evalResult as T;
+
   throw new ApiError(404, `mock: no handler for GET ${path}`);
+}
+
+export async function mockSend<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const out = evalSend(method.toUpperCase(), path.replace(/\/+$/, ""), body);
+  if (out === undefined) throw new ApiError(404, `mock: no handler for ${method} ${path}`);
+  return out as T;
+}
+
+/** Backs /api/proxy/* in mock mode: same status codes and bodies as the real API would return. */
+export async function mockFetch(method: string, path: string, params: Params, rawBody: string | null): Promise<Response> {
+  try {
+    if (method === "GET") {
+      const text = evalExportJsonl(path);
+      if (text !== undefined) {
+        return new Response(text, {
+          headers: {
+            "content-type": "application/x-ndjson",
+            "content-disposition": `attachment; filename="${path.split("/").at(-2)}.jsonl"`,
+          },
+        });
+      }
+      return Response.json(await mockGet(path, params));
+    }
+    let body: unknown;
+    try {
+      body = rawBody ? JSON.parse(rawBody) : undefined;
+    } catch {
+      return Response.json({ detail: "invalid JSON body" }, { status: 400 });
+    }
+    return Response.json(await mockSend(method, path, body), { status: method === "POST" ? 201 : 200 });
+  } catch (e) {
+    if (e instanceof ApiError) {
+      const isJson = e.body.startsWith("{");
+      return new Response(isJson ? e.body : JSON.stringify({ detail: e.body }), {
+        status: e.status,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    throw e;
+  }
 }

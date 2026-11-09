@@ -129,3 +129,160 @@ export const SPAN_KINDS: SpanKind[] = [
   "EVALUATOR",
   "UNKNOWN",
 ];
+
+// ── Datasets and experiments (spec §4 "Datasets e experimentos") ────────────────────────────
+
+export type Dataset = {
+  id: string;
+  name: string;
+  description: string | null;
+  item_count: number;
+  created_at: string;
+};
+
+export type DatasetItem = {
+  id: string;
+  dataset_id: string;
+  input: Record<string, unknown>;
+  expected_output: string | null;
+  context: string[];
+  metadata: Record<string, unknown>;
+  source_trace_id: string | null;
+  source_span_id: string | null;
+  created_at: string;
+};
+
+export type DatasetDetail = { dataset: Dataset; items: DatasetItem[] };
+
+export type CreateDatasetRequest = { name: string; description?: string };
+export type CreateDatasetItemRequest = {
+  input: Record<string, unknown>;
+  expected_output?: string | null;
+  context?: string[];
+  metadata?: Record<string, unknown>;
+};
+export type DatasetItemFromSpanRequest = { trace_id: string; span_id?: string };
+
+export type MetricType =
+  | "faithfulness"
+  | "answer_relevancy"
+  | "context_precision"
+  | "g_eval"
+  | "equals"
+  | "contains"
+  | "regex"
+  | "is_json"
+  | "levenshtein"
+  | "rouge_l"
+  | "cost"
+  | "latency";
+
+export const METRIC_TYPES: MetricType[] = [
+  "faithfulness",
+  "answer_relevancy",
+  "context_precision",
+  "g_eval",
+  "equals",
+  "contains",
+  "regex",
+  "is_json",
+  "levenshtein",
+  "rouge_l",
+  "cost",
+  "latency",
+];
+
+/** `name` defaults to `type`; scores, summary and regressions are keyed by that name. */
+export type MetricSpec = {
+  type: MetricType;
+  name?: string;
+  params?: Record<string, unknown>;
+  threshold?: number | null;
+};
+
+export type ModelProvider = "openai" | "anthropic" | "fake";
+export const MODEL_PROVIDERS: ModelProvider[] = ["openai", "anthropic", "fake"];
+
+export type PromptRef =
+  | { name: string; version: number }
+  | { template: string | Message[]; type: "text" | "chat" };
+
+export type Variant = {
+  label: string;
+  prompt: PromptRef;
+  model: { provider: ModelProvider; name: string; params?: Record<string, unknown> };
+};
+
+export type ExperimentStatus = "queued" | "running" | "done" | "failed";
+
+export type MetricAggregate = { mean: number | null; pass_rate: number | null };
+
+/** variant label → metric name → aggregate. */
+export type ExperimentSummary = Record<string, Record<string, MetricAggregate>>;
+
+export type Experiment = {
+  id: string;
+  name: string;
+  dataset_id: string;
+  baseline_experiment_id: string | null;
+  status: ExperimentStatus;
+  variants: Variant[];
+  metrics: MetricSpec[];
+  error: string | null;
+  summary: ExperimentSummary | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+};
+
+export type ExperimentListItem = Pick<
+  Experiment,
+  "id" | "name" | "dataset_id" | "status" | "created_at" | "finished_at" | "summary"
+>;
+
+export type FaithfulnessStatement = { statement: string; supported: boolean; reason: string };
+
+/** `value`/`passed` are null when the metric does not apply (n/a). */
+export type MetricScore = {
+  value: number | null;
+  passed: boolean | null;
+  reason: string | null;
+  details?: Record<string, unknown>;
+};
+
+export type ExperimentResult = {
+  item_id: string;
+  variant: string;
+  output: string | null;
+  latency_ms: number | null;
+  cost_usd: number | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  error: string | null;
+  scores: Record<string, MetricScore>;
+};
+
+export type Regression = {
+  item_id: string;
+  variant: string;
+  metric: string;
+  baseline: number | null;
+  current: number | null;
+};
+
+export type ExperimentDetail = {
+  experiment: Experiment;
+  results: ExperimentResult[];
+  summary: ExperimentSummary;
+  regressions: Regression[];
+};
+
+export type CreateExperimentRequest = {
+  name: string;
+  dataset_id: string;
+  baseline_experiment_id?: string | null;
+  variants: Variant[];
+  metrics: MetricSpec[];
+};
+
+export const metricKey = (m: MetricSpec): string => m.name || m.type;
