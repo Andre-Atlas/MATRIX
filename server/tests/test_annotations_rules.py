@@ -16,7 +16,6 @@ from sqlalchemy import create_engine, select
 from matrix_server import rules as rules_engine
 from matrix_server.api import annotations as annotations_api
 from matrix_server.api import datasets as datasets_api
-from matrix_server.api import ingest, query
 from matrix_server.api import rules as rules_api
 from matrix_server.app import create_app
 from matrix_server.config import Settings
@@ -53,15 +52,10 @@ def client(request, tmp_path):
         app.include_router(rules_api.router)
     if "/api/v1/annotations" not in paths:
         app.include_router(annotations_api.router)
-    ingest_hook = rules_engine.make_ingest_hook(app.state.session_factory, app.state.span_store)
-    score_hook = rules_engine.make_score_hook(app.state.span_store)
-    ingest.on_spans_ingested.append(ingest_hook)
-    query.on_score_created.append(score_hook)
+    # create_app already installs the rules ingest and score hooks.
     try:
         yield TestClient(app)
     finally:
-        ingest.on_spans_ingested.remove(ingest_hook)
-        query.on_score_created.remove(score_hook)
         if request.param == "pg":
             app.state.db_engine.dispose()
 

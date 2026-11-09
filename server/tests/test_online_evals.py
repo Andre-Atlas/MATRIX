@@ -18,8 +18,7 @@ from otlp_payloads import (
 from sqlalchemy import select, update
 
 from matrix_server import online_evals
-from matrix_server.api import ingest, query
-from matrix_server.api import online_evals as online_evals_api
+from matrix_server.api import query
 from matrix_server.app import create_app
 from matrix_server.config import Settings
 from matrix_server.domain.spans import Span
@@ -77,9 +76,7 @@ def env(request, tmp_path, monkeypatch):
     monkeypatch.delenv("MATRIX_JUDGE_PROVIDER", raising=False)
     monkeypatch.delenv("MATRIX_JUDGE_MODEL", raising=False)
     app = create_app(Settings(database_url=url, admin_token="adm"))
-    app.include_router(online_evals_api.router)
-    hook = make_ingest_hook(app.state.session_factory)
-    ingest.on_spans_ingested.append(hook)
+    # create_app already wires the online-evals router and ingest hook.
     online_handlers.set_span_store(app.state.span_store)
     monkeypatch.setitem(runner.HANDLERS, JOB_KIND, online_handlers.handle_online_eval_score)
     online_evals.invalidate_cache()
@@ -87,7 +84,6 @@ def env(request, tmp_path, monkeypatch):
     try:
         yield app, client, _project(client, "one")
     finally:
-        ingest.on_spans_ingested.remove(hook)
         online_handlers.set_span_store(None)
         online_evals.invalidate_cache()
         app.state.db_engine.dispose()
