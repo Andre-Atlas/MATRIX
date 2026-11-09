@@ -2,9 +2,13 @@
 
 Every read and write is scoped by `project_id`. Trace summaries are derived from spans:
 root = span without parent (earliest one on ties; earliest span when none is parentless),
-status = "error" if any span errored, tokens/cost summed, previews = root input/output cut
-to 300 chars, session/user from the root or else the earliest span that has them, tags =
-sorted union. Pagination cursors are opaque base64 of (time in µs, id), descending.
+status = "error" if any span errored, cost summed, tokens summed over LLM and EMBEDDING spans
+only (AGENT/CHAIN spans often repeat their children's usage), previews = root input/output
+cut to 300 chars, session/user from the root or else the earliest span that has them, tags =
+sorted union. Trace start = earliest span start; `since`/`until` filter on it. Pagination
+cursors are opaque base64 of (time in µs, id), descending.
+
+A span re-sent by an exporter retry is stored once: the last write wins in both stores.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ import json
 import math
 import re
 import threading
+import time
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, runtime_checkable
@@ -24,10 +29,9 @@ from matrix_server.config import Settings
 from matrix_server.domain.spans import SessionSummary, Span, SpanKind, TraceSummary
 
 PREVIEW_CHARS = 300
-MAX_LIMIT = 1000
-# `since` filters on trace start; spans are pre-filtered with this slack so the partition and
-# primary-key pruning stay exact for traces shorter than the slack.
-_SINCE_SLACK = timedelta(hours=24)
+MAX_LIMIT = 500
+# Span kinds whose token usage counts towards trace/overview totals (same kinds that are costed).
+USAGE_KINDS = frozenset({SpanKind.LLM, SpanKind.EMBEDDING})
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
@@ -61,8 +65,10 @@ class SpanStore(Protocol):
     ) -> tuple[list[SessionSummary], str | None]: ...
 
     def get_session(
-        self, project_id: str, session_id: str
-    ) -> tuple[SessionSummary, list[TraceSummary]] | None: ...
+        self, project_id: str, session_id: str, limit: int = 50, cursor: str | None = None
+    ) -> tuple[SessionSummary, list[TraceSummary], str | None] | None:
+        """Session summary plus one page of its traces (newest first) and the next cursor."""
+        ...
 
     def overview(self, project_id: str, since: datetime | None = None) -> dict[str, Any]: ...
 
@@ -128,8 +134,8 @@ def summarize_trace(spans: Sequence[Span]) -> TraceSummary:
         duration_ms=(to_micros(end) - to_micros(start)) / 1000,
         status="error" if any(s.status == "error" for s in spans) else "ok",
         span_count=len(spans),
-        input_tokens=sum(s.input_tokens for s in spans),
-        output_tokens=sum(s.output_tokens for s in spans),
+        input_tokens=sum(s.input_tokens for s in spans if s.kind in USAGE_KINDS),
+        output_tokens=sum(s.output_tokens for s in spans if s.kind in USAGE_KINDS),
         total_cost_usd=sum(s.cost_usd for s in spans),
         root_kind=root.kind,
         input_preview=_preview(root.input),
@@ -287,13 +293,13 @@ class MemorySpanStore:
         return _page(items, limit, lambda s: encode_cursor(s.last_seen, s.session_id))
 
     def get_session(
-        self, project_id: str, session_id: str
-    ) -> tuple[SessionSummary, list[TraceSummary]] | None:
+        self, project_id: str, session_id: str, limit: int = 50, cursor: str | None = None
+    ) -> tuple[SessionSummary, list[TraceSummary], str | None] | None:
         summary = next((s for s in self._sessions(project_id) if s.session_id == session_id), None)
         if summary is None:
             return None
-        traces, _ = self.list_traces(project_id, session_id=session_id, limit=MAX_LIMIT)
-        return summary, traces
+        traces, next_cursor = self.list_traces(project_id, session_id=session_id, limit=limit, cursor=cursor)
+        return summary, traces, next_cursor
 
     def overview(self, project_id: str, since: datetime | None = None) -> dict[str, Any]:
         summaries = [s for s in self._summaries(project_id) if since is None or s.start_time >= since]
@@ -393,12 +399,19 @@ _SELECT_SPAN = ", ".join(
 )
 # Root ordering key: parentless first, then earliest, then span id (same as `_root_key`).
 _ROOT_KEY = "tuple(parent_span_id != '', start_time, span_id)"
+_USAGE_FILTER = "kind IN ({})".format(", ".join(f"'{k.value}'" for k in sorted(USAGE_KINDS)))
+# Columns read by the aggregations (the dedup key columns first).
+_LIGHT_COLUMNS = (
+    "project_id, trace_id, span_id, parent_span_id, name, kind, start_time, end_time, status, "
+    "model, input_tokens, output_tokens, cost_usd, session_id, user_id"
+)
+_SUMMARY_COLUMNS = f"{_LIGHT_COLUMNS}, input, output, tags"
 _TRACE_AGG = f"""
     toUnixTimestamp64Micro(min(start_time)) AS ts,
     toUnixTimestamp64Micro(max(end_time)) AS te,
     count() AS span_count,
-    sum(input_tokens) AS in_tok,
-    sum(output_tokens) AS out_tok,
+    sumIf(input_tokens, {_USAGE_FILTER}) AS in_tok,
+    sumIf(output_tokens, {_USAGE_FILTER}) AS out_tok,
     sum(cost_usd) AS cost,
     max(status = 'error') AS has_error,
     argMin(name, {_ROOT_KEY}) AS root_name,
@@ -501,13 +514,18 @@ def _finite(value: Any) -> float:
 
 
 class ClickHouseSpanStore:
-    """Spans in a ClickHouse `MergeTree` table, read with parameterized queries only.
+    """Spans in a ClickHouse `ReplacingMergeTree(version)` table, parameterized queries only.
 
     Layout: `ORDER BY (project_id, trace_id, start_time, span_id)` makes a trace a contiguous
     range of the primary key, so trace/span lookups and the per-page aggregation
     (`trace_id IN (...)`) read only the needed granules. `list_traces` first ranks trace ids
     with a `GROUP BY trace_id` over light columns of one project, then aggregates the heavy
     columns (previews, tags) only for the page. Partitions by month prune `since` filters.
+
+    Exporter retries can store a span more than once. Each insert gets a strictly increasing
+    `version` (server clock in ns, assigned here, never a column DEFAULT); background merges
+    keep the highest version, and every read deduplicates first (`LIMIT 1 BY` span key ordered
+    by `version DESC`) so aggregates never count a retried span twice, merged or not.
     """
 
     def __init__(
@@ -526,6 +544,8 @@ class ClickHouseSpanStore:
         self.ttl_days = ttl_days
         self._insert_settings = {"async_insert": 1, "wait_for_async_insert": 1} if async_insert else {}
         self._client = client if client is not None else self._connect(url)
+        self._version_lock = threading.Lock()
+        self._last_version = 0
 
     @staticmethod
     def _connect(url: str) -> Any:
@@ -554,17 +574,27 @@ class ClickHouseSpanStore:
             f"""
 CREATE TABLE IF NOT EXISTS {self.table} (
     {columns},
-    `inserted_at` DateTime64(3, 'UTC') DEFAULT now64(3),
+    `version` UInt64,
     INDEX idx_session session_id TYPE bloom_filter(0.01) GRANULARITY 4,
     INDEX idx_user user_id TYPE bloom_filter(0.01) GRANULARITY 4,
     INDEX idx_model model TYPE set(256) GRANULARITY 4
 )
-ENGINE = MergeTree
+ENGINE = ReplacingMergeTree(version)
 PARTITION BY toYYYYMM(start_time)
 ORDER BY (project_id, trace_id, start_time, span_id){ttl}
 SETTINGS index_granularity = 8192
 """
         )
+        # No migration path: a table from before the ReplacingMergeTree switch (pre-release, no
+        # production data) must be dropped and recreated.
+        engine = self._client.query(
+            "SELECT engine FROM system.tables WHERE database = {db:String} AND name = 'spans'",
+            parameters={"db": self.database},
+        ).result_rows
+        if engine and engine[0][0] != "ReplacingMergeTree":
+            raise RuntimeError(
+                f"{self.table} uses {engine[0][0]}; drop it so it is recreated as ReplacingMergeTree"
+            )
 
     def drop_database(self) -> None:
         self._client.command(f"DROP DATABASE IF EXISTS `{self.database}`")
@@ -577,12 +607,43 @@ SETTINGS index_granularity = 8192
         for span in spans:
             if not span.project_id:
                 raise ValueError("span without project_id")
+        first = self._next_versions(len(spans))
+        # Later rows of a batch get higher versions, so in-batch duplicates also resolve to the last.
+        rows = [[*_span_row(s), first + i] for i, s in enumerate(spans)]
         self._client.insert(
             self.table,
-            [_span_row(s) for s in spans],
-            column_names=_COLUMN_NAMES,
+            rows,
+            column_names=[*_COLUMN_NAMES, "version"],
             settings=self._insert_settings,
         )
+
+    def _next_versions(self, count: int) -> int:
+        """First of `count` strictly increasing versions (ns since epoch, monotonic in-process)."""
+        with self._version_lock:
+            first = max(time.time_ns(), self._last_version + 1)
+            self._last_version = first + count - 1
+            return first
+
+    def _dedup(self, columns: str, where: str) -> str:
+        """Subquery with one row per span (highest version) among rows matching `where`."""
+        return f"""(
+            SELECT {columns}
+            FROM {self.table}
+            WHERE {where}
+            ORDER BY version DESC
+            LIMIT 1 BY project_id, trace_id, span_id
+        )"""
+
+    def _since_candidates(self) -> str:
+        """Traces with a span at or after `since`: a trace starting at/after `since` is among them.
+
+        Exact pre-filter (no slack): the trace start is then recomputed over all of its spans.
+        """
+        return f"""trace_id IN (
+            SELECT trace_id FROM {self.table}
+            WHERE project_id = {{project_id:String}}
+              AND start_time >= fromUnixTimestamp64Micro({{since:Int64}}, 'UTC')
+        )"""
 
     # ---- reads
 
@@ -611,8 +672,7 @@ SETTINGS index_granularity = 8192
         having = ["1"]
         if since is not None:
             params["since"] = to_micros(since)
-            params["since_pruned"] = to_micros(since - _SINCE_SLACK)
-            where.append("start_time >= fromUnixTimestamp64Micro({since_pruned:Int64}, 'UTC')")
+            where.append(self._since_candidates())
             having.append("ts >= {since:Int64}")
         if until is not None:
             params["until"] = to_micros(until)
@@ -648,18 +708,17 @@ SETTINGS index_granularity = 8192
                     argMin(kind, {_ROOT_KEY}) AS root_kind,
                     argMinIf(session_id, {_ROOT_KEY}, session_id != '') AS sid,
                     argMinIf(user_id, {_ROOT_KEY}, user_id != '') AS uid
-                FROM {self.table}
-                WHERE {" AND ".join(where)}
+                FROM {self._dedup(_LIGHT_COLUMNS, " AND ".join(where))}
                 GROUP BY trace_id
                 HAVING {" AND ".join(having)}
                 ORDER BY ts DESC, trace_id DESC
                 LIMIT {{limit:UInt32}}
             )
         """
+        page_where = f"project_id = {{project_id:String}} AND trace_id IN ({ranked})"
         sql = f"""
             SELECT trace_id, {_TRACE_AGG}
-            FROM {self.table}
-            WHERE project_id = {{project_id:String}} AND trace_id IN ({ranked})
+            FROM {self._dedup(_SUMMARY_COLUMNS, page_where)}
             GROUP BY trace_id
             ORDER BY ts DESC, trace_id DESC
         """
@@ -676,9 +735,9 @@ SETTINGS index_granularity = 8192
             SELECT {_SELECT_SPAN}
             FROM {self.table}
             WHERE project_id = {{project_id:String}} AND trace_id = {{trace_id:String}} {span_filter}
-            ORDER BY inserted_at
+            ORDER BY version
         """
-        # A retried export can store a span twice; the latest insert wins.
+        # A retried export can store a span twice; the highest version (latest insert) wins.
         unique: dict[str, Span] = {}
         for row in self._rows(sql, params):
             unique[row["span_id"]] = _span_from_row(project_id, row)
@@ -705,6 +764,10 @@ SETTINGS index_granularity = 8192
         if cursor:
             params["cursor_ts"], params["cursor_id"] = decode_cursor(cursor)
             having.append("(last_seen, sid) < ({cursor_ts:Int64}, {cursor_id:String})")
+        session_traces = f"""project_id = {{project_id:String}} AND trace_id IN (
+            SELECT trace_id FROM {self.table}
+            WHERE project_id = {{project_id:String}} AND session_id != ''
+        )"""
         sql = f"""
             SELECT
                 sid,
@@ -721,11 +784,7 @@ SETTINGS index_granularity = 8192
                     sum(cost_usd) AS cost,
                     argMinIf(session_id, {_ROOT_KEY}, session_id != '') AS sid,
                     argMinIf(user_id, {_ROOT_KEY}, user_id != '') AS uid
-                FROM {self.table}
-                WHERE project_id = {{project_id:String}} AND trace_id IN (
-                    SELECT trace_id FROM {self.table}
-                    WHERE project_id = {{project_id:String}} AND session_id != ''
-                )
+                FROM {self._dedup(_LIGHT_COLUMNS, session_traces)}
                 GROUP BY trace_id
                 HAVING sid != ''
             )
@@ -756,13 +815,13 @@ SETTINGS index_granularity = 8192
         return _page(items, limit, lambda s: encode_cursor(s.last_seen, s.session_id))
 
     def get_session(
-        self, project_id: str, session_id: str
-    ) -> tuple[SessionSummary, list[TraceSummary]] | None:
+        self, project_id: str, session_id: str, limit: int = 50, cursor: str | None = None
+    ) -> tuple[SessionSummary, list[TraceSummary], str | None] | None:
         rows = self._session_rows(project_id, session_id=session_id, limit=1, cursor=None)
         if not rows:
             return None
-        traces, _ = self.list_traces(project_id, session_id=session_id, limit=MAX_LIMIT)
-        return self._session_from_row(rows[0]), traces
+        traces, next_cursor = self.list_traces(project_id, session_id=session_id, limit=limit, cursor=cursor)
+        return self._session_from_row(rows[0]), traces, next_cursor
 
     def overview(self, project_id: str, since: datetime | None = None) -> dict[str, Any]:
         params: dict[str, Any] = {"project_id": project_id}
@@ -770,8 +829,7 @@ SETTINGS index_granularity = 8192
         having = ""
         if since is not None:
             params["since"] = to_micros(since)
-            params["since_pruned"] = to_micros(since - _SINCE_SLACK)
-            where += " AND start_time >= fromUnixTimestamp64Micro({since_pruned:Int64}, 'UTC')"
+            where += f" AND {self._since_candidates()}"
             having = "HAVING ts >= {since:Int64}"
         traces = f"""
             SELECT
@@ -780,10 +838,9 @@ SETTINGS index_granularity = 8192
                 toUnixTimestamp64Micro(max(end_time)) AS te,
                 max(status = 'error') AS has_error,
                 sum(cost_usd) AS cost,
-                sum(input_tokens) AS in_tok,
-                sum(output_tokens) AS out_tok
-            FROM {self.table}
-            WHERE {where}
+                sumIf(input_tokens, {_USAGE_FILTER}) AS in_tok,
+                sumIf(output_tokens, {_USAGE_FILTER}) AS out_tok
+            FROM {self._dedup(_LIGHT_COLUMNS, where)}
             GROUP BY trace_id
             {having}
         """
@@ -807,8 +864,8 @@ SETTINGS index_granularity = 8192
         models = self._rows(
             f"""
             SELECT model, count() AS calls, sum(cost_usd) AS model_cost
-            FROM {self.table}
-            WHERE project_id = {{project_id:String}} AND model != '' {trace_filter}
+            FROM {self._dedup(_LIGHT_COLUMNS, f"project_id = {{project_id:String}} {trace_filter}")}
+            WHERE model != ''
             GROUP BY model
             ORDER BY model_cost DESC, model ASC
             """,

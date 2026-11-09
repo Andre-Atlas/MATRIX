@@ -96,7 +96,35 @@ def test_sessions(env):
     detail = client.get("/api/v1/sessions/sess-2", headers=auth).json()
     assert detail["session"]["session_id"] == "sess-2"
     assert [t["trace_id"] for t in detail["traces"]] == [ERROR_TRACE_ID]
+    assert detail["next_cursor"] is None
     assert client.get("/api/v1/sessions/nope", headers=auth).status_code == 404
+
+
+def test_session_detail_paginates_traces(env):
+    client, auth = env
+    store = client.app.state.span_store
+    (span,) = [s for s in store.get_trace(_pid(store), ERROR_TRACE_ID)[1]]
+    copies = [
+        span.model_copy(
+            update={"trace_id": f"{n:032x}", "start_time": span.start_time - timedelta(minutes=n)}
+        )
+        for n in range(1, 4)
+    ]
+    store.insert(copies)
+    first = client.get("/api/v1/sessions/sess-2?limit=2", headers=auth).json()
+    assert len(first["traces"]) == 2 and first["next_cursor"]
+    second = client.get(f"/api/v1/sessions/sess-2?limit=2&cursor={first['next_cursor']}", headers=auth).json()
+    ids = [t["trace_id"] for t in first["traces"] + second["traces"]]
+    assert ids == [ERROR_TRACE_ID, *[c.trace_id for c in copies]]
+    assert second["next_cursor"] is None
+    assert client.get("/api/v1/sessions/sess-2?cursor=%%%", headers=auth).status_code == 400
+    assert client.get("/api/v1/sessions/sess-2?limit=501", headers=auth).status_code == 422
+    assert client.get("/api/v1/traces?limit=500", headers=auth).status_code == 200
+
+
+def _pid(store):
+    (project_id,) = store._data.keys()
+    return project_id
 
 
 def test_overview(env):

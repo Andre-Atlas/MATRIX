@@ -10,6 +10,7 @@ This module never logs: payloads may contain PII.
 from __future__ import annotations
 
 import json
+import math
 import mimetypes
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -24,14 +25,29 @@ from matrix_server.domain.spans import (
     ToolCall,
     ToolInfo,
 )
-from matrix_server.ingest.otlp import RawSpan
-from matrix_server.pricing import compute_cost
+from matrix_server.ingest.otlp import TRUNCATION_MARK, RawSpan
+from matrix_server.pricing import compute_cost, get_price
 
-TRUNCATION_MARK = "…[truncated]"
+__all__ = ["TRUNCATION_MARK", "normalize", "normalize_all", "normalize_partial", "truncate"]
+
+MAX_TOKENS = 2**63 - 1
+UNKNOWN_MODEL_KEY = "matrix.cost_unknown_model"
+EMBEDDING_VECTORS_KEY = "matrix.embedding_vectors_removed"
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _FIRST_TOKEN_EVENTS = frozenset({"first_token", "gen_ai.first_token", "llm.first_token"})
 _COSTED_KINDS = frozenset({SpanKind.LLM, SpanKind.EMBEDDING})
-_MODEL_KEYS = ("llm.model_name", "gen_ai.request.model", "gen_ai.response.model", "embedding.model_name")
+_LLM_MODEL_KEYS = ("llm.model_name", "gen_ai.request.model", "gen_ai.response.model")
+_MODEL_KEYS = (*_LLM_MODEL_KEYS, "embedding.model_name")
+_CACHE_READ_KEYS = (
+    "llm.token_count.prompt_details.cache_read",
+    "gen_ai.usage.cache_read_input_tokens",
+    "gen_ai.usage.cache_read.input_tokens",
+)
+_CACHE_WRITE_KEYS = (
+    "llm.token_count.prompt_details.cache_write",
+    "gen_ai.usage.cache_creation_input_tokens",
+    "gen_ai.usage.cache_creation.input_tokens",
+)
 _PROVIDER_KEYS = ("llm.provider", "llm.system", "gen_ai.system", "gen_ai.provider.name")
 _GENAI_OPERATION_KINDS = {
     "chat": SpanKind.LLM,
@@ -74,21 +90,25 @@ def _text(value: Any) -> str | None:
 
 
 def _int(value: Any) -> int:
+    """Token count: clamped to [0, 2^63-1]; non-numeric and non-finite values count as 0."""
     if value is None or isinstance(value, bool):
         return 0
-    try:
-        return max(int(float(value)), 0)
-    except (TypeError, ValueError):
-        return 0
+    if not isinstance(value, int):
+        number = _float(value)
+        if number is None:
+            return 0
+        value = int(number)
+    return min(max(value, 0), MAX_TOKENS)
 
 
 def _float(value: Any) -> float | None:
     if value is None or isinstance(value, bool):
         return None
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
         return None
+    return number if math.isfinite(number) else None
 
 
 def _json_object(value: Any) -> dict[str, Any] | None:
@@ -295,8 +315,32 @@ def _kind(attrs: dict[str, Any], model: str | None, is_root: bool) -> SpanKind:
     if isinstance(operation, str) and operation.lower() in _GENAI_OPERATION_KINDS:
         return _GENAI_OPERATION_KINDS[operation.lower()]
     if model:
+        if _first(attrs, _LLM_MODEL_KEYS) is None:
+            return SpanKind.EMBEDDING  # only `embedding.model_name` is set
         return SpanKind.LLM
     return SpanKind.CHAIN if is_root else SpanKind.UNKNOWN
+
+
+def _drop_embedding_vectors(attrs: dict[str, Any]) -> None:
+    """Embedding vectors are large and useless in the UI: remove them, keep how many there were."""
+    removed = 0
+    for key in [k for k in attrs if k.startswith("embedding.embeddings.") and k.endswith(".embedding.vector")]:
+        del attrs[key]
+        removed += 1
+    listed = attrs.get("embedding.embeddings")
+    if isinstance(listed, list):
+        for item in listed:
+            if not isinstance(item, dict):
+                continue
+            if "embedding.vector" in item:
+                del item["embedding.vector"]
+                removed += 1
+            nested = item.get("embedding")
+            if isinstance(nested, dict) and "vector" in nested:
+                del nested["vector"]
+                removed += 1
+    if removed:
+        attrs[EMBEDDING_VECTORS_KEY] = removed
 
 
 def _ttft_ms(raw: RawSpan, attrs: dict[str, Any]) -> float | None:
@@ -366,17 +410,14 @@ def normalize(raw: RawSpan, project_id: str, max_chars: int) -> Span:
         )
     )
     reasoning_tokens = _int(attrs.get("llm.token_count.completion_details.reasoning"))
-    cache_read_tokens = _int(
-        _first(attrs, ("llm.token_count.prompt_details.cache_read", "gen_ai.usage.cache_read_input_tokens"))
-    )
-    cache_write_tokens = _int(
-        _first(
-            attrs, ("llm.token_count.prompt_details.cache_write", "gen_ai.usage.cache_creation_input_tokens")
-        )
-    )
+    cache_read_tokens = _int(_first(attrs, _CACHE_READ_KEYS))
+    cache_write_tokens = _int(_first(attrs, _CACHE_WRITE_KEYS))
     cost = 0.0
     if kind in _COSTED_KINDS:
+        if model and get_price(model) is None:
+            attrs[UNKNOWN_MODEL_KEY] = True
         cost = compute_cost(model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
+    _drop_embedding_vectors(attrs)
 
     span_input = _text(attrs.pop("input.value", None))
     span_output = _text(attrs.pop("output.value", None))
@@ -487,3 +528,24 @@ def _truncate_message(message: Message, max_chars: int) -> Message:
 
 def normalize_all(raw_spans: list[RawSpan], project_id: str, max_chars: int) -> list[Span]:
     return [normalize(raw, project_id, max_chars) for raw in raw_spans]
+
+
+def normalize_partial(
+    raw_spans: list[RawSpan], project_id: str, max_chars: int
+) -> tuple[list[Span], int, list[str]]:
+    """Normalize span by span: a span that fails is dropped and counted, never the batch.
+
+    Returns (spans, rejected count, distinct reasons). Reasons carry the exception type only.
+    """
+    spans: list[Span] = []
+    rejected = 0
+    reasons: list[str] = []
+    for raw in raw_spans:
+        try:
+            spans.append(normalize(raw, project_id, max_chars))
+        except Exception as exc:  # noqa: BLE001 - one bad span must not fail the batch
+            rejected += 1
+            reason = f"span normalization failed: {type(exc).__name__}"
+            if reason not in reasons:
+                reasons.append(reason)
+    return spans, rejected, reasons

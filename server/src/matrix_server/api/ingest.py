@@ -1,4 +1,10 @@
-"""OTLP/HTTP trace receiver: `POST /v1/traces` (protobuf or JSON, optionally gzip)."""
+"""OTLP/HTTP trace receiver: `POST /v1/traces` (protobuf or JSON, optionally gzip).
+
+Status codes: 400 undecodable body, 413 body (or decompressed body, or normalized attribute
+total of `max_normalized_factor` x `max_body_bytes`) too large, 415 unsupported media, 503
+store failure (retryable). Invalid spans are dropped and reported in the OTLP `partial_success`
+(`rejected_spans`, `error_message`) of a 200 response; the rest of the batch is stored.
+"""
 
 from __future__ import annotations
 
@@ -11,8 +17,14 @@ from starlette.concurrency import run_in_threadpool
 
 from matrix_server.auth import current_project_id
 from matrix_server.domain.spans import Span
-from matrix_server.ingest.openinference import normalize_all
-from matrix_server.ingest.otlp import OtlpDecodeError, decode_request, encode_response, is_supported
+from matrix_server.ingest.openinference import normalize_partial
+from matrix_server.ingest.otlp import (
+    AttributeBudgetExceeded,
+    OtlpDecodeError,
+    decode_batch,
+    encode_response,
+    is_supported,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -23,8 +35,8 @@ router = APIRouter()
 on_spans_ingested: list[Callable[[str, list[Span]], None]] = []
 
 
-def _too_large() -> HTTPException:
-    return HTTPException(status_code=413, detail="request body too large")
+def _too_large(detail: str = "request body too large") -> HTTPException:
+    return HTTPException(status_code=413, detail=detail)
 
 
 async def _read_body(request: Request, limit: int) -> bytes:
@@ -42,17 +54,30 @@ async def _read_body(request: Request, limit: int) -> bytes:
 
 
 def _gunzip(body: bytes, limit: int) -> bytes:
-    decompressor = zlib.decompressobj(wbits=16 + zlib.MAX_WBITS)
+    """Decompress every gzip member (RFC 1952 allows several); the total is bounded by `limit`."""
+    parts: list[bytes] = []
+    size = 0
+    data = body
     try:
-        out = decompressor.decompress(body, limit + 1)
-        if len(out) > limit or decompressor.unconsumed_tail:
-            raise _too_large()
-        out += decompressor.flush()
+        while True:
+            remaining = limit - size
+            decompressor = zlib.decompressobj(wbits=16 + zlib.MAX_WBITS)
+            out = decompressor.decompress(data, remaining + 1)
+            if len(out) > remaining or decompressor.unconsumed_tail:
+                raise _too_large()
+            out += decompressor.flush()
+            if len(out) > remaining:
+                raise _too_large()
+            parts.append(out)
+            size += len(out)
+            if not decompressor.eof:
+                raise HTTPException(status_code=400, detail="truncated gzip body")
+            data = decompressor.unused_data
+            if not data.strip(b"\x00"):  # trailing zero padding is tolerated, like gzip(1)
+                break
     except zlib.error as exc:
         raise HTTPException(status_code=400, detail="invalid gzip body") from exc
-    if len(out) > limit:
-        raise _too_large()
-    return out
+    return b"".join(parts)
 
 
 def run_hooks(project_id: str, spans: list[Span]) -> None:
@@ -82,16 +107,28 @@ async def export_traces(request: Request, project_id: str = Depends(current_proj
     if encoding in ("gzip", "x-gzip"):
         body = _gunzip(body, limit)
 
-    def ingest() -> None:
+    max_attribute_bytes = settings.max_normalized_factor * limit
+
+    def ingest() -> tuple[int, list[str]]:
         try:
-            raw_spans = decode_request(body, content_type)
+            batch = decode_batch(body, content_type, max_attribute_bytes=max_attribute_bytes)
         except OtlpDecodeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        spans = normalize_all(raw_spans, project_id, settings.max_attribute_chars)
+        except AttributeBudgetExceeded as exc:
+            raise _too_large("normalized span attributes too large") from exc
+        spans, rejected, reasons = normalize_partial(batch.spans, project_id, settings.max_attribute_chars)
         if spans:
-            request.app.state.span_store.insert(spans)
+            try:
+                request.app.state.span_store.insert(spans)
+            except Exception as exc:  # surfaced as a retryable status; no payload logged
+                logger.error("span store insert failed: %s", type(exc).__name__)
+                raise HTTPException(
+                    status_code=503, detail="span store unavailable", headers={"Retry-After": "5"}
+                ) from exc
             run_hooks(project_id, spans)
+        return batch.rejected + rejected, batch.errors + reasons
 
-    await run_in_threadpool(ingest)
-    content, media_type = encode_response(content_type)
+    rejected, errors = await run_in_threadpool(ingest)
+    message = f"{rejected} span(s) rejected: {'; '.join(errors)}" if rejected else ""
+    content, media_type = encode_response(content_type, rejected, message)
     return Response(content=content, media_type=media_type)

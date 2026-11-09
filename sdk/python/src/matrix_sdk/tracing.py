@@ -70,10 +70,11 @@ class SpanHelper:
 
     # -- lifecycle
     def __enter__(self) -> Self:
+        # Exceptions are recorded once, in __exit__ (with a clear status message).
         self._cm = _tracer().start_as_current_span(
             self.name,
-            record_exception=True,
-            set_status_on_exception=True,
+            record_exception=False,
+            set_status_on_exception=False,
             attributes={SPAN_KIND: self.kind, **self._initial},
         )
         self.span = self._cm.__enter__()
@@ -81,7 +82,6 @@ class SpanHelper:
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         if exc is not None and self.span is not None:
-            # start_as_current_span records/marks too; do it explicitly for a clear message.
             self.span.record_exception(exc)
             self.span.set_status(Status(StatusCode.ERROR, f"{exc_type.__name__}: {exc}"))
         assert self._cm is not None

@@ -13,11 +13,16 @@ __all__ = ["Price", "compute_cost", "get_price", "reload_prices"]
 _DEFAULT_FILE = Path(__file__).with_name("prices.json")
 _ENV_VAR = "MATRIX_PRICES_FILE"
 _FIELDS = ("input", "output", "cache_read", "cache_write")
+# Only provider prefixes and date/version suffixes are stripped; anything else must be a table
+# key or an explicit `_aliases` entry. There is no prefix matching: `o3-pro` is not `o3`.
+_PREFIXES = (re.compile(r"^(?:(?:us|eu|apac|global)\.)?(?:anthropic|meta|mistral|cohere|amazon|openai)\."),)
 _SUFFIXES = (
     re.compile(r"@.*$"),
+    re.compile(r"-v\d+(?::\d+)?$"),
     re.compile(r"-latest$"),
     re.compile(r"-\d{4}-\d{2}-\d{2}$"),
     re.compile(r"-\d{8}$"),
+    re.compile(r"-\d{4}$"),
 )
 
 
@@ -32,6 +37,7 @@ class Price:
 
 
 _table: dict[str, Price] | None = None
+_aliases: dict[str, str] = {}
 
 
 def _build(entry: dict, base: Price | None) -> Price | None:
@@ -46,10 +52,15 @@ def _build(entry: dict, base: Price | None) -> Price | None:
     return Price(**{f: merged[f] for f in _FIELDS})
 
 
-def _merge_file(table: dict[str, Price], path: Path) -> None:
+def _merge_file(table: dict[str, Price], aliases: dict[str, str], path: Path) -> None:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         return
+    raw_aliases = data.get("_aliases")
+    if isinstance(raw_aliases, dict):
+        for alias, target in raw_aliases.items():
+            if not alias.startswith("_") and isinstance(target, str):
+                aliases[alias.strip().lower()] = target.strip().lower()
     for key, entry in data.items():
         if key.startswith("_") or not isinstance(entry, dict):
             continue
@@ -59,16 +70,17 @@ def _merge_file(table: dict[str, Price], path: Path) -> None:
             table[k] = price
 
 
-def _load() -> dict[str, Price]:
+def _load() -> tuple[dict[str, Price], dict[str, str]]:
     table: dict[str, Price] = {}
-    _merge_file(table, _DEFAULT_FILE)
+    aliases: dict[str, str] = {}
+    _merge_file(table, aliases, _DEFAULT_FILE)
     override = os.environ.get(_ENV_VAR)
     if override:
         try:
-            _merge_file(table, Path(override))
+            _merge_file(table, aliases, Path(override))
         except (OSError, ValueError):
             pass  # a broken override must never break ingestion
-    return table
+    return table, aliases
 
 
 def reload_prices() -> None:
@@ -78,9 +90,9 @@ def reload_prices() -> None:
 
 
 def _prices() -> dict[str, Price]:
-    global _table
+    global _table, _aliases
     if _table is None:
-        _table = _load()
+        _table, _aliases = _load()
     return _table
 
 
@@ -94,6 +106,9 @@ def _candidates(name: str) -> list[str]:
     parts = name.split("/")
     for i in range(1, len(parts)):
         add("/".join(parts[i:]))
+    for base in tuple(out):
+        for rx in _PREFIXES:
+            add(rx.sub("", base))
     for base in tuple(out):
         s = base
         for rx in _SUFFIXES:
@@ -109,16 +124,13 @@ def get_price(model: str | None) -> Price | None:
     if not name:
         return None
     table = _prices()
-    cands = _candidates(name)
-    for c in cands:
+    for c in _candidates(name):
         if c in table:
             return table[c]
-    best: str | None = None
-    for c in cands:
-        for key in table:
-            if c.startswith(key) and (best is None or len(key) > len(best)):
-                best = key
-    return table[best] if best else None
+        target = _aliases.get(c)
+        if target is not None and target in table:
+            return table[target]
+    return None
 
 
 def compute_cost(
@@ -128,7 +140,11 @@ def compute_cost(
     cache_read_tokens: int = 0,
     cache_write_tokens: int = 0,
 ) -> float:
-    """Cost in USD. cache_read_tokens are assumed included in input_tokens."""
+    """Cost in USD.
+
+    `input_tokens` is the total prompt size and includes both cache reads and cache writes
+    (OpenInference / OTel GenAI convention); only the remainder is billed at the input price.
+    """
     price = get_price(model)
     if price is None:
         return 0.0
@@ -136,7 +152,7 @@ def compute_cost(
     out = max(int(output_tokens or 0), 0)
     cr = max(int(cache_read_tokens or 0), 0)
     cw = max(int(cache_write_tokens or 0), 0)
-    uncached = max(inp - cr, 0)
+    uncached = max(inp - cr - cw, 0)
     total = (
         uncached * price.input + cr * price.cache_read + cw * price.cache_write + out * price.output
     ) / 1_000_000

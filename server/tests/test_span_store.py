@@ -221,10 +221,22 @@ def test_sessions(store, project):
 
     got = store.get_session(project, "s1")
     assert got is not None
-    summary, traces = got
+    summary, traces, next_cursor = got
     assert summary == s1
     assert [int(t.trace_id, 16) for t in traces] == [2, 1]
+    assert next_cursor is None
     assert store.get_session(project, "missing") is None
+
+
+def test_get_session_paginates_traces(store, project):
+    store.insert([mk(project, n, start_s=n, session_id="s1") for n in range(1, 6)])
+    summary, page1, cursor = store.get_session(project, "s1", limit=2)
+    assert summary.trace_count == 5
+    assert [int(t.trace_id, 16) for t in page1] == [5, 4]
+    _, page2, cursor = store.get_session(project, "s1", limit=2, cursor=cursor)
+    _, page3, cursor = store.get_session(project, "s1", limit=2, cursor=cursor)
+    assert [int(t.trace_id, 16) for t in page2 + page3] == [3, 2, 1]
+    assert cursor is None
 
 
 def test_overview(store, project):
@@ -250,11 +262,23 @@ def test_overview(store, project):
                 start_s=60,
                 dur_ms=300,
                 status="error",
+                kind=SpanKind.LLM,
                 model="gpt-4o",
                 cost_usd=0.25,
                 input_tokens=1,
             ),
-            mk(project, 3, start_s=120, dur_ms=1000, model="claude-haiku-4-5", cost_usd=2.0, output_tokens=7),
+            mk(
+                project,
+                3,
+                start_s=120,
+                dur_ms=1000,
+                kind=SpanKind.LLM,
+                model="claude-haiku-4-5",
+                cost_usd=2.0,
+                output_tokens=7,
+            ),
+            # aggregated usage repeated on an AGENT span is not counted twice
+            mk(project, 4, 1, parent=f"{4:016x}", start_s=180, kind=SpanKind.AGENT, input_tokens=99),
             mk(project, 4, start_s=180, dur_ms=200),
         ]
     )
@@ -332,3 +356,121 @@ def test_build_span_store_clickhouse(clickhouse_store):
 def test_clickhouse_rejects_bad_database_name():
     with pytest.raises(ValueError):
         ClickHouseSpanStore("http://localhost:8123", "bad`name", client=object())
+
+
+def test_exporter_retry_is_counted_once(store, project):
+    # The same spans inserted twice (exporter retry) must not inflate any aggregate.
+    spans = [
+        mk(project, 1, start_s=0, session_id="s1", kind=SpanKind.AGENT),
+        mk(
+            project,
+            1,
+            1,
+            parent=f"{1:016x}",
+            start_s=0.01,
+            kind=SpanKind.LLM,
+            model="gpt-4o",
+            input_tokens=100,
+            output_tokens=10,
+            cost_usd=0.5,
+        ),
+    ]
+    store.insert(spans)
+    before = (
+        store.list_traces(project)[0],
+        store.get_trace(project, f"{1:032x}")[0],
+        store.list_sessions(project)[0],
+        store.get_session(project, "s1"),
+        store.overview(project),
+    )
+    store.insert(spans)
+    store.insert(spans[1:])
+    after = (
+        store.list_traces(project)[0],
+        store.get_trace(project, f"{1:032x}")[0],
+        store.list_sessions(project)[0],
+        store.get_session(project, "s1"),
+        store.overview(project),
+    )
+    assert after == before
+    (summary,) = after[0]
+    assert (summary.span_count, summary.input_tokens, summary.total_cost_usd) == (2, 100, 0.5)
+    assert after[4]["by_model"] == [{"model": "gpt-4o", "calls": 1, "cost_usd": 0.5}]
+    assert after[2][0].total_cost_usd == pytest.approx(0.5)
+
+
+def test_retry_last_write_wins(store, project):
+    first = mk(project, 1, kind=SpanKind.LLM, model="gpt-4o", cost_usd=0.5, input_tokens=1)
+    second = first.model_copy(update={"cost_usd": 0.75, "input_tokens": 2})
+    store.insert([first])
+    store.insert([second])
+    (summary,), _ = store.list_traces(project)
+    assert (summary.span_count, summary.total_cost_usd, summary.input_tokens) == (1, 0.75, 2)
+    assert store.overview(project)["by_model"][0]["cost_usd"] == 0.75
+    assert store.get_span(project, first.trace_id, first.span_id).cost_usd == 0.75
+    # in-batch duplicates: the later one wins too
+    store.insert([second.model_copy(update={"cost_usd": 1.0}), second.model_copy(update={"cost_usd": 2.0})])
+    assert store.list_traces(project)[0][0].total_cost_usd == 2.0
+
+
+def test_since_uses_trace_start_not_late_children(store, project):
+    # Root 48h before `since`, child 1h after: the trace started before `since`, so it is excluded.
+    since = T0 + timedelta(days=3)
+    store.insert(
+        [
+            mk(project, 1, start_s=(since - T0).total_seconds() - 48 * 3600, dur_ms=3 * 3600 * 1000),
+            mk(project, 1, 1, parent=f"{1:016x}", start_s=(since - T0).total_seconds() + 3600, kind=SpanKind.LLM),
+            mk(project, 2, start_s=(since - T0).total_seconds() + 60),
+        ]
+    )
+    items, _ = store.list_traces(project, since=since)
+    assert [int(t.trace_id, 16) for t in items] == [2]
+    assert store.overview(project, since=since)["trace_count"] == 1
+    (old,), _ = store.list_traces(project, until=since - timedelta(hours=1))
+    assert old.span_count == 2 and old.start_time == since - timedelta(hours=48)
+
+
+def test_token_totals_only_from_llm_and_embedding(store, project):
+    store.insert(
+        [
+            mk(project, 1, kind=SpanKind.AGENT, input_tokens=150, output_tokens=15),
+            mk(project, 1, 1, parent=f"{1:016x}", kind=SpanKind.LLM, input_tokens=100, output_tokens=10),
+            mk(project, 1, 2, parent=f"{1:016x}", kind=SpanKind.EMBEDDING, input_tokens=50),
+            mk(project, 1, 3, parent=f"{1:016x}", kind=SpanKind.CHAIN, input_tokens=150, output_tokens=10),
+        ]
+    )
+    (summary,), _ = store.list_traces(project)
+    assert (summary.input_tokens, summary.output_tokens) == (150, 10)
+    assert store.get_trace(project, summary.trace_id)[0].input_tokens == 150
+    ov = store.overview(project)
+    assert (ov["input_tokens"], ov["output_tokens"]) == (150, 10)
+
+
+def test_max_limit_is_500(store, project):
+    from matrix_server.storage.spans import MAX_LIMIT
+
+    assert MAX_LIMIT == 500
+    store.insert([mk(project, n, start_s=n) for n in range(1, 503)])
+    items, cursor = store.list_traces(project, limit=10_000)
+    assert len(items) == 500 and cursor is not None
+
+
+def test_clickhouse_schema_is_replacing_merge_tree(clickhouse_store):
+    rows = clickhouse_store._client.query(
+        "SELECT engine_full FROM system.tables WHERE database = {db:String} AND name = 'spans'",
+        parameters={"db": clickhouse_store.database},
+    ).result_rows
+    assert rows[0][0].startswith("ReplacingMergeTree(version)")
+
+
+def test_clickhouse_retry_deduped_after_merge(clickhouse_store, project):
+    span = mk(project, 1, kind=SpanKind.LLM, model="gpt-4o", cost_usd=0.5)
+    clickhouse_store.insert([span])
+    clickhouse_store.insert([span.model_copy(update={"cost_usd": 0.75})])
+    clickhouse_store._client.command(f"OPTIMIZE TABLE {clickhouse_store.table} FINAL")
+    count = clickhouse_store._client.query(
+        f"SELECT count() FROM {clickhouse_store.table} WHERE project_id = {{p:String}}",
+        parameters={"p": project},
+    ).result_rows[0][0]
+    assert count == 1
+    assert clickhouse_store.list_traces(project)[0][0].total_cost_usd == 0.75

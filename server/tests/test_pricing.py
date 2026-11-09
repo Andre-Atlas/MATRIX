@@ -37,10 +37,43 @@ def test_normalisation(name, key):
     assert get_price(name) is not None
 
 
-def test_longest_prefix_wins():
-    assert get_price("gpt-4o-mini-custom-ft").input == get_price("gpt-4o-mini").input
-    assert get_price("gpt-5-mini-foo").input == get_price("gpt-5-mini").input
-    assert get_price("o3-mini-high").input == get_price("o3-mini").input
+@pytest.mark.parametrize(
+    "name,key",
+    [
+        ("us.anthropic.claude-sonnet-4-20250514-v1:0", "claude-sonnet-4"),
+        ("anthropic.claude-3-5-sonnet-20241022-v2:0", "claude-3-5-sonnet"),
+        ("chatgpt-4o-latest", "gpt-4o"),
+        ("meta-llama/Llama-3.1-8B-Instruct", "llama-3.1-8b"),
+        ("mistral-large-2411", "mistral-large"),
+        ("claude-opus-4-0", "claude-opus-4"),
+    ],
+)
+def test_version_suffixes_and_explicit_aliases(name, key):
+    assert get_price(name) is not None
+    assert get_price(name) == get_price(key)
+
+
+@pytest.mark.parametrize(
+    "name", ["o3-pro", "claude-opus-4-6", "gpt-4o-mini-tts", "o3-mini-high", "gpt-5-mini-foo", "gpt-4o-mini-ft"]
+)
+def test_no_prefix_fallback(name):
+    # A different model that merely starts with a known key must not get that key's price.
+    assert get_price(name) is None
+    assert compute_cost(name, 1000, 1000) == 0.0
+
+
+def test_aliases_from_override_file(tmp_path, monkeypatch):
+    path = tmp_path / "prices.json"
+    path.write_text(json.dumps({"_aliases": {"my-alias": "gpt-4o"}}))
+    monkeypatch.setenv("MATRIX_PRICES_FILE", str(path))
+    reload_prices()
+    assert get_price("my-alias") == get_price("gpt-4o")
+
+
+def test_cache_write_not_billed_twice():
+    # 1M prompt tokens of which 200k cache reads and 300k cache writes: 500k at the input price.
+    cost = compute_cost("claude-sonnet-4", 1_000_000, 0, 200_000, 300_000)
+    assert cost == pytest.approx((500_000 * 3 + 200_000 * 0.3 + 300_000 * 3.75) / 1_000_000)
 
 
 def test_unknown_and_empty():

@@ -316,8 +316,8 @@ class AnthropicProvider(_HTTPBase):
             input_tokens=base_in + cr + cw,
             output_tokens=out,
             latency_ms=round(latency, 3),
-            # compute_cost expects cache reads inside input_tokens and cache writes separately.
-            cost_usd=compute_cost(resolved, base_in + cr, out, cr, cw),
+            # compute_cost expects cache reads and writes both included in input_tokens.
+            cost_usd=compute_cost(resolved, base_in + cr + cw, out, cr, cw),
             model=resolved,
             raw=data,
         )

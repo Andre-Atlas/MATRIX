@@ -219,3 +219,73 @@ def test_create_dataset_item():
     make_client(handler).create_dataset_item("d1", {"q": "x"}, expected_output="y", context=["c"])
     assert seen["path"] == "/api/v1/datasets/d1/items"
     assert seen["body"] == {"input": {"q": "x"}, "expected_output": "y", "context": ["c"]}
+
+
+# -- review regressions
+
+def test_exception_recorded_once(spans):
+    with pytest.raises(ValueError), mx.trace_tool("t"):
+        raise ValueError("boom")
+    (span,) = spans.get_finished_spans()
+    assert [e.name for e in span.events] == ["exception"]
+    assert span.status.status_code == StatusCode.ERROR and span.status.description == "ValueError: boom"
+
+
+def test_refresh_threads_pruned(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(client_mod, "_clock", lambda: now[0])
+    c = make_client(lambda req: httpx.Response(200, json=prompt_json(1)))
+    c.get_prompt("greet")
+    for _ in range(30):
+        now[0] += 100
+        c.get_prompt("greet", cache_ttl=1)
+        c.wait_for_refreshes()
+    now[0] += 100
+    c.get_prompt("greet", cache_ttl=1)
+    assert len(c._threads) <= 2
+    c.wait_for_refreshes()
+    assert c._threads == []
+
+
+def test_init_reuses_existing_global_sdk_provider(monkeypatch):
+    exporter = InMemorySpanExporter()
+    app_provider = TracerProvider()
+    app_provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(client_mod.trace, "get_tracer_provider", lambda: app_provider)
+    set_calls = []
+    monkeypatch.setattr(client_mod.trace, "set_tracer_provider", set_calls.append)
+    matrix_exporter = InMemorySpanExporter()
+    monkeypatch.setattr(client_mod, "OTLPSpanExporter", lambda **kw: matrix_exporter)
+    c = mx.init(api_key="k", endpoint="http://m.test", batch=False)
+    try:
+        assert c.tracer_provider is app_provider and set_calls == []
+        procs = app_provider._active_span_processor._span_processors
+        assert any(isinstance(p, tracing.SessionSpanProcessor) for p in procs)
+        with mx.session("s1"), mx.trace_chain("c"):  # helpers use the app's provider
+            pass
+        (span,) = exporter.get_finished_spans()
+        (sent,) = matrix_exporter.get_finished_spans()  # and MATRIX receives the same span
+        assert span.attributes["session.id"] == "s1" and sent.context == span.context
+    finally:
+        tracing._set_provider(None)
+        c.shutdown()
+    # shutdown stops only MATRIX's processors, not the application's provider or exporter
+    assert not exporter._stopped
+
+
+def test_score_label_and_path_encoding():
+    seen = []
+
+    def handler(req):
+        seen.append(req)
+        if req.url.path.startswith("/api/v1/prompts"):
+            return httpx.Response(200, json=prompt_json(1))
+        return httpx.Response(200, json={"id": "1"})
+
+    c = make_client(handler)
+    c.score("t" * 32, "quality", 1.0, label="good")
+    assert json.loads(seen[-1].content)["label"] == "good"
+    c.get_prompt("team/greet?x#y")
+    assert seen[-1].url.raw_path.startswith(b"/api/v1/prompts/team%2Fgreet%3Fx%23y?")
+    c.create_dataset_item("../d 1", {"q": 1})
+    assert seen[-1].url.raw_path == b"/api/v1/datasets/..%2Fd%201/items"

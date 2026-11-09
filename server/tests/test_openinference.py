@@ -279,3 +279,63 @@ def test_project_id_not_serialized(spans):
     dumped = spans[AGENT_ID].model_dump(mode="json")
     assert "project_id" not in dumped
     assert dumped["start_time"] == "2026-11-09T12:00:00.000000Z"
+
+
+def _one(attrs, *, parent=None):
+    request = export_request([pb_span(AGENT_TRACE_ID, LLM1_ID, "s", 0, 1, attrs, parent=parent)])
+    return _normalized(request)[LLM1_ID]
+
+
+@pytest.mark.parametrize(
+    "read_key,write_key",
+    [
+        ("gen_ai.usage.cache_read.input_tokens", "gen_ai.usage.cache_creation.input_tokens"),
+        ("gen_ai.usage.cache_read_input_tokens", "gen_ai.usage.cache_creation_input_tokens"),
+        ("llm.token_count.prompt_details.cache_read", "llm.token_count.prompt_details.cache_write"),
+    ],
+)
+def test_cache_token_names_and_cost(read_key, write_key):
+    span = _one(
+        {
+            "gen_ai.operation.name": "chat",
+            "gen_ai.request.model": "claude-sonnet-4",
+            "gen_ai.usage.input_tokens": 1000,
+            "gen_ai.usage.output_tokens": 10,
+            read_key: 200,
+            write_key: 300,
+        }
+    )
+    assert (span.cache_read_tokens, span.cache_write_tokens) == (200, 300)
+    # cache writes are part of input_tokens: billed once at the cache-write price
+    assert span.cost_usd == pytest.approx((500 * 3 + 200 * 0.3 + 300 * 3.75 + 10 * 15) / 1_000_000)
+
+
+def test_unknown_model_flagged_and_free():
+    span = _one({"openinference.span.kind": "LLM", "llm.model_name": "o3-pro", "llm.token_count.prompt": 10})
+    assert span.cost_usd == 0.0
+    assert span.attributes["matrix.cost_unknown_model"] is True
+    known = _one({"openinference.span.kind": "LLM", "llm.model_name": "o3", "llm.token_count.prompt": 10})
+    assert "matrix.cost_unknown_model" not in known.attributes and known.cost_usd > 0
+
+
+def test_embedding_vectors_removed_and_kind_inferred():
+    span = _one(
+        {
+            "embedding.model_name": "text-embedding-3-small",
+            "embedding.embeddings.0.embedding.text": "hello",
+            "embedding.embeddings.0.embedding.vector": [0.1] * 1536,
+            "embedding.embeddings.1.embedding.vector": [0.2] * 1536,
+            "llm.token_count.prompt": 1000,
+        },
+        parent=AGENT_ID,
+    )
+    assert span.kind == SpanKind.EMBEDDING
+    assert span.attributes["embedding.embeddings.0.embedding.text"] == "hello"
+    assert not any(k.endswith(".embedding.vector") for k in span.attributes)
+    assert span.attributes["matrix.embedding_vectors_removed"] == 2
+    assert span.cost_usd == compute_cost("text-embedding-3-small", 1000, 0)
+
+
+def test_token_counts_clamped():
+    span = _one({"llm.model_name": "gpt-4o", "llm.token_count.prompt": 1e30, "llm.token_count.completion": -5})
+    assert (span.input_tokens, span.output_tokens) == (2**63 - 1, 0)

@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     admin_token: str | None = None
     max_body_bytes: int = 10_000_000
     max_attribute_chars: int = 100_000
+    # Bound on the decoded attribute size of one request (resource/scope attributes are copied
+    # into each span): max_normalized_factor x max_body_bytes, else 413.
+    max_normalized_factor: int = 4
 
 
 @lru_cache

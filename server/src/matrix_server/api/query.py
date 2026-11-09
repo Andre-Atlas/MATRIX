@@ -17,7 +17,7 @@ from matrix_server.auth import current_project_id
 from matrix_server.domain.spans import SessionSummary, Span, TraceSummary, UtcDatetime
 from matrix_server.storage.db import as_utc
 from matrix_server.storage.models import Score
-from matrix_server.storage.spans import InvalidCursor
+from matrix_server.storage.spans import MAX_LIMIT, InvalidCursor
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +71,7 @@ class SessionPage(BaseModel):
 class SessionDetail(BaseModel):
     session: SessionSummary
     traces: list[TraceSummary]
+    next_cursor: str | None = None
 
 
 def _span_store(request: Request) -> Any:
@@ -143,7 +144,7 @@ def list_traces(
     kind: str | None = None,
     since: datetime | None = None,
     until: datetime | None = None,
-    limit: Annotated[int, Query(ge=1, le=500)] = 50,
+    limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = 50,
     cursor: str | None = None,
 ) -> TracePage:
     try:
@@ -179,7 +180,7 @@ def get_trace(request: Request, trace_id: str, project_id: str = Depends(current
 def list_sessions(
     request: Request,
     project_id: str = Depends(current_project_id),
-    limit: Annotated[int, Query(ge=1, le=500)] = 50,
+    limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = 50,
     cursor: str | None = None,
 ) -> SessionPage:
     try:
@@ -191,14 +192,21 @@ def list_sessions(
 
 @router.get("/sessions/{session_id}", response_model=SessionDetail)
 def get_session(
-    request: Request, session_id: str, project_id: str = Depends(current_project_id)
+    request: Request,
+    session_id: str,
+    project_id: str = Depends(current_project_id),
+    limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = 50,
+    cursor: str | None = None,
 ) -> SessionDetail:
-    found = _span_store(request).get_session(project_id, session_id)
+    try:
+        found = _span_store(request).get_session(project_id, session_id, limit=limit, cursor=cursor)
+    except InvalidCursor as exc:
+        raise HTTPException(status_code=400, detail="invalid cursor") from exc
     if found is None:
         raise HTTPException(status_code=404, detail="session not found")
-    summary, traces = found
+    summary, traces, next_cursor = found
     _fill_scores(request, project_id, traces)
-    return SessionDetail(session=summary, traces=traces)
+    return SessionDetail(session=summary, traces=traces, next_cursor=next_cursor)
 
 
 @router.get("/stats/overview")

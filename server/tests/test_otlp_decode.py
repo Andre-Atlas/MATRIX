@@ -182,3 +182,38 @@ def test_unsupported_content_type():
 def test_encode_response():
     assert encode_response("application/x-protobuf") == (b"", "application/x-protobuf")
     assert encode_response("application/json") == (b"{}", "application/json")
+
+
+def test_decode_batch_rejects_bad_spans_individually():
+    from matrix_server.ingest.otlp import decode_batch
+
+    request = export_request(
+        [pb_span(AGENT_TRACE_ID, AGENT_ID, "ok", 0, 1, {}), pb_span(AGENT_TRACE_ID, ERROR_ID, "bad", 0, 1, {})]
+    )
+    request.resource_spans[0].scope_spans[0].spans[1].span_id = b"\x01"
+    batch = decode_batch(request.SerializeToString(), "application/x-protobuf")
+    assert [s.span_id for s in batch.spans] == [AGENT_ID]
+    assert batch.rejected == 1 and batch.errors == ["invalid span id"]
+
+
+def test_decode_batch_attribute_budget():
+    from matrix_server.ingest.otlp import AttributeBudgetExceeded, decode_batch
+
+    request = export_request(
+        [pb_span(AGENT_TRACE_ID, f"{i + 1:016x}", "s", 0, 1, {}) for i in range(10)],
+        resource_attrs={"big": "x" * 4000},
+    )
+    body = request.SerializeToString()
+    assert len(decode_batch(body, "application/x-protobuf", max_attribute_bytes=50_000).spans) == 10
+    with pytest.raises(AttributeBudgetExceeded):
+        decode_batch(body, "application/x-protobuf", max_attribute_bytes=20_000)
+
+
+def test_encode_partial_success():
+    from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceResponse
+
+    content, _ = encode_response("application/x-protobuf", 2, "2 span(s) rejected")
+    parsed = ExportTraceServiceResponse.FromString(content)
+    assert (parsed.partial_success.rejected_spans, parsed.partial_success.error_message) == (2, "2 span(s) rejected")
+    content, _ = encode_response("application/json", 2, "x")
+    assert json.loads(content) == {"partialSuccess": {"rejectedSpans": "2", "errorMessage": "x"}}
