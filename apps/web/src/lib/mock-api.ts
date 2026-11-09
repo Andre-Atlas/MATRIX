@@ -2,6 +2,7 @@
 import { ApiError } from "./api-error";
 import { mockDb } from "./mock-data";
 import { evalExportJsonl, evalGet, evalSend } from "./mock-evals";
+import { dpoExportJsonl, opsGet, opsSend } from "./mock-ops";
 import type { ListResponse, OverviewStats, Score, SessionDetail, TraceDetail, TraceSummary } from "./types";
 
 type Params = Record<string, string | number | undefined>;
@@ -106,18 +107,24 @@ export async function mockGet<T>(path: string, params: Params = {}): Promise<T> 
       .filter((t) => t.summary.session_id === s.session_id)
       .map((t) => t.summary)
       .sort((a, b) => a.start_time.localeCompare(b.start_time));
-    const detail: SessionDetail = { session: s, traces };
+    const { items, next_cursor } = page(traces, params);
+    const detail: SessionDetail = { session: s, traces: items, next_cursor };
     return detail as T;
   }
 
   const evalResult = evalGet(p);
   if (evalResult !== undefined) return evalResult as T;
 
+  const opsResult = opsGet(p, params);
+  if (opsResult !== undefined) return opsResult as T;
+
   throw new ApiError(404, `mock: no handler for GET ${path}`);
 }
 
 export async function mockSend<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const out = evalSend(method.toUpperCase(), path.replace(/\/+$/, ""), body);
+  const m = method.toUpperCase();
+  const p = path.replace(/\/+$/, "");
+  const out = evalSend(m, p, body) ?? opsSend(m, p, body);
   if (out === undefined) throw new ApiError(404, `mock: no handler for ${method} ${path}`);
   return out as T;
 }
@@ -126,12 +133,12 @@ export async function mockSend<T>(method: string, path: string, body?: unknown):
 export async function mockFetch(method: string, path: string, params: Params, rawBody: string | null): Promise<Response> {
   try {
     if (method === "GET") {
-      const text = evalExportJsonl(path);
+      const text = evalExportJsonl(path) ?? dpoExportJsonl(path);
       if (text !== undefined) {
         return new Response(text, {
           headers: {
             "content-type": "application/x-ndjson",
-            "content-disposition": `attachment; filename="${path.split("/").at(-2)}.jsonl"`,
+            "content-disposition": `attachment; filename="${path.endsWith("dpo.jsonl") ? "dpo" : path.split("/").at(-2)}.jsonl"`,
           },
         });
       }

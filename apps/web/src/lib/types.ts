@@ -63,6 +63,8 @@ export type Span = {
   input_tokens: number;
   output_tokens: number;
   reasoning_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
   cost_usd: number;
   ttft_ms: number | null;
   input: string | null;
@@ -104,7 +106,7 @@ export type ListResponse<T> = { items: T[]; next_cursor: string | null };
 
 export type TraceDetail = { trace: TraceSummary; spans: Span[] };
 
-export type SessionDetail = { session: SessionSummary; traces: TraceSummary[] };
+export type SessionDetail = { session: SessionSummary; traces: TraceSummary[]; next_cursor: string | null };
 
 export type OverviewStats = {
   trace_count: number;
@@ -286,3 +288,132 @@ export type CreateExperimentRequest = {
 };
 
 export const metricKey = (m: MetricSpec): string => m.name || m.type;
+
+// ── Prompts (spec §4 "Prompts"; backend: server/src/matrix_server/api/prompts.py) ───────────
+
+export type PromptType = "text" | "chat";
+export const PROMPT_ROLES = ["system", "user", "assistant", "tool"] as const;
+export type PromptRole = (typeof PROMPT_ROLES)[number];
+export type ChatTemplateMessage = { role: string; content: string };
+export type PromptTemplate = string | ChatTemplateMessage[];
+
+export type PromptSummary = {
+  name: string;
+  latest_version: number;
+  labels: Record<string, number>;
+  updated_at: string;
+};
+
+export type PromptVersion = {
+  name: string;
+  version: number;
+  type: PromptType;
+  template: PromptTemplate;
+  variables: string[];
+  config: Record<string, unknown>;
+  response_schema: Record<string, unknown> | boolean | null;
+  labels: string[];
+  commit_message: string | null;
+  created_at: string;
+};
+
+/** Prompt lists are `{items}` only (no cursor). */
+export type PromptList = { items: PromptSummary[] };
+export type PromptVersionList = { items: PromptVersion[] };
+
+export type CreatePromptRequest = {
+  name: string;
+  type: PromptType;
+  template: PromptTemplate;
+  config?: Record<string, unknown>;
+  response_schema?: Record<string, unknown> | boolean | null;
+  labels?: string[];
+  commit_message?: string | null;
+};
+
+export type MoveLabelRequest = { label: string; version: number };
+
+// ── Annotation, rules, online evals, alerts (spec §4 "Anotação, regras e avaliação online") ──
+
+export type AnnotationStatus = "pending" | "done";
+
+export type Annotation = {
+  id: string;
+  trace_id: string;
+  reason: string | null;
+  status: AnnotationStatus;
+  created_at: string;
+  completed_at: string | null;
+};
+
+/** List items are enriched with the trace summary (null when the trace is gone). */
+export type AnnotationListItem = Annotation & {
+  trace_name: string | null;
+  input_preview: string | null;
+  output_preview: string | null;
+};
+
+export type CreateAnnotationRequest = { trace_id: string; reason?: string | null };
+export type CompleteAnnotationRequest = {
+  scores?: { name: string; value: number }[];
+  corrected_output?: string | null;
+  add_to_dataset_id?: string | null;
+  comment?: string | null;
+};
+
+export type RuleCondition = {
+  score_name?: string;
+  op?: "<" | "<=" | ">" | ">=" | "==";
+  value?: number;
+  feedback?: "negative";
+  min_latency_ms?: number;
+  status?: "error";
+};
+export const RULE_OPS = ["<", "<=", ">", ">=", "=="] as const;
+export type RuleAction = "annotate" | "add_to_dataset" | "alert";
+export const RULE_ACTIONS: RuleAction[] = ["annotate", "add_to_dataset", "alert"];
+
+export type Rule = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  condition: RuleCondition;
+  actions: RuleAction[];
+  dataset_id: string | null;
+  created_at: string;
+};
+export type CreateRuleRequest = {
+  name: string;
+  enabled?: boolean;
+  condition: RuleCondition;
+  actions: RuleAction[];
+  dataset_id?: string | null;
+};
+
+export type OnlineEval = {
+  id: string;
+  name: string;
+  metric: string;
+  params: Record<string, unknown>;
+  sampling_rate: number;
+  filter: { kind?: SpanKind; name?: string };
+  model: { provider: string; name: string } | null;
+  enabled: boolean;
+  created_at: string;
+};
+export type CreateOnlineEvalRequest = {
+  name: string;
+  metric: string;
+  params?: Record<string, unknown>;
+  sampling_rate: number;
+  filter?: { kind?: SpanKind; name?: string };
+  model?: { provider: string; name: string };
+};
+
+export type Alert = {
+  id: string;
+  rule_id: string | null;
+  trace_id: string;
+  message: string;
+  created_at: string;
+};

@@ -163,7 +163,7 @@ function Stat({ label, children }: { label: string; children: React.ReactNode })
   );
 }
 
-export function SpanPanel({ span, traceStart }: { span: Span; traceStart: number }) {
+export function SpanPanel({ span, traceStart, readOnly = false }: { span: Span; traceStart: number; readOnly?: boolean }) {
   const startOffset = Date.parse(span.start_time) - traceStart;
   const inMime = typeof span.attributes["input.mime_type"] === "string" ? (span.attributes["input.mime_type"] as string) : null;
   const outMime =
@@ -183,7 +183,7 @@ export function SpanPanel({ span, traceStart }: { span: Span; traceStart: number
           <Mono className="text-[11px] text-zinc-500">{span.span_id}</Mono>
         </div>
         <div className="shrink-0">
-          <AddToDataset traceId={span.trace_id} spanId={span.span_id} />
+          {!readOnly && <AddToDataset traceId={span.trace_id} spanId={span.span_id} />}
         </div>
       </header>
 
@@ -206,6 +206,12 @@ export function SpanPanel({ span, traceStart }: { span: Span; traceStart: number
               <Stat label="Tokens in">{formatTokens(span.input_tokens)}</Stat>
               <Stat label="Tokens out">{formatTokens(span.output_tokens)}</Stat>
               <Stat label="Reasoning">{formatTokens(span.reasoning_tokens)}</Stat>
+              {span.cache_read_tokens + span.cache_write_tokens > 0 && (
+                <>
+                  <Stat label="Cache read">{formatTokens(span.cache_read_tokens)}</Stat>
+                  <Stat label="Cache write">{formatTokens(span.cache_write_tokens)}</Stat>
+                </>
+              )}
             </>
           )}
           {span.cost_usd > 0 && <Stat label="Cost">{formatCost(span.cost_usd)}</Stat>}

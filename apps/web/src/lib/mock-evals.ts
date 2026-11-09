@@ -729,6 +729,16 @@ function itemFromSpan(s: Store, datasetId: string, body: DatasetItemFromSpanRequ
   };
 }
 
+/** Used by the annotation mock: adds the trace's root span as a regression case (optionally with a corrected answer). */
+export function mockAddTraceToDataset(datasetId: string, traceId: string, expectedOutput: string | null): DatasetItem {
+  const s = store();
+  if (!s.datasets.some((d) => d.id === datasetId)) throw new ApiError(404, "dataset not found");
+  const item = itemFromSpan(s, datasetId, { trace_id: traceId });
+  if (expectedOutput !== null) item.expected_output = expectedOutput;
+  s.items.push(item);
+  return item;
+}
+
 function validateExperiment(s: Store, body: CreateExperimentRequest) {
   if (!body?.name?.trim()) bad("name is required");
   if (!s.datasets.some((d) => d.id === body.dataset_id)) bad("dataset_id: unknown dataset");

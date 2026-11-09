@@ -7,11 +7,25 @@ import { EmptyState, Mono, ScoreChips, StatusBadge } from "@/components/ui";
 
 export const dynamic = "force-dynamic";
 
-export default async function SessionPage({ params }: { params: Promise<{ sessionId: string }> }) {
+const PAGE_SIZE = 50;
+
+export default async function SessionPage({
+  params,
+  searchParams,
+}: {
+  params: Promise<{ sessionId: string }>;
+  searchParams: Promise<{ cursor?: string; o?: string }>;
+}) {
   const { sessionId } = await params;
+  const sp = await searchParams;
+  // `o` is how many turns precede this page, so numbering continues across pages.
+  const offset = Math.max(0, Number.parseInt(sp.o ?? "0", 10) || 0);
   let detail: SessionDetail;
   try {
-    detail = await apiGet<SessionDetail>(`/api/v1/sessions/${encodeURIComponent(sessionId)}`);
+    detail = await apiGet<SessionDetail>(`/api/v1/sessions/${encodeURIComponent(sessionId)}`, {
+      limit: PAGE_SIZE,
+      cursor: sp.cursor,
+    });
   } catch (e) {
     if (isNotFound(e)) notFound();
     throw e;
@@ -58,7 +72,7 @@ export default async function SessionPage({ params }: { params: Promise<{ sessio
                 }`}
               />
               <div className="mb-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-zinc-500">
-                <span className="font-medium text-zinc-300">Turn {i + 1}</span>
+                <span className="font-medium text-zinc-300">Turn {offset + i + 1}</span>
                 <Mono>{formatClock(t.start_time)}</Mono>
                 <StatusBadge status={t.status} />
                 <Mono>{formatDuration(t.duration_ms)}</Mono>
@@ -101,6 +115,23 @@ export default async function SessionPage({ params }: { params: Promise<{ sessio
             </li>
           ))}
         </ol>
+      )}
+      {(sp.cursor || detail.next_cursor) && (
+        <nav aria-label="Pagination" className="mt-5 flex gap-4 text-xs">
+          {sp.cursor && (
+            <Link href={`/sessions/${encodeURIComponent(sessionId)}`} className="text-zinc-400 hover:text-zinc-100">
+              ← First turns
+            </Link>
+          )}
+          {detail.next_cursor && (
+            <Link
+              href={`/sessions/${encodeURIComponent(sessionId)}?${new URLSearchParams({ cursor: detail.next_cursor, o: String(offset + turns.length) }).toString()}`}
+              className="text-emerald-300 hover:underline"
+            >
+              Next turns →
+            </Link>
+          )}
+        </nav>
       )}
     </div>
   );

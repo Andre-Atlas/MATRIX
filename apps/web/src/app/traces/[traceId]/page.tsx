@@ -5,6 +5,7 @@ import { formatCost, formatDuration, formatTimestamp, formatTokens } from "@/lib
 import { agentGraph, traceBounds, waterfallRows } from "@/lib/trace-tree";
 import type { TraceDetail } from "@/lib/types";
 import { EmptyState, KindBadge, Mono, ScoreChips, StatusBadge } from "@/components/ui";
+import { AnnotateButton } from "@/components/annotations/annotate-button";
 import { AgentGraph } from "@/components/trace/agent-graph";
 import { SpanPanel } from "@/components/trace/span-panel";
 import { Waterfall } from "@/components/trace/waterfall";
@@ -85,8 +86,9 @@ export default async function TracePage({
             </div>
           )}
         </dl>
-        <div className="ml-auto">
+        <div className="ml-auto flex items-center gap-3">
           <ScoreChips scores={trace.scores} max={6} />
+          <AnnotateButton traceId={trace.trace_id} />
         </div>
       </header>
 
