@@ -1,4 +1,4 @@
-.PHONY: test lint dev-api dev-web up
+.PHONY: test lint dev-api dev-web up demo
 
 test:
 	cd server && uv run pytest -q
@@ -18,3 +18,6 @@ dev-web:
 
 up:
 	docker compose -f deploy/compose.yaml up --build
+
+demo:
+	uv run --project server python scripts/verify_mvp.py

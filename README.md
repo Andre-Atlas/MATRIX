@@ -21,6 +21,16 @@ make dev-web   # web em :3000
 make up        # stack completa via docker compose
 ```
 
+## Demo ponta a ponta
+
+`examples/rag_demo.py` simula um agente de suporte com RAG (3 sessões, 8 turnos, com erro de ferramenta, resposta contraditória e feedback negativo) usando só o SDK:
+
+```bash
+MATRIX_API_KEY=... MATRIX_ENDPOINT=http://localhost:8000 uv run --project sdk/python python examples/rag_demo.py
+```
+
+`make demo` roda `scripts/verify_mvp.py`: sobe API e worker (ClickHouse e PostgreSQL locais, com `alembic upgrade head` já aplicado), cria projeto, regras e avaliação online, executa o demo e confere cada critério do MVP pela API, imprimindo PASS/FAIL. Sai com código 0 só se todos passarem.
+
 ## Testes
 
 ```bash
