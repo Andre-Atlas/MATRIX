@@ -21,3 +21,4 @@
 Formato: `T<n> · [tag] · C<n> → modelo/esforço (papel)`.
 
 ## Progresso
+- T02 · [core] · C2 → sonnet/low (implementer) · revisão C2 → feita pelo orquestrador (scaffold sem lógica; `make test` e `make lint` verdes)

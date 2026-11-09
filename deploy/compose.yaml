@@ -1,0 +1,82 @@
+name: matrix
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    ports:
+      - "8123:8123"
+    environment:
+      CLICKHOUSE_DB: matrix
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: matrix
+      POSTGRES_USER: matrix
+      POSTGRES_PASSWORD: matrix
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U matrix -d matrix"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address :9001
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
+  api:
+    build: ../server
+    command: ["matrix-api"]
+    environment: &server-env
+      MATRIX_DATABASE_URL: postgresql+psycopg://matrix:matrix@postgres:5432/matrix
+      MATRIX_SPAN_STORE: clickhouse
+      MATRIX_CLICKHOUSE_URL: http://clickhouse:8123
+      MATRIX_ADMIN_TOKEN: ${MATRIX_ADMIN_TOKEN:-}
+    ports:
+      - "8000:8000"
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  worker:
+    build: ../server
+    command: ["matrix-worker"]
+    environment: *server-env
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  web:
+    build: ../apps/web
+    environment:
+      MATRIX_API_URL: http://api:8000
+      MATRIX_API_KEY: ${MATRIX_API_KEY:-}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+volumes:
+  clickhouse-data:
+  postgres-data:
+  minio-data:
