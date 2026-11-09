@@ -31,3 +31,14 @@ Formato: `T<n> · [tag] · C<n> → modelo/esforço (papel)`.
 - T08 · [design] · C4 → opus/medium (implementer)
 
 ## Progresso
+- Revisão F1 (C5, opus/high): 2 HIGH confirmados (amplificação de memória por atributos de resource; duplicatas de retry inflando agregados no ClickHouse), 4 MEDIUM, 8 LOW. Isolamento por projeto, SQL parametrizado, limite de gzip e auth confirmados corretos.
+- Correção F1 · C5 → opus/high (implementer) — 1ª rodada de correção, sem escalonamento.
+- T09 · [arch] · C4 → opus/medium (implementer) — 272 testes (SQLite + PostgreSQL)
+- T10 · [core] · C4 → opus/medium (implementer) — 62 testes
+- T11 · [core] · C4 → opus/medium (implementer)
+- T12 · [design] · C4 → opus/medium (implementer)
+- T15 · [core] · C3 → sonnet/medium (implementer)
+- Ruling: bancos de teste separados por agente paralelo (`matrix_test_a/_b/_c`) porque os testes recriam as tabelas — evita interferência entre agentes — custo: nenhum.
+- T13 · [core] · C3 → sonnet/medium (implementer) — 32 testes
+- T17 · [core] · C4 → opus/medium (implementer)
+- Ruling: quatro agentes (correção F1, T11, T12, T17) pararam pelo limite de uso da conta às ~10:00 UTC; o container reiniciou. Retomados às 17:27 UTC a partir do estado salvo, com ClickHouse e Postgres reiniciados — sem perda de trabalho; a janela de 8h estourou por esse intervalo — custo: só tempo.
