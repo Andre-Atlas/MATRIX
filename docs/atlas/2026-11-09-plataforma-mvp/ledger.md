@@ -42,3 +42,9 @@ Formato: `T<n> · [tag] · C<n> → modelo/esforço (papel)`.
 - T13 · [core] · C3 → sonnet/medium (implementer) — 32 testes
 - T17 · [core] · C4 → opus/medium (implementer)
 - Ruling: quatro agentes (correção F1, T11, T12, T17) pararam pelo limite de uso da conta às ~10:00 UTC; o container reiniciou. Retomados às 17:27 UTC a partir do estado salvo, com ClickHouse e Postgres reiniciados — sem perda de trabalho; a janela de 8h estourou por esse intervalo — custo: só tempo.
+- T11 · [core] · C4 → opus/medium (implementer) — integrado; create_app liga todos os routers e hooks sem empilhar
+- T12 · [design] · C4 → opus/medium (implementer) — 52 testes web
+- T14+T16 · [design] · C3 → sonnet/medium (implementer, um agente para as duas por terem o mesmo nível e a mesma área)
+- T18 · [core] · C3 → sonnet/medium (implementer)
+- Revisão backend T09–T17 · C4 → opus/medium (security-reviewer): 4 HIGH (lease sem renovação, ReDoS na métrica regex, hooks de score ausentes no worker, sem limite de corpo nas rotas JSON), 2 MEDIUM. Sem IDOR nem SSRF.
+- Correção backend · C4 → opus/medium (implementer) — 1ª rodada
