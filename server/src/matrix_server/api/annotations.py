@@ -13,14 +13,14 @@ from typing import Annotated, Any, Literal
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session
 
 from matrix_server.api import query
 from matrix_server.auth import current_project_id
 from matrix_server.rules import item_from_trace, root_of_trace
 from matrix_server.storage.annotations import complete_annotation, open_annotation
-from matrix_server.storage.db import as_utc
+from matrix_server.storage.db import as_utc, utcnow
 from matrix_server.storage.models import Alert, Annotation, Dataset, DatasetItem, PreferencePair, Score
 
 logger = logging.getLogger(__name__)
@@ -29,6 +29,8 @@ ProjectId = Annotated[str, Depends(current_project_id)]
 router = APIRouter(prefix="/api/v1", tags=["annotations"])
 
 _EXPORT_BATCH = 500
+MAX_OUTPUT_CHARS = 100_000
+MAX_COMMENT_CHARS = 10_000
 
 
 class ScoreIn(BaseModel):
@@ -43,9 +45,9 @@ class AnnotationCreate(BaseModel):
 
 class AnnotationComplete(BaseModel):
     scores: list[ScoreIn] = Field(default_factory=list, max_length=50)
-    corrected_output: str | None = None
+    corrected_output: str | None = Field(default=None, max_length=MAX_OUTPUT_CHARS)
     add_to_dataset_id: str | None = Field(default=None, max_length=32)
-    comment: str | None = None
+    comment: str | None = Field(default=None, max_length=MAX_COMMENT_CHARS)
 
 
 def _parse(model: type[BaseModel], payload: Any) -> Any:
@@ -184,6 +186,32 @@ def _original_output(root: Any) -> str:
     return ""
 
 
+def _lock_pending(db: Session, project_id: str, annotation_id: str) -> Annotation:
+    """Take the annotation for completion, so concurrent completes create one set of scores/pairs.
+
+    PostgreSQL: `SELECT ... FOR UPDATE` (a concurrent complete waits, then sees `done`). SQLite: a
+    conditional `UPDATE ... SET status='done' WHERE status='pending'` takes the write lock and its
+    rowcount tells whether this request won. Either way the claim is undone by a rollback."""
+    stmt = select(Annotation).where(Annotation.id == annotation_id, Annotation.project_id == project_id)
+    postgres = db.get_bind().dialect.name == "postgresql"
+    annotation = db.scalars(stmt.with_for_update() if postgres else stmt).first()
+    if annotation is None:
+        raise HTTPException(status_code=404, detail="annotation not found")
+    if annotation.status == "done":
+        raise HTTPException(status_code=409, detail="annotation already completed")
+    if not postgres:
+        claimed = db.execute(
+            update(Annotation)
+            .where(Annotation.id == annotation.id, Annotation.status == "pending")
+            .values(status="done", dedup_key=None, completed_at=utcnow())
+            .execution_options(synchronize_session=False)
+        )
+        if claimed.rowcount != 1:
+            raise HTTPException(status_code=409, detail="annotation already completed")
+        db.refresh(annotation)
+    return annotation
+
+
 @router.post("/annotations/{annotation_id}/complete")
 def complete(
     annotation_id: str,
@@ -197,13 +225,7 @@ def complete(
     store = request.app.state.span_store
     db = _db(request)
     try:
-        annotation = db.scalars(
-            select(Annotation).where(Annotation.id == annotation_id, Annotation.project_id == project_id)
-        ).first()
-        if annotation is None:
-            raise HTTPException(status_code=404, detail="annotation not found")
-        if annotation.status == "done":
-            raise HTTPException(status_code=409, detail="annotation already completed")
+        annotation = _lock_pending(db, project_id, annotation_id)
         if body.add_to_dataset_id is not None:
             ds = db.scalars(
                 select(Dataset.id).where(
@@ -252,12 +274,12 @@ def complete(
         annotation.corrected_output = body.corrected_output
         annotation.comment = body.comment
         complete_annotation(db, annotation)
+        db.flush()
+        for score in scores:  # same transaction as the scores, like POST /scores
+            query.run_score_hooks(db, project_id, score)
         db.commit()
-        out = annotation_out(annotation)
-        for score in scores:  # after commit, like POST /scores
-            query._run_hooks(db, project_id, score)
-        return out
-    except HTTPException:
+        return annotation_out(annotation)
+    except Exception:
         db.rollback()
         raise
     finally:

@@ -55,7 +55,12 @@ class ApiKey(Base):
 
 class Score(Base):
     __tablename__ = "scores"
-    __table_args__ = (Index("ix_scores_project_trace", "project_id", "trace_id"),)
+    __table_args__ = (
+        Index("ix_scores_project_trace", "project_id", "trace_id"),
+        # Automated scores carry a dedup key (online evals: "online:{eval}:{trace}:{span}") so a
+        # job delivered twice records one score; NULL (human/SDK scores) never conflicts.
+        UniqueConstraint("project_id", "dedup_key", name="uq_scores_dedup"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
@@ -66,6 +71,7 @@ class Score(Base):
     label: Mapped[str | None] = mapped_column(String(200), nullable=True)
     comment: Mapped[str | None] = mapped_column(Text, nullable=True)
     source: Mapped[str] = mapped_column(String(16), nullable=False)
+    dedup_key: Mapped[str | None] = mapped_column(String(200), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 

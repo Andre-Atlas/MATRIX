@@ -19,5 +19,8 @@ dev-web:
 up:
 	docker compose -f deploy/compose.yaml up --build
 
+DEMO_DATABASE_URL ?= postgresql+psycopg://matrix:matrix@localhost:5432/matrix
+
 demo:
+	cd server && MATRIX_DATABASE_URL=$(DEMO_DATABASE_URL) uv run alembic upgrade head
 	uv run --project server python scripts/verify_mvp.py

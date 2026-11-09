@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import Iterator
+from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -24,6 +26,10 @@ ProjectId = Annotated[str, Depends(current_project_id)]
 router = APIRouter(prefix="/api/v1", tags=["datasets"])
 
 MAX_CONTEXT_ITEMS = 100
+MAX_EXPECTED_OUTPUT_CHARS = 100_000
+MAX_CONTEXT_CHARS = 50_000
+MAX_PAGE = 500
+DEFAULT_PAGE = 500
 _EXPORT_BATCH = 500
 
 
@@ -34,8 +40,10 @@ class DatasetCreate(BaseModel):
 
 class ItemCreate(BaseModel):
     input: dict[str, Any]
-    expected_output: str | None = None
-    context: list[str] = Field(default_factory=list, max_length=MAX_CONTEXT_ITEMS)
+    expected_output: str | None = Field(default=None, max_length=MAX_EXPECTED_OUTPUT_CHARS)
+    context: list[Annotated[str, Field(max_length=MAX_CONTEXT_CHARS)]] = Field(
+        default_factory=list, max_length=MAX_CONTEXT_ITEMS
+    )
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -129,21 +137,57 @@ def list_datasets(db: DbSession, project_id: ProjectId) -> dict[str, Any]:
     return {"items": [dataset_out(ds, n) for ds, n in rows]}
 
 
-def _items(db: Session, dataset_id: str) -> list[DatasetItem]:
-    return list(
-        db.scalars(
-            select(DatasetItem)
-            .where(DatasetItem.dataset_id == dataset_id)
-            .order_by(DatasetItem.created_at, DatasetItem.id)
-        ).all()
-    )
+def _encode_cursor(item: DatasetItem) -> str:
+    raw = f"{iso_utc(item.created_at)}|{item.id}"
+    return base64.urlsafe_b64encode(raw.encode()).decode()
+
+
+def _decode_cursor(cursor: str) -> tuple[datetime, str]:
+    try:
+        stamp, row_id = base64.urlsafe_b64decode(cursor.encode()).decode().split("|", 1)
+        ts = datetime.fromisoformat(stamp)
+    except (ValueError, UnicodeError) as exc:
+        raise HTTPException(status_code=400, detail="invalid cursor") from exc
+    return ts, row_id
+
+
+def _same_tz(db: Session, ts: datetime) -> datetime:
+    # SQLite stores naive UTC datetimes; compare like with like.
+    return ts.replace(tzinfo=None) if db.get_bind().dialect.name == "sqlite" else ts
+
+
+def _items_page(
+    db: Session, dataset_id: str, limit: int, cursor: str | None
+) -> tuple[list[DatasetItem], str | None]:
+    """Items oldest first, keyset-paginated on (created_at, id)."""
+    stmt = select(DatasetItem).where(DatasetItem.dataset_id == dataset_id)
+    if cursor:
+        ts, row_id = _decode_cursor(cursor)
+        ts = _same_tz(db, ts)
+        stmt = stmt.where(
+            or_(DatasetItem.created_at > ts, and_(DatasetItem.created_at == ts, DatasetItem.id > row_id))
+        )
+    rows = list(db.scalars(stmt.order_by(DatasetItem.created_at, DatasetItem.id).limit(limit + 1)))
+    next_cursor = None
+    if len(rows) > limit:
+        rows = rows[:limit]
+        next_cursor = _encode_cursor(rows[-1])
+    return rows, next_cursor
 
 
 @router.get("/datasets/{dataset_id}")
-def get_dataset(dataset_id: str, db: DbSession, project_id: ProjectId) -> dict[str, Any]:
+def get_dataset(
+    dataset_id: str,
+    db: DbSession,
+    project_id: ProjectId,
+    limit: Annotated[int, Query(ge=1, le=MAX_PAGE)] = DEFAULT_PAGE,
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    """Dataset with one page of its items: `{dataset, items, next_cursor}` (`item_count` is the total)."""
     ds = get_dataset_or_404(db, project_id, dataset_id)
-    items = _items(db, ds.id)
-    return {"dataset": dataset_out(ds, len(items)), "items": [item_out(i) for i in items]}
+    total = db.scalar(select(func.count(DatasetItem.id)).where(DatasetItem.dataset_id == ds.id)) or 0
+    items, next_cursor = _items_page(db, ds.id, limit, cursor)
+    return {"dataset": dataset_out(ds, total), "items": [item_out(i) for i in items], "next_cursor": next_cursor}
 
 
 @router.post("/datasets/{dataset_id}/items", status_code=201)

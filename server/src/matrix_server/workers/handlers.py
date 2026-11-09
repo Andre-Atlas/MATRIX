@@ -5,12 +5,14 @@ from __future__ import annotations
 import logging
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from matrix_server.evals.runner import ExperimentConfigError, run_experiment
+from matrix_server.storage import jobs
 from matrix_server.storage.db import utcnow
 from matrix_server.storage.models import Experiment, Job
-from matrix_server.workers.runner import register
+from matrix_server.workers.context import JobLost
+from matrix_server.workers.runner import on_final_failure, register
 
 log = logging.getLogger(__name__)
 
@@ -38,7 +40,9 @@ def _safe_error(exc: Exception) -> str:
 def run_experiment_job(session: Session, job: Job) -> None:
     """Run an experiment. Idempotent: results are upserted per (item, variant); a done experiment is
     skipped. Systemic errors are recorded on the experiment (sanitized) and re-raised so the queue
-    retries; after the last attempt the experiment is marked `failed`."""
+    retries; after the last attempt the experiment is marked `failed` (here, or by
+    `settle_failed_experiment` when the lease expired). A lost lease stops the run without touching
+    the experiment (the job is being run, or was settled, elsewhere)."""
     experiment_id = (job.payload or {}).get("experiment_id")
     found = session.execute(
         select(Experiment.id, Experiment.status).where(
@@ -57,6 +61,10 @@ def run_experiment_job(session: Session, job: Job) -> None:
     try:
         exp = session.get(Experiment, exp_id, populate_existing=True)
         run_experiment(session, exp)
+    except JobLost:
+        session.rollback()
+        log.warning("job %s: lease lost, experiment %s left to its current owner", job.id, exp_id)
+        raise
     except Exception as exc:
         session.rollback()
         final = job.attempts >= job.max_attempts
@@ -69,3 +77,28 @@ def run_experiment_job(session: Session, job: Job) -> None:
             finished_at=utcnow() if final else None,
         )
         raise
+
+
+LEASE_EXPIRED_MESSAGE = "worker lease expired: the run took too long or its worker stopped"
+
+
+@on_final_failure("experiment.run")
+def settle_failed_experiment(session_factory: sessionmaker[Session], job: Job) -> None:
+    """The job failed for good: an experiment still `queued`/`running` becomes `failed`. The error is
+    sanitized: the handler's own message when it recorded one, else a fixed text (never the
+    traceback stored on the job)."""
+    experiment_id = (job.payload or {}).get("experiment_id")
+    if not isinstance(experiment_id, str):
+        return
+    with session_factory() as session, session.begin():
+        exp = session.scalars(
+            select(Experiment).where(Experiment.id == experiment_id, Experiment.project_id == job.project_id)
+        ).first()
+        if exp is None or exp.status in ("done", "failed"):
+            return
+        exp.status = "failed"
+        if job.error == jobs.LEASE_EXPIRED_ERROR:
+            exp.error = LEASE_EXPIRED_MESSAGE
+        elif not exp.error:
+            exp.error = "internal error: job failed"
+        exp.finished_at = utcnow()

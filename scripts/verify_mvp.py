@@ -257,7 +257,8 @@ def main() -> int:
                      "par DPO exportado (chosen = correção, rejected = saída original)")
             ds = call("GET", f"/api/v1/datasets/{state['dataset']}")
             added = [i for i in ds["items"] if i["source_trace_id"] == target["trace_id"]]
-            c.expect(bool(added) and added[0]["expected_output"] == fixed,
+            # The trace may already be in the dataset (from-span in criterion 3); look for the corrected copy.
+            c.expect(any(i["expected_output"] == fixed for i in added),
                      "correção entrou no dataset como caso de regressão")
             done = call("GET", "/api/v1/annotations", params={"status": "done"})["items"]
             c.expect(any(a["id"] == target["id"] for a in done), "anotação marcada como concluída")

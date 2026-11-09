@@ -23,7 +23,8 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1")
 
-# Called after a score is committed with (db session, project_id, score). Rules register here.
+# Called after a score is flushed with (db session, project_id, score), in the transaction that
+# created it; the caller commits afterwards (see `run_score_hooks`). Rules register here.
 # A failing hook is logged (without payload) and never fails the request.
 on_score_created: list[Callable[[Session, str, Score], None]] = []
 
@@ -216,15 +217,23 @@ def stats_overview(
     return _span_store(request).overview(project_id, parse_since(since))
 
 
-def _run_hooks(session: Session, project_id: str, score: Score) -> None:
+def run_score_hooks(session: Session, project_id: str, score: Score) -> None:
+    """Run `on_score_created` in the caller's transaction (the score must be flushed). Each hook runs
+    in a savepoint so a failure only undoes its own writes (logged by type only, never the payload).
+    The caller commits: score and hook writes are atomic."""
     for hook in on_score_created[:]:
+        savepoint = session.begin_nested()
         try:
             hook(session, project_id, score)
+            if savepoint.is_active:
+                savepoint.commit()
         except Exception as exc:  # noqa: BLE001 - a hook must never fail score creation
-            session.rollback()
+            if savepoint.is_active:
+                savepoint.rollback()
             logger.error(
                 "score hook %s failed: %s", getattr(hook, "__qualname__", repr(hook)), type(exc).__name__
             )
+
 
 
 @router.post("/scores", response_model=ScoreOut, status_code=201)
@@ -249,9 +258,13 @@ def create_score(
     try:
         score = Score(project_id=project_id, **body.model_dump())
         session.add(score)
+        session.flush()
+        run_score_hooks(session, project_id, score)
         session.commit()
         out = _to_out(score)
-        _run_hooks(session, project_id, score)
+    except Exception:
+        session.rollback()
+        raise
     finally:
         session.close()
     return out

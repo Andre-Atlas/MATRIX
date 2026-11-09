@@ -16,6 +16,7 @@ dependencies = [
   "jsonschema",
   "psycopg[binary]",
   "alembic>=1.20.1",
+  "regex>=2026.9.29",
 ]
 
 [project.scripts]

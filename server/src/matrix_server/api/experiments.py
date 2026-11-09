@@ -18,7 +18,7 @@ from matrix_server.api.datasets import get_dataset_or_404, iso_utc, parse_body
 from matrix_server.auth import current_project_id
 from matrix_server.evals.metrics import build_metric
 from matrix_server.evals.providers import get_provider
-from matrix_server.evals.runner import find_regressions
+from matrix_server.evals.runner import find_regressions, max_cells
 from matrix_server.prompts import PROMPT_TYPES, PromptValidationError, validate_template
 from matrix_server.storage import jobs
 from matrix_server.storage.db import get_db
@@ -197,6 +197,11 @@ def create_experiment(
     item_count = db.scalar(select(func.count(DatasetItem.id)).where(DatasetItem.dataset_id == dataset.id))
     if not item_count:
         raise _bad("dataset has no items")
+    if item_count * len(body.variants) > max_cells():
+        raise _bad(
+            f"experiment too large: {item_count} items x {len(body.variants)} variants exceeds "
+            f"{max_cells()} cells (MATRIX_MAX_EXPERIMENT_CELLS)"
+        )
     variants = _validate_variants(db, project_id, body.variants)
     metrics = _validate_metrics(body.metrics)
     if body.baseline_experiment_id is not None:

@@ -8,13 +8,16 @@ applicable" (e.g. no contexts) and `passed` is then None.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import math
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
 import jsonschema
+import regex
 
 from matrix_server.evals.judge import Judge
 from matrix_server.evals.providers import Embedder
@@ -38,6 +41,8 @@ MAX_REGEX_INPUT = 100_000
 MAX_REGEX_PATTERN = 1_000
 MAX_EDIT_CHARS = 5_000
 MAX_LCS_TOKENS = 5_000
+# User-supplied patterns run on the `regex` engine with a wall-clock budget (ReDoS guard).
+REGEX_TIMEOUT_S = 1.0
 
 
 @dataclass
@@ -398,16 +403,77 @@ class Regex(Metric):
     def validate(self) -> None:
         self._str_param("pattern", required=True, max_len=MAX_REGEX_PATTERN)
         try:
-            self._rx = re.compile(self.params["pattern"])
-        except re.error as exc:
+            self._rx = regex.compile(self.params["pattern"])
+        except regex.error as exc:
             raise ValueError(f"regex: invalid pattern: {exc}") from None
 
     def evaluate(self, case: EvalCase, deps: EvalDeps | None = None) -> MetricResult:
         text = case.output or ""
         truncated = len(text) > MAX_REGEX_INPUT
-        ok = self._rx.search(text[:MAX_REGEX_INPUT]) is not None
+        try:
+            ok = self._rx.search(text[:MAX_REGEX_INPUT], timeout=REGEX_TIMEOUT_S) is not None
+        except TimeoutError:
+            return self._bool(False, "regex timeout", {"timeout": True})
         return self._bool(ok, f"pattern {'matched' if ok else 'not found'}",
                           {"truncated": True} if truncated else None)
+
+
+# --- is_json: JSON Schema with a ReDoS-safe `pattern` -------------------------------
+#
+# jsonschema evaluates `pattern` with the stdlib `re` (no timeout). `pattern` is re-implemented on
+# the `regex` engine under one wall-clock budget per evaluation (REGEX_TIMEOUT_S, shared by every
+# pattern in the schema). `patternProperties` is rejected at validation time: it is also matched
+# with `re` inside jsonschema's additionalProperties/unevaluatedProperties logic, which cannot be
+# safely overridden.
+
+_REJECTED_SCHEMA_KEYWORDS = frozenset({"patternProperties"})
+_schema_deadline: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "matrix_schema_deadline", default=None
+)
+
+
+class _SchemaRegexTimeout(Exception):
+    pass
+
+
+def _safe_pattern(validator: Any, patrn: Any, instance: Any, schema: Any):
+    if not validator.is_type(instance, "string"):
+        return
+    deadline = _schema_deadline.get()
+    remaining = REGEX_TIMEOUT_S if deadline is None else deadline - time.monotonic()
+    if remaining <= 0:
+        raise _SchemaRegexTimeout
+    try:
+        found = regex.search(patrn, instance[:MAX_REGEX_INPUT], timeout=remaining)
+    except TimeoutError:
+        raise _SchemaRegexTimeout from None
+    if found is None:
+        yield jsonschema.ValidationError(f"{instance[:80]!r} does not match {patrn[:80]!r}")
+
+
+def _safe_validator_cls(schema: Any) -> Any:
+    base = jsonschema.validators.validator_for(schema)
+    return jsonschema.validators.extend(base, {"pattern": _safe_pattern})
+
+
+def _check_schema_keywords(node: Any, depth: int = 0) -> None:
+    if depth > 64:
+        raise ValueError("is_json: schema is nested too deeply")
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in _REJECTED_SCHEMA_KEYWORDS:
+                raise ValueError(f"is_json: schema keyword '{key}' is not supported")
+            if key == "pattern" and isinstance(value, str):
+                if len(value) > MAX_REGEX_PATTERN:
+                    raise ValueError("is_json: schema pattern is too long")
+                try:
+                    regex.compile(value)
+                except regex.error as exc:
+                    raise ValueError(f"is_json: invalid schema pattern: {exc}") from None
+            _check_schema_keywords(value, depth + 1)
+    elif isinstance(node, list):
+        for value in node:
+            _check_schema_keywords(value, depth + 1)
 
 
 @register_metric
@@ -422,6 +488,7 @@ class IsJson(Metric):
             return
         if not isinstance(schema, (dict, bool)):
             raise ValueError("is_json: param 'schema' must be a JSON Schema object")  # noqa: TRY004
+        _check_schema_keywords(schema)
         try:
             jsonschema.validators.validator_for(schema).check_schema(schema)
         except jsonschema.SchemaError as exc:
@@ -435,8 +502,14 @@ class IsJson(Metric):
         schema = self.params.get("schema")
         if schema is None:
             return self._bool(True, "valid JSON")
-        validator = jsonschema.validators.validator_for(schema)(schema)
-        err = jsonschema.exceptions.best_match(validator.iter_errors(data))
+        validator = _safe_validator_cls(schema)(schema)
+        token = _schema_deadline.set(time.monotonic() + REGEX_TIMEOUT_S)
+        try:
+            err = jsonschema.exceptions.best_match(validator.iter_errors(data))
+        except _SchemaRegexTimeout:
+            return self._bool(False, "regex timeout", {"timeout": True})
+        finally:
+            _schema_deadline.reset(token)
         if err is not None:
             path = "/".join(str(p) for p in err.absolute_path)
             return self._bool(False, f"schema violation at '{path}': {err.message[:160]}")

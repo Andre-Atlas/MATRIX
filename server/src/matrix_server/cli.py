@@ -21,7 +21,9 @@ def run_worker() -> None:
     import threading
 
     from matrix_server.config import Settings
+    from matrix_server.hooks import install_worker_hooks
     from matrix_server.storage.db import init_db, make_engine, make_session_factory
+    from matrix_server.storage.spans import build_span_store
     from matrix_server.workers import runner
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -29,6 +31,8 @@ def run_worker() -> None:
     engine = make_engine(settings.database_url)
     init_db(engine)
     runner.load_handler_modules()
+    # The online-eval handler creates scores here: span store + rules score hook, as in the API.
+    install_worker_hooks(build_span_store(settings))
     stop_event = threading.Event()
 
     def _stop(signum, _frame) -> None:

@@ -293,7 +293,10 @@ def _enabled_rules(session: Session, project_id: str) -> list[Rule]:
 
 
 def evaluate_on_score(session: Session, project_id: str, score: Score, span_store: Any | None = None) -> int:
-    """Fire the project's score/feedback rules matching `score`; returns how many rules fired."""
+    """Fire the project's score/feedback rules matching `score`; returns how many rules fired.
+
+    Writes are flushed in the caller's transaction, never committed: the caller commits them
+    together with the score (API request or worker job), so a rollback leaves neither behind."""
     fired = 0
     for rule in _enabled_rules(session, project_id):
         why = _match_score(rule, score)
@@ -301,7 +304,7 @@ def evaluate_on_score(session: Session, project_id: str, score: Score, span_stor
             continue
         _fire(session, rule, project_id, score.trace_id, why, span_store)
         fired += 1
-    session.commit()
+    session.flush()
     return fired
 
 
@@ -360,13 +363,15 @@ def make_ingest_hook(
 
 
 def make_score_hook(span_store: Any | None) -> Callable[[Session, str, Score], None]:
-    """Hook for `api.query.on_score_created`. `span_store` enables the add_to_dataset action."""
+    """Hook for `api.query.on_score_created`. `span_store` enables the add_to_dataset action.
+
+    Runs in the caller's transaction inside a savepoint: a failure undoes only the rule writes."""
 
     def rules_score_hook(session: Session, project_id: str, score: Score) -> None:
         try:
-            evaluate_on_score(session, project_id, score, span_store)
+            with session.begin_nested():
+                evaluate_on_score(session, project_id, score, span_store)
         except Exception as exc:  # noqa: BLE001 - hooks must never fail score creation
-            session.rollback()
             logger.error("rules score hook failed: %s", type(exc).__name__)
 
     return rules_score_hook

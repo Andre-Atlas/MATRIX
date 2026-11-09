@@ -26,6 +26,7 @@ from matrix_server.evals.providers import HashingEmbedder, OpenAIEmbedder, Provi
 from matrix_server.prompts import VARIABLE_RE
 from matrix_server.storage.db import utcnow
 from matrix_server.storage.models import DatasetItem, Experiment, ExperimentResult, PromptVersion
+from matrix_server.workers.context import JobLost, lost_event
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +34,7 @@ REGRESSION_DELTA = 0.1
 DEFAULT_CONCURRENCY = 4
 MAX_CONCURRENCY = 32
 MAX_CELL_ERROR_CHARS = 500
+DEFAULT_MAX_CELLS = 5000
 
 
 class ExperimentConfigError(ValueError):
@@ -51,6 +53,16 @@ def concurrency() -> int:
     return max(1, min(value, MAX_CONCURRENCY))
 
 
+def max_cells() -> int:
+    """Upper bound on items x variants per experiment (`MATRIX_MAX_EXPERIMENT_CELLS`, default 5000)."""
+    raw = os.environ.get("MATRIX_MAX_EXPERIMENT_CELLS", "")
+    try:
+        value = int(raw) if raw.strip() else DEFAULT_MAX_CELLS
+    except ValueError:
+        value = DEFAULT_MAX_CELLS
+    return max(1, value)
+
+
 def build_eval_deps() -> EvalDeps:
     """Judge/embedder from `MATRIX_JUDGE_PROVIDER` / `MATRIX_JUDGE_MODEL` (default: offline heuristics)."""
     provider = (os.environ.get("MATRIX_JUDGE_PROVIDER") or "fake").strip().lower()
@@ -60,26 +72,38 @@ def build_eval_deps() -> EvalDeps:
     if not model:
         raise ExperimentConfigError("MATRIX_JUDGE_MODEL must be set when MATRIX_JUDGE_PROVIDER is not 'fake'")
     try:
-        llm = get_provider(provider, **_provider_opts(provider))
+        llm = get_provider(provider, **_provider_opts(provider, judge_base_url()))
     except ValueError as exc:
         raise ExperimentConfigError(f"invalid MATRIX_JUDGE_PROVIDER: {provider!r}") from exc
     if provider == "openai":
         embed_model = (os.environ.get("MATRIX_EMBEDDING_MODEL") or "text-embedding-3-small").strip()
-        embedder: Any = OpenAIEmbedder(model=embed_model, base_url=_openai_base_url())
+        embedder: Any = OpenAIEmbedder(model=embed_model, base_url=judge_base_url())
     else:
         embedder = HashingEmbedder()
     return EvalDeps(judge=LLMJudge(llm, model), embedder=embedder)
 
 
-def _openai_base_url() -> str | None:
-    value = (os.environ.get("MATRIX_OPENAI_BASE_URL") or "").strip()
+def _env_url(name: str) -> str | None:
+    value = (os.environ.get(name) or "").strip()
     return value or None
 
 
-def _provider_opts(provider: str) -> dict[str, Any]:
+def _openai_base_url() -> str | None:
+    """`MATRIX_OPENAI_BASE_URL`: OpenAI-compatible endpoint for experiment cells and judges."""
+    return _env_url("MATRIX_OPENAI_BASE_URL")
+
+
+def judge_base_url() -> str | None:
+    """Judge/embedder endpoint (offline experiments and online evals): `MATRIX_JUDGE_BASE_URL` when
+    set (judge-specific override), else `MATRIX_OPENAI_BASE_URL`."""
+    return _env_url("MATRIX_JUDGE_BASE_URL") or _openai_base_url()
+
+
+def _provider_opts(provider: str, base_url: str | None = None) -> dict[str, Any]:
     # base_url is operator configuration (env), never request input: avoids SSRF via the API.
-    if provider == "openai" and _openai_base_url():
-        return {"base_url": _openai_base_url()}
+    base_url = base_url if base_url is not None else _openai_base_url()
+    if provider == "openai" and base_url:
+        return {"base_url": base_url}
     return {}
 
 
@@ -296,14 +320,29 @@ def run_experiment(session: Session, exp: Experiment) -> None:
     except ValueError as exc:
         raise ExperimentConfigError(f"invalid metric: {exc}") from exc
     variants = resolve_variants(session, exp)
+    if len(items) * len(variants) > max_cells():
+        raise ExperimentConfigError(
+            f"experiment has {len(items) * len(variants)} cells (items x variants); the limit is {max_cells()}"
+        )
     deps = build_eval_deps()
     snapshots = [
         {"id": i.id, "input": i.input or {}, "expected_output": i.expected_output, "context": i.context or []}
         for i in items
     ]
     tasks = [(item, variant) for item in snapshots for variant in variants]
+    # Inside a worker: once the job lease is lost, pending cells are skipped and the run stops.
+    lost = lost_event()
+
+    def run(task: tuple[dict[str, Any], ResolvedVariant]) -> CellResult | None:
+        if lost is not None and lost.is_set():
+            return None
+        return run_cell(task[0], task[1], metrics, deps)
+
     with ThreadPoolExecutor(max_workers=min(concurrency(), len(tasks))) as pool:
-        cells = list(pool.map(lambda t: run_cell(t[0], t[1], metrics, deps), tasks))
+        maybe_cells = list(pool.map(run, tasks))
+    if lost is not None and lost.is_set():
+        raise JobLost
+    cells = [c for c in maybe_cells if c is not None]
 
     existing = {
         (r.item_id, r.variant): r

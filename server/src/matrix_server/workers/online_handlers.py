@@ -2,8 +2,9 @@
 
 Judge selection: the online eval's `model` ({provider, name}) when set, else the environment
 (`MATRIX_JUDGE_PROVIDER`, `MATRIX_JUDGE_MODEL`, default `fake`). Provider `fake` uses the offline
-heuristic judge. API keys are read from environment variables by the providers and never stored;
-`MATRIX_JUDGE_BASE_URL` (env only) points the OpenAI-compatible provider at another endpoint.
+heuristic judge. API keys are read from environment variables by the providers and never stored.
+The OpenAI-compatible endpoint is `MATRIX_OPENAI_BASE_URL` (shared with experiments), overridden for
+judges by `MATRIX_JUDGE_BASE_URL` when set (env only, never request input).
 """
 
 from __future__ import annotations
@@ -14,7 +15,8 @@ import os
 import threading
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from matrix_server.domain.spans import Span, SpanKind
@@ -28,6 +30,7 @@ from matrix_server.evals import (
     evaluate_case,
     get_provider,
 )
+from matrix_server.evals.runner import judge_base_url
 from matrix_server.online_evals import JOB_KIND
 from matrix_server.storage.models import Job, OnlineEval, Score
 from matrix_server.workers.runner import register
@@ -114,7 +117,7 @@ def build_deps(model: dict[str, Any] | None) -> EvalDeps:
     provider_name = provider_name.strip().lower() or "fake"
     if provider_name == "fake":
         return EvalDeps.offline()
-    base_url = os.environ.get("MATRIX_JUDGE_BASE_URL") or None
+    base_url = judge_base_url()
     opts: dict[str, Any] = {"base_url": base_url} if provider_name == "openai" and base_url else {}
     provider = get_provider(provider_name, **opts)
     if not model_name:
@@ -126,14 +129,21 @@ def build_deps(model: dict[str, Any] | None) -> EvalDeps:
 # --------------------------------------------------------------------------- handler
 
 
-def _existing_score(session: Session, project_id: str, trace_id: str, span_id: str, name: str) -> bool:
+def dedup_key(online_eval_id: str, trace_id: str, span_id: str) -> str:
+    return f"online:{online_eval_id}:{trace_id}:{span_id}"
+
+
+def _existing_score(
+    session: Session, project_id: str, online_eval_id: str, trace_id: str, span_id: str, name: str
+) -> bool:
     return (
         session.scalars(
             select(Score.id).where(
                 Score.project_id == project_id,
-                Score.trace_id == trace_id,
-                Score.span_id == span_id,
-                Score.name == name,
+                or_(
+                    Score.dedup_key == dedup_key(online_eval_id, trace_id, span_id),
+                    (Score.trace_id == trace_id) & (Score.span_id == span_id) & (Score.name == name),
+                ),
             )
         ).first()
         is not None
@@ -141,22 +151,10 @@ def _existing_score(session: Session, project_id: str, trace_id: str, span_id: s
 
 
 def _run_score_hooks(session: Session, project_id: str, score: Score) -> None:
-    """Score hooks run in the job's transaction; each one inside a savepoint so a failure only
-    undoes its own writes (logged by type only, never the payload)."""
-    from matrix_server.api.query import on_score_created
+    """Score hooks run in the job's transaction (committed with the job), one savepoint each."""
+    from matrix_server.api.query import run_score_hooks
 
-    for hook in on_score_created[:]:
-        savepoint = session.begin_nested()
-        try:
-            hook(session, project_id, score)
-            if savepoint.is_active:
-                savepoint.commit()
-        except Exception as exc:  # noqa: BLE001 - a hook must never lose the score
-            if savepoint.is_active:
-                savepoint.rollback()
-            logger.error(
-                "score hook %s failed: %s", getattr(hook, "__qualname__", repr(hook)), type(exc).__name__
-            )
+    run_score_hooks(session, project_id, score)
 
 
 @register(JOB_KIND)
@@ -176,7 +174,7 @@ def handle_online_eval_score(session: Session, job: Job) -> None:
     ).first()
     if ev is None or not ev.enabled:
         return
-    if _existing_score(session, project_id, trace_id, span_id, ev.name):
+    if _existing_score(session, project_id, online_eval_id, trace_id, span_id, ev.name):
         return
 
     found = get_span_store().get_trace(project_id, trace_id)
@@ -204,7 +202,16 @@ def handle_online_eval_score(session: Session, job: Job) -> None:
         value=float(result.value),
         comment=(result.reason or "")[:MAX_COMMENT_CHARS] or None,
         source="llm",
+        dedup_key=dedup_key(online_eval_id, trace_id, span_id),
     )
     session.add(score)
-    session.flush()
+    try:
+        # No savepoint: on SQLite (pysqlite) a SAVEPOINT opened before any write would commit on
+        # release. The score is this handler's first write, so a full rollback loses nothing.
+        session.flush()
+    except IntegrityError:
+        # A duplicate job (or a concurrent worker) already recorded this span: nothing more to do.
+        session.rollback()
+        logger.info("job %s: span already scored by online eval %s", job.id, online_eval_id)
+        return
     _run_score_hooks(session, project_id, score)
