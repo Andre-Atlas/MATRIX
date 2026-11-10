@@ -658,3 +658,128 @@ export type SafetyScansResponse = {
   scans: SafetyScan[];
   total: number;
 };
+
+// ── AI Gateway & Proxy de Inferência (Trilha D) ──
+
+export type CircuitBreakerState =
+  | "closed"
+  | "half_open"
+  | "open"
+  | "CLOSED"
+  | "HALF_OPEN"
+  | "OPEN";
+
+export type GatewayProviderHealth = "healthy" | "degraded" | "outage";
+
+export type GatewayLogStatus = "CACHE_HIT" | "DIRECT" | "FALLBACK" | "ERROR";
+
+export type GatewayStats = {
+  total_requests: number;
+  cache_hits?: number;
+  cache_hit_rate: number; // 0.0 to 1.0 (e.g. 0.384)
+  saved_cost_usd?: number;
+  cost_saved_usd?: number;
+  tokens_saved?: number;
+  total_cost_usd?: number;
+  latency_p50_ms?: number;
+  latency_p99_ms?: number;
+  avg_latency_ms: number;
+  active_providers?: number;
+  healthy_providers?: number;
+  fallback_events_24h?: number;
+  requests_by_status?: Record<GatewayLogStatus, number>;
+  throughput_rpm?: number;
+};
+
+export type GatewayProviderStatus = {
+  id?: string;
+  name: string;
+  provider?: string;
+  endpoint?: string;
+  model_count?: number;
+  models?: string[];
+  status?: GatewayProviderHealth;
+  circuit_state?: CircuitBreakerState;
+  circuit_breaker?: string;
+  failure_count: number;
+  failure_threshold?: number;
+  latency_p50_ms?: number;
+  latency_p99_ms?: number;
+  avg_latency_ms?: number;
+  uptime_percentage?: number;
+  last_checked_at?: string;
+  error_message?: string | null;
+  weight?: number;
+  total_requests?: number;
+};
+
+export type FallbackNode = {
+  provider: string;
+  model: string;
+  priority: number;
+  max_retries: number;
+  timeout_ms: number;
+};
+
+export type GatewayRoutingRule = {
+  id: string;
+  name: string;
+  description?: string;
+  match_pattern: string;
+  primary_provider: string;
+  primary_model: string;
+  fallback_chain: FallbackNode[];
+  semantic_cache_enabled: boolean;
+  cache_similarity_threshold: number; // e.g. 0.92
+  rate_limit_rpm: number;
+  retry_count: number;
+  timeout_ms: number;
+  is_active: boolean;
+};
+
+export type GatewayLogEntry = {
+  id: string;
+  timestamp: string;
+  project_id?: string;
+  request_id?: string;
+  route_name?: string;
+  model?: string;
+  requested_model?: string;
+  served_model?: string;
+  provider: string;
+  status: GatewayLogStatus;
+  cache_hit?: boolean;
+  fallback_triggered?: boolean;
+  fallback_chain_traversed?: string[];
+  status_code?: number;
+  latency_ms: number;
+  tokens?: { prompt?: number; completion?: number; total?: number };
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+  cost_usd?: number;
+  saved_cost_usd?: number;
+  cost_saved_usd?: number;
+  cache_score?: number | null;
+  error_message?: string | null;
+  client_ip?: string;
+};
+
+export type GatewayStatsResponse = GatewayStats;
+
+export type GatewayProvidersResponse = {
+  providers: GatewayProviderStatus[];
+  total: number;
+};
+
+export type GatewayLogsResponse = {
+  logs: GatewayLogEntry[];
+  total: number;
+  next_cursor: string | null;
+};
+
+export type GatewayRulesResponse = {
+  rules: GatewayRoutingRule[];
+  total: number;
+};
+

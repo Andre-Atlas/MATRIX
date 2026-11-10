@@ -2,6 +2,10 @@
 import { ApiError } from "./api-error";
 import {
   createMockSafetyScan,
+  getMockGatewayLogs,
+  getMockGatewayProviders,
+  getMockGatewayRules,
+  getMockGatewayStats,
   getMockSafetyReport,
   getMockSafetyScans,
   MOCK_SAFETY_CATEGORIES,
@@ -13,6 +17,10 @@ import { evalExportJsonl, evalGet, evalSend } from "./mock-evals";
 import { dpoExportJsonl, opsGet, opsSend } from "./mock-ops";
 import type {
   CreateSafetyScanRequest,
+  GatewayLogsResponse,
+  GatewayProvidersResponse,
+  GatewayRulesResponse,
+  GatewayStatsResponse,
   ListResponse,
   OverviewStats,
   SafetyCategoriesResponse,
@@ -154,6 +162,30 @@ export async function mockGet<T>(path: string, params: Params = {}): Promise<T> 
     if (!report) throw new ApiError(404, "safety scan not found");
     return report as T;
   }
+
+  // ── AI Gateway routes (Trilha D) ──
+  if (p === "/api/v1/gateway/stats") {
+    const stats: GatewayStatsResponse = getMockGatewayStats();
+    return stats as T;
+  }
+
+  if (p === "/api/v1/gateway/providers") {
+    const providers = getMockGatewayProviders();
+    const resp: GatewayProvidersResponse = { providers, total: providers.length };
+    return resp as T;
+  }
+
+  if (p === "/api/v1/gateway/logs") {
+    const resp: GatewayLogsResponse = getMockGatewayLogs(params);
+    return resp as T;
+  }
+
+  if (p === "/api/v1/gateway/rules") {
+    const rules = getMockGatewayRules();
+    const resp: GatewayRulesResponse = { rules, total: rules.length };
+    return resp as T;
+  }
+
 
   const evalResult = evalGet(p);
   if (evalResult !== undefined) return evalResult as T;

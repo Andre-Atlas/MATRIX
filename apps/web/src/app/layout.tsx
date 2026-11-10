@@ -14,6 +14,7 @@ const NAV = [
   { href: "/experiments", label: "Experiments" },
   { href: "/vectors", label: "Vector Space" },
   { href: "/safety", label: "Safety & OWASP" },
+  { href: "/gateway", label: "AI Gateway" },
   { href: "/annotations", label: "Annotations" },
   { href: "/alerts", label: "Alerts" },
 ];

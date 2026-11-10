@@ -832,3 +832,16 @@ export {
   getMockSafetyReport,
   createMockSafetyScan,
 } from "./mock-safety";
+
+// ── AI Gateway & Proxy (Trilha D) Mock Data & Handlers ──
+export {
+  MOCK_GATEWAY_STATS,
+  MOCK_GATEWAY_PROVIDERS,
+  MOCK_GATEWAY_ROUTING_RULES,
+  MOCK_GATEWAY_LOGS,
+  getMockGatewayStats,
+  getMockGatewayProviders,
+  getMockGatewayRules,
+  getMockGatewayLogs,
+} from "./mock-gateway";
+

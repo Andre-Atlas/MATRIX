@@ -6,6 +6,7 @@ from matrix_server.api import (
     auth,
     datasets,
     experiments,
+    gateway,
     ingest,
     online_evals,
     prompts,
@@ -15,6 +16,7 @@ from matrix_server.api import (
     vectors,
 )
 from matrix_server.config import Settings, get_settings
+from matrix_server.gateway.router import GatewayRouter
 from matrix_server.hooks import install_api_hooks
 from matrix_server.limits import BodyLimitMiddleware
 from matrix_server.storage.db import init_db, make_engine, make_session_factory
@@ -36,6 +38,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.db_engine = engine
     app.state.session_factory = make_session_factory(engine)
     app.state.span_store = build_span_store(settings)
+    app.state.gateway_router = GatewayRouter()
 
     install_api_hooks(app.state.session_factory, app.state.span_store)
 
@@ -56,6 +59,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         safety,
         online_evals,
         vectors,
+        gateway,
     ):
         app.include_router(module.router)
     return app
