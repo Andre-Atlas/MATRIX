@@ -12,7 +12,11 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import timedelta
+from enum import IntEnum
+from typing import Literal
 
 from fastapi import HTTPException, Request
 from sqlalchemy import select
@@ -141,3 +145,38 @@ def require_admin(request: Request) -> None:
         raise HTTPException(
             status_code=401, detail="invalid admin token", headers={"WWW-Authenticate": "Bearer"}
         )
+
+
+# --- RBAC skeleton (contract: docs/atlas/2026-11-10-plataforma-completa/contracts/g0.md) ---------
+# Interface shared by every router. T21 replaces the body of `require` with the full
+# implementation (user sessions, memberships, key scopes); routers only depend on the signature.
+
+
+class Role(IntEnum):
+    VIEWER = 1
+    MEMBER = 2
+    ADMIN = 3
+    OWNER = 4
+
+
+@dataclass(frozen=True)
+class Principal:
+    project_id: str
+    kind: Literal["api_key", "user"]
+    user_id: str | None
+    role: Role
+    scopes: frozenset[str]
+
+
+def require(min_role: Role = Role.VIEWER, *, scope: str | None = None) -> Callable[..., Principal]:
+    """FastAPI dependency factory: authenticate and require at least `min_role`."""
+
+    def dependency(request: Request) -> Principal:
+        project_id = current_project_id(request)
+        # Interim behaviour until T21: API keys are trusted as members with every scope.
+        role = Role.MEMBER
+        if min_role > role:
+            raise HTTPException(status_code=403, detail=f"requires role {min_role.name.lower()}")
+        return Principal(project_id, "api_key", None, role, frozenset({"ingest", "read", "write"}))
+
+    return dependency

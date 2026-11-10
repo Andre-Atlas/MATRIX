@@ -324,3 +324,24 @@ class Job(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+# --- Audit log (G0) ---------------------------------------------------------
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_log"
+    __table_args__ = (Index("ix_audit_project_ts", "project_id", "ts"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    project_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    actor_kind: Mapped[str] = mapped_column(String(16), nullable=False)  # user | api_key | system
+    actor_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    action: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    target: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    detail: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+
+
+# --- Model modules registered here (one import per module, appended by each task) ------------
+# Keeps Base.metadata complete for Alembic and create_all without every task editing this file.
