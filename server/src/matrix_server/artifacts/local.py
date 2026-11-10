@@ -136,6 +136,9 @@ class LocalArtifactStore:
     def stat_upload(self, project_id: str, upload_id: str) -> int | None:
         return None
 
+    def upload_checksum(self, project_id: str, upload_id: str) -> str | None:
+        return None
+
     def open_upload(self, project_id: str, upload_id: str) -> BinaryIO:
         raise BlobNotFound("no staged upload")
 

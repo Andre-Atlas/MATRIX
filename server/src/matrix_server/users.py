@@ -6,9 +6,14 @@
 - Sessions: opaque `mxs_<token_urlsafe(32)>`; only its SHA-256 is stored (`WebSession.id`). A
   session expires after `session_idle_ttl_seconds` without use (sliding; `last_seen_at` is written
   at most once per minute) and `session_absolute_ttl_seconds` after creation.
-- Throttling: `MAX_FAILURES` failures per (e-mail, IP) within `FAILURE_WINDOW` lock the pair for
-  `LOCK_STEPS[n]` (escalating); a successful login clears it. The key is a hash of both values, so
-  a locked unknown e-mail behaves exactly like a known one.
+- Throttling: failures within `FAILURE_WINDOW` are counted under three keys (`throttle_keys`):
+  the (e-mail, IP) pair (`PAIR_MAX_FAILURES`), the IP alone (`IP_MAX_FAILURES`, stops one client
+  spraying many e-mails) and the e-mail alone (`EMAIL_MAX_FAILURES`, stops a distributed attack on
+  one account). Reaching a limit locks that key for `LOCK_STEPS[n]` (escalating). A successful
+  login clears the pair and e-mail keys, never the IP key (an attacker could reset it with their
+  own account). Keys are hashes, so a locked unknown e-mail behaves exactly like a known one.
+- Cost bound: at most `hash_concurrency` argon2 operations run at once in the process (each uses
+  64 MiB); a caller that waits longer than `HASH_WAIT_SECONDS` gets `PasswordHasherBusy` (503).
 
 Nothing here logs passwords, tokens or full e-mails.
 """
@@ -18,7 +23,10 @@ from __future__ import annotations
 import hashlib
 import math
 import secrets
+import threading
 import unicodedata
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 
 from argon2 import PasswordHasher
@@ -39,7 +47,10 @@ SESSION_SCHEME = "mxs"
 SESSION_TOKEN_BYTES = 32
 LAST_SEEN_RESOLUTION = timedelta(minutes=1)
 
-MAX_FAILURES = 5
+PAIR_MAX_FAILURES = 5
+IP_MAX_FAILURES = 30
+EMAIL_MAX_FAILURES = 20
+MAX_FAILURES = PAIR_MAX_FAILURES
 FAILURE_WINDOW = timedelta(minutes=15)
 LOCK_STEPS = (timedelta(minutes=1), timedelta(minutes=2), timedelta(minutes=5), timedelta(minutes=15))
 # Lock escalation is forgotten after this long without a new lock.
@@ -47,6 +58,30 @@ LOCK_MEMORY = timedelta(hours=24)
 
 password_hasher = PasswordHasher()
 _dummy_hash: str | None = None
+
+DEFAULT_HASH_CONCURRENCY = 4
+HASH_WAIT_SECONDS = 10.0
+_hash_slots = threading.BoundedSemaphore(DEFAULT_HASH_CONCURRENCY)
+
+
+class PasswordHasherBusy(RuntimeError):
+    """Too many password hashes in flight; the caller answers 503 with Retry-After."""
+
+
+def configure_hash_concurrency(limit: int) -> None:
+    global _hash_slots
+    _hash_slots = threading.BoundedSemaphore(max(1, int(limit)))
+
+
+@contextmanager
+def _hash_slot() -> Iterator[None]:
+    slots = _hash_slots
+    if not slots.acquire(timeout=HASH_WAIT_SECONDS):
+        raise PasswordHasherBusy("password hashing is saturated")
+    try:
+        yield
+    finally:
+        slots.release()
 
 
 class UserError(ValueError):
@@ -89,14 +124,15 @@ def validate_password(password: str, email: str | None = None) -> None:
 
 
 def hash_password(password: str) -> str:
-    return password_hasher.hash(password)
+    with _hash_slot():
+        return password_hasher.hash(password)
 
 
 def dummy_hash() -> str:
     """A fixed hash (per process) with the current parameters, verified for unknown users."""
     global _dummy_hash
     if _dummy_hash is None:
-        _dummy_hash = password_hasher.hash(secrets.token_urlsafe(24))
+        _dummy_hash = hash_password(secrets.token_urlsafe(24))
     return _dummy_hash
 
 
@@ -104,10 +140,11 @@ def verify_password(stored_hash: str | None, password: str) -> bool:
     """Always runs exactly one argon2 verification (against the dummy hash when `stored_hash` is
     None), so an unknown user costs the same as a wrong password."""
     target = stored_hash if stored_hash else dummy_hash()
-    try:
-        password_hasher.verify(target, password)
-    except (VerifyMismatchError, VerificationError, InvalidHashError):
-        return False
+    with _hash_slot():
+        try:
+            password_hasher.verify(target, password)
+        except (VerifyMismatchError, VerificationError, InvalidHashError):
+            return False
     return bool(stored_hash)
 
 
@@ -236,9 +273,50 @@ def active_sessions(session: Session, user_id: str, idle_ttl: timedelta) -> list
 # --- login throttling -----------------------------------------------------------
 
 
+def _throttle_hash(*parts: str) -> str:
+    return hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()
+
+
 def attempt_key(email: str, ip: str | None) -> str:
-    raw = f"{normalize_email(email)}\x00{ip or ''}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    """Key of the (e-mail, IP) pair."""
+    return _throttle_hash(normalize_email(email), ip or "")
+
+
+def ip_key(ip: str | None) -> str:
+    return _throttle_hash("ip", ip or "")
+
+
+def email_key(email: str) -> str:
+    return _throttle_hash("email", normalize_email(email))
+
+
+def throttle_keys(email: str, ip: str | None) -> list[tuple[str, int]]:
+    """(key, max failures) for every counter a login failure feeds."""
+    return [
+        (attempt_key(email, ip), PAIR_MAX_FAILURES),
+        (ip_key(ip), IP_MAX_FAILURES),
+        (email_key(email), EMAIL_MAX_FAILURES),
+    ]
+
+
+def locked_for_any(session: Session, keys: list[tuple[str, int]], now: datetime | None = None) -> int | None:
+    """Longest remaining lock among `keys` (seconds), or None."""
+    now = now or utcnow()
+    waits = [w for key, _ in keys if (w := locked_for(session, key, now)) is not None]
+    return max(waits) if waits else None
+
+
+def register_failures(session: Session, keys: list[tuple[str, int]], now: datetime | None = None) -> int | None:
+    """Count one failure under every key; the longest lock it starts (seconds), or None."""
+    now = now or utcnow()
+    locks = [lk for key, limit in keys if (lk := register_failure(session, key, now, limit)) is not None]
+    return max(locks) if locks else None
+
+
+def clear_login_failures(session: Session, email: str, ip: str | None) -> None:
+    """After a successful login: the pair and e-mail counters reset, the IP counter does not."""
+    clear_failures(session, attempt_key(email, ip))
+    clear_failures(session, email_key(email))
 
 
 def locked_for(session: Session, key: str, now: datetime | None = None) -> int | None:
@@ -265,7 +343,9 @@ def _attempt_row(session: Session, key: str, now: datetime) -> LoginAttempt:
     return row
 
 
-def register_failure(session: Session, key: str, now: datetime | None = None) -> int | None:
+def register_failure(
+    session: Session, key: str, now: datetime | None = None, max_failures: int = PAIR_MAX_FAILURES
+) -> int | None:
     """Count one failure; return the lock duration in seconds when this failure locks the pair."""
     now = now or utcnow()
     row = _attempt_row(session, key, now)
@@ -278,7 +358,7 @@ def register_failure(session: Session, key: str, now: datetime | None = None) ->
         row.count = 0
     row.count += 1
     lock_seconds = None
-    if row.count >= MAX_FAILURES:
+    if row.count >= max_failures:
         step = LOCK_STEPS[min(row.lock_count, len(LOCK_STEPS) - 1)]
         row.lock_count += 1
         row.locked_until = now + step

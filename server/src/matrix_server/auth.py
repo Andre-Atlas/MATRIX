@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import secrets
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -325,7 +326,21 @@ def _credential(request: Request) -> tuple[Literal["api_key", "session"], str] |
 
 
 def client_ip(request: Request) -> str | None:
-    return request.client.host if request.client else None
+    """Client address for throttling and audit: the socket peer, or the value of
+    `settings.trusted_proxy_header` when configured (rightmost entry of a comma-separated list,
+    i.e. the address the trusted proxy saw). An absent or invalid header falls back to the peer."""
+    peer = request.client.host if request.client else None
+    settings = getattr(request.app.state, "settings", None)
+    header = getattr(settings, "trusted_proxy_header", None)
+    if header:
+        raw = request.headers.get(header)
+        if raw:
+            candidate = raw.split(",")[-1].strip()
+            try:
+                return str(ipaddress.ip_address(candidate))
+            except ValueError:
+                pass
+    return peer
 
 
 def _settings_ttls(request: Request) -> tuple[timedelta, timedelta]:

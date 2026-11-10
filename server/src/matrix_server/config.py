@@ -30,6 +30,12 @@ class Settings(BaseSettings):
     session_absolute_ttl_seconds: int = 30 * 24 * 3600
     # Whether any logged-in user may create projects (POST /api/v1/projects).
     allow_project_creation: bool = True
+    # Header carrying the real client IP, set (overwritten) by a trusted reverse proxy such as the
+    # Next.js server, e.g. "X-Forwarded-For" or "X-Real-IP". Off by default: the socket peer is used.
+    # With a comma-separated list the rightmost entry (the one the trusted proxy saw) is taken.
+    trusted_proxy_header: str | None = None
+    # Concurrent argon2 operations per process (each needs 64 MiB); excess waits, then 503.
+    password_hash_concurrency: int = 4
 
     # Artifact store (ADR-007, contract G0 section 2). Raw upload routes are exempt from the JSON
     # body limit and bounded by max_artifact_bytes instead (limits.py).
@@ -42,6 +48,9 @@ class Settings(BaseSettings):
     s3_access_key: str | None = None
     s3_secret_key: str | None = None
     s3_auto_create_bucket: bool = False
+    # Trust the S3 server's verification of x-amz-checksum-sha256 for presigned uploads above
+    # verify_hash_max_bytes (AWS S3, MinIO). Off: such uploads are refused at complete (audit S11).
+    s3_trust_checksum: bool = False
     max_artifact_bytes: int = 5 * 1024**3
     project_quota_bytes: int = 50 * 1024**3
     verify_hash_max_bytes: int = 256 * 1024**2

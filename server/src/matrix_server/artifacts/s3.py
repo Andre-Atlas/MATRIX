@@ -15,6 +15,7 @@ Presigned URLs are signed against `public_endpoint` when set (the address browse
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import uuid
 from collections.abc import Iterator
@@ -34,6 +35,7 @@ from matrix_server.artifacts import (
     InvalidKey,
     PresignedRequest,
     check_project_id,
+    check_sha256,
     content_disposition,
     is_sha256,
     object_key,
@@ -70,6 +72,7 @@ class S3ArtifactStore:
         secret_key: str | None = None,
         public_endpoint: str | None = None,
         auto_create_bucket: bool = False,
+        trust_checksum: bool = False,
         part_size: int = PART_SIZE,
     ) -> None:
         if part_size < 5 * 1024 * 1024:
@@ -77,6 +80,9 @@ class S3ArtifactStore:
         self.bucket = bucket
         self.region = region
         self.part_size = part_size
+        # Only for servers that verify `x-amz-checksum-sha256` on PUT (AWS S3, MinIO); otherwise a
+        # stored-but-unchecked checksum header would be taken as proof of the content's hash.
+        self.trust_checksum = trust_checksum
         config = Config(
             signature_version="s3v4",
             s3={"addressing_style": "path"},
@@ -107,6 +113,7 @@ class S3ArtifactStore:
             secret_key=settings.s3_secret_key,
             public_endpoint=settings.s3_public_endpoint,
             auto_create_bucket=settings.s3_auto_create_bucket,
+            trust_checksum=settings.s3_trust_checksum,
         )
 
     def ensure_bucket(self) -> None:
@@ -253,17 +260,31 @@ class S3ArtifactStore:
     def presign_put(
         self, project_id: str, sha256: str, size: int, ttl: int, *, upload_id: str
     ) -> PresignedRequest:
+        """PUT to the upload's staging key with `Content-Length` and `x-amz-checksum-sha256` in the
+        signed headers (audit S10): the server refuses any other size, and a server that verifies
+        checksums refuses content that does not hash to `sha256`."""
         key = self._upload_key(project_id, upload_id)
+        checksum = base64.b64encode(bytes.fromhex(check_sha256(sha256))).decode()
         url = self.signer.generate_presigned_url(
             "put_object",
-            Params={"Bucket": self.bucket, "Key": key, "ContentType": "application/octet-stream"},
+            Params={
+                "Bucket": self.bucket,
+                "Key": key,
+                "ContentType": "application/octet-stream",
+                "ContentLength": size,
+                "ChecksumSHA256": checksum,
+            },
             ExpiresIn=ttl,
             HttpMethod="PUT",
         )
         return PresignedRequest(
             method="PUT",
             url=url,
-            headers={"Content-Type": "application/octet-stream"},
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(size),
+                "x-amz-checksum-sha256": checksum,
+            },
             expires_at=datetime.now(UTC) + timedelta(seconds=ttl),
         )
 
@@ -284,6 +305,27 @@ class S3ArtifactStore:
         return PresignedRequest(method="GET", url=url, expires_at=datetime.now(UTC) + timedelta(seconds=ttl))
 
     # --- staging -----------------------------------------------------------------------------
+
+    def upload_checksum(self, project_id: str, upload_id: str) -> str | None:
+        """Hex sha256 the server computed and verified for the staged object (None when unknown or
+        when checksums are not trusted)."""
+        if not self.trust_checksum:
+            return None
+        try:
+            head = self.client.head_object(
+                Bucket=self.bucket, Key=self._upload_key(project_id, upload_id), ChecksumMode="ENABLED"
+            )
+        except ClientError as exc:
+            if _is_not_found(exc):
+                return None
+            raise
+        value = head.get("ChecksumSHA256")
+        if not value or "-" in value:  # composite (multipart) checksums prove nothing about the whole
+            return None
+        try:
+            return base64.b64decode(value, validate=True).hex()
+        except ValueError:
+            return None
 
     def stat_upload(self, project_id: str, upload_id: str) -> int | None:
         head = self._head(self._upload_key(project_id, upload_id))

@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import os
 import subprocess
 import sys
 import threading
@@ -21,7 +22,14 @@ RUN = "/api/v1/runs/r1"
 # -- start_run / capture
 
 
-def test_start_run_body(server, client, monkeypatch):
+def test_start_run_body(server, client, monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@t"}
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True, env=env)
+    subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "init"], cwd=repo, check=True, env=env)
+    monkeypatch.chdir(repo)
     monkeypatch.setenv("SUPER_SECRET_TOKEN", "hunter2-do-not-send")
     run = client.start_run(name="exp", group="g", tags=["a", 1], config={"lr": 0.1, "nested": {"x": [1, 2]}},
                            dataset_version="dv1", system_metrics=False)
@@ -31,7 +39,7 @@ def test_start_run_body(server, client, monkeypatch):
     assert body["name"] == "exp" and body["group"] == "g" and body["tags"] == ["a", "1"]
     assert body["params"] == {"lr": 0.1, "nested": {"x": [1, 2]}}
     assert body["dataset_version_id"] == "dv1"
-    assert body["git"]["commit"] and len(body["git"]["commit"]) == 40  # tests run inside the repository
+    assert body["git"]["commit"] and len(body["git"]["commit"]) == 40  # temporary repository, independent of the checkout
     env = body["env"]
     assert env["python"] and env["platform"] and 0 < len(env["packages"]) <= 500
     assert any(p.startswith("httpx==") for p in env["packages"])

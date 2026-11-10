@@ -182,7 +182,6 @@ def test_create_validation(client, two):
         {"tags": ["x"] * 51},
         {"tags": ["bad\ttag"]},
         {"name": ""},
-        {"params": {"lr": float("nan")}},
         {"env": {"packages": ["p==1"] * 501}},
         {"parent_run_id": "nope"},
     ]
@@ -191,7 +190,9 @@ def test_create_validation(client, two):
     foreign = new_run(client, two_)
     resp = client.post("/api/v1/runs", json={"parent_run_id": foreign["id"]}, headers=one.key)
     assert resp.status_code == 422
-    # NaN never reaches the JSON response (the 422 does not echo the input).
+    # The string "nan" is an ordinary param value; a JSON NaN literal is rejected, and the 422 does
+    # not echo the input (NaN would not serialize).
+    assert client.post("/api/v1/runs", json={"params": {"lr": "nan"}}, headers=one.key).status_code == 201
     resp = client.post(
         "/api/v1/runs", content=b'{"params": {"x": NaN}}', headers={**one.key, "Content-Type": "application/json"}
     )
@@ -295,7 +296,10 @@ def test_params_are_immutable(client, two):
     assert "new" not in client.get(f"/api/v1/runs/{rid}", headers=one.key).json()["params"]
     assert client.post(url, json={"params": {"batch": 32.0}}, headers=one.key).status_code == 409
     assert client.post(url, json={"params": {"batch": "32"}}, headers=one.key).status_code == 409
-    assert client.post(url, json={"params": {"x": float("inf")}}, headers=one.key).status_code == 422
+    resp = client.post(
+        url, content=b'{"params": {"x": Infinity}}', headers={**one.key, "Content-Type": "application/json"}
+    )
+    assert resp.status_code == 422  # ...but a JSON Infinity/NaN literal is rejected
     assert client.post(url, json={}, headers=one.key).status_code == 422
 
 
@@ -374,7 +378,8 @@ def test_metric_keys_series_downsampling_and_resend(client, two):
     for i in range(0, len(steps), 5000):
         chunk = steps[i : i + 5000]
         log(client, one, rid, [{"key": "train/loss", "step": s, "value": 1.0 / (s + 1)} for s in chunk])
-    log(client, one, rid, [{"key": "train/loss", "step": 9999, "value": 50.0}])  # spike, off-grid step
+    log(client, one, rid, [{"key": "train/loss", "step": 10_000, "value": 50.0}])  # spike, off-grid step
+    log(client, one, rid, [{"key": "train/loss", "step": 9_999, "value": 0.5}])  # on-grid: replaces, not adds
     log(client, one, rid, [{"key": "acc", "step": s, "value": s / 10} for s in (0, 1, 7, 100)])
     log(client, one, rid, [{"key": "acc", "step": 7, "value": 0.05}])  # resend: last write wins
     keys = client.get(f"/api/v1/runs/{rid}/metric-keys", headers=one.key).json()["keys"]

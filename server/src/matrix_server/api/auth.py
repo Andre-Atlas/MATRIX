@@ -84,6 +84,10 @@ class PasswordIn(BaseModel):
     new_password: str = Field(min_length=1, max_length=4096)
 
 
+def hasher_busy() -> HTTPException:
+    return HTTPException(status_code=503, detail="server busy, retry shortly", headers={"Retry-After": "1"})
+
+
 def _too_many(retry_after: int) -> HTTPException:
     return HTTPException(
         status_code=429, detail="too many failed attempts, try again later",
@@ -96,18 +100,21 @@ def login(request: Request, db: DbSession, payload: Annotated[Any, Body()] = Non
     body: LoginIn = parse_body(LoginIn, payload)
     email = users.normalize_email(body.email)
     ip = client_ip(request)
-    key = users.attempt_key(email, ip)
-    retry_after = users.locked_for(db, key)
+    keys = users.throttle_keys(email, ip)
+    retry_after = users.locked_for_any(db, keys)
     if retry_after is not None:
         raise _too_many(retry_after)
 
     user = users.get_user_by_email(db, email)
     # Always exactly one argon2 verification (dummy hash for unknown users), so both paths cost
     # the same; over-long passwords are verified too and then rejected.
-    ok = users.verify_password(user.password_hash if user else None, body.password)
+    try:
+        ok = users.verify_password(user.password_hash if user else None, body.password)
+    except users.PasswordHasherBusy:
+        raise hasher_busy() from None
     ok = ok and len(body.password) <= users.PASSWORD_MAX_CHARS
     if not ok or user is None:
-        lock = users.register_failure(db, key)
+        lock = users.register_failures(db, keys)
         audit.record(
             db,
             action="auth.login_failed",
@@ -120,8 +127,11 @@ def login(request: Request, db: DbSession, payload: Annotated[Any, Body()] = Non
         logger.info("login failed for %s from %s", users.mask_email(email), ip)
         raise HTTPException(status_code=401, detail=LOGIN_FAILED, headers={"WWW-Authenticate": "Bearer"})
 
-    users.clear_failures(db, key)
-    users.rehash_if_needed(user, body.password)
+    users.clear_login_failures(db, email, ip)
+    try:
+        users.rehash_if_needed(user, body.password)
+    except users.PasswordHasherBusy:
+        pass  # upgrade on a later login
     user.last_login_at = utcnow()
     token, web_session = users.create_session(
         db,
@@ -169,12 +179,17 @@ def change_password(
     user = db.get(User, ctx.user.id)
     if user is None:
         raise HTTPException(status_code=401, detail="invalid or missing credentials")
-    key = users.attempt_key(user.email, client_ip(request))
-    retry_after = users.locked_for(db, key)
+    ip = client_ip(request)
+    keys = users.throttle_keys(user.email, ip)
+    retry_after = users.locked_for_any(db, keys)
     if retry_after is not None:
         raise _too_many(retry_after)
-    if not users.verify_password(user.password_hash, body.current_password):
-        users.register_failure(db, key)
+    try:
+        current_ok = users.verify_password(user.password_hash, body.current_password)
+    except users.PasswordHasherBusy:
+        raise hasher_busy() from None
+    if not current_ok:
+        users.register_failures(db, keys)
         audit.record(
             db, action="auth.password_change_failed", actor_kind="user", actor_id=user.id, target=user.id,
             detail=request_detail(request),
@@ -185,7 +200,9 @@ def change_password(
         users.set_password(db, user, body.new_password)
     except users.UserError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    users.clear_failures(db, key)
+    except users.PasswordHasherBusy:
+        raise hasher_busy() from None
+    users.clear_login_failures(db, user.email, ip)
     revoked = users.revoke_user_sessions(db, user.id, except_id=ctx.session_id)
     audit.record(
         db, action="auth.password_change", actor_kind="user", actor_id=user.id, target=user.id,

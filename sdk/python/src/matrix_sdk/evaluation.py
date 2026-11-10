@@ -340,9 +340,12 @@ def regression_report_data(y_true: Any, y_pred: Any, seed: int = 0) -> dict[str,
     q75, q25 = np.percentile(res, [75, 25])
     width = 2 * (q75 - q25) * n ** (-1 / 3)
     span = float(res.max() - res.min())
-    bins = HIST_DEFAULT_BINS if width <= 0 or span <= 0 else int(math.ceil(span / width))
+    bins = HIST_DEFAULT_BINS if width <= 0 or span <= 0 else math.ceil(span / width)
     bins = max(HIST_MIN_BINS, min(HIST_MAX_BINS, bins))
-    counts, edges = np.histogram(res, bins=bins)
+    lo, hi = float(res.min()), float(res.max())
+    if hi - lo <= 1e-9 * max(1.0, abs(lo), abs(hi)):  # constant residuals: give the bins a finite width
+        lo, hi = lo - 0.5, hi + 0.5
+    counts, edges = np.histogram(res, bins=bins, range=(lo, hi))
     sel = np.arange(n)
     if n > MAX_SAMPLE:
         sel = np.sort(np.random.default_rng(seed).choice(n, MAX_SAMPLE, replace=False))
@@ -402,8 +405,8 @@ def _shap_importance(np: Any, model: Any, X: Any, n_features: int, seed: int) ->
                  else np.asarray(values))
     if arr.ndim == 1:
         arr = arr[None, :]
-    axis = 1 if arr.ndim > 1 and arr.shape[1] == n_features else [i for i, s in enumerate(arr.shape)
-                                                                   if s == n_features][0]
+    axis = 1 if arr.ndim > 1 and arr.shape[1] == n_features else next(i for i, s in enumerate(arr.shape)
+                                                                   if s == n_features)
     return np.moveaxis(arr, axis, 0).reshape(n_features, -1).mean(axis=1)
 
 

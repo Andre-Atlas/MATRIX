@@ -444,16 +444,42 @@ def test_redirect_revalidates_allowlist(db, server):
     assert exc.value.reason == "host_not_allowed" and net.dials == [PUBLIC_IP]
 
 
-def test_redirect_follows_and_strips_credentials_on_host_change(db, server):
+def test_redirect_follows_and_strips_caller_headers_on_origin_change(db, server):
     _Net(server, {"a.example.com": [PUBLIC_IP], "b.example.com": ["8.8.8.8"]})
-    creds = {"Authorization": "Bearer tok", "Cookie": "sid=1", "X-Custom": "keep"}
-    same = _client(db, settings=_public()).get("http://a.example.com/redirect?to=/echo", headers=creds).json()
-    assert same["authorization"] == "Bearer tok" and same["cookie"] == "sid=1"
+    secret_headers = {
+        "Authorization": "Bearer tok", "Proxy-Authorization": "Basic x", "Cookie": "sid=1",
+        "X-Api-Key": "k1", "Api-Key": "k2", "X-Goog-Api-Key": "k3", "Anthropic-Api-Key": "k4",
+        "X-Custom-Token": "k5",
+    }
+    kept = {"Accept": "application/json", "Accept-Language": "pt-BR", "User-Agent": "matrix-test"}
+    hdrs = {**secret_headers, **kept}
+    same = _client(db, settings=_public()).get("http://a.example.com/redirect?to=/echo", headers=hdrs).json()
+    assert same["authorization"] == "Bearer tok" and same["x-api-key"] == "k1"  # same origin: all kept
     other = _client(db, settings=_public()).get(
-        "http://a.example.com/redirect?to=http://b.example.com/echo", headers=creds
+        "http://a.example.com/redirect?to=http://b.example.com/echo", headers=hdrs
     ).json()
-    assert "authorization" not in other and "cookie" not in other
-    assert other["x-custom"] == "keep" and other["host"] == "b.example.com"
+    for name in secret_headers:
+        assert name.lower() not in other, name
+    for name, value in kept.items():
+        assert other[name.lower()] == value
+    assert other["host"] == "b.example.com"
+
+
+def test_redirect_to_other_port_is_cross_origin(db, server):
+    _Net(server, {"a.example.com": [PUBLIC_IP]})
+    other = _client(db, settings=EgressSettings(mode="public", allowed_ports="80,8080")).get(
+        "http://a.example.com/redirect?to=http://a.example.com:8080/echo", headers={"X-Api-Key": "k1"}
+    ).json()
+    assert "x-api-key" not in other
+
+
+def test_cross_origin_post_keeps_content_type_with_307(db, server):
+    _Net(server, {"a.example.com": [PUBLIC_IP], "b.example.com": ["8.8.8.8"]})
+    seen = _client(db, settings=_public()).post(
+        "http://a.example.com/redirect?code=307&to=http://b.example.com/echo",
+        json={"x": 1}, headers={"X-Api-Key": "k1"},
+    ).json()
+    assert seen["content-type"] == "application/json" and "x-api-key" not in seen
 
 
 def test_redirect_limit(db, server):

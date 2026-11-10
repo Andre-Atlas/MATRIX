@@ -37,7 +37,12 @@ _STRIP_REQUEST_HEADERS = frozenset(
     {"host", "content-length", "transfer-encoding", "connection", "keep-alive", "upgrade", "te",
      "trailer", "proxy-connection", "accept-encoding"}
 )
-_CREDENTIAL_HEADERS = frozenset({"authorization", "proxy-authorization", "cookie", "cookie2"})
+# On a cross-origin redirect every caller header is dropped except these (any other header may carry
+# a credential: authorization, cookie, x-api-key, api-key, x-goog-api-key, ...). accept-encoding is
+# set by the client itself; content-length is recomputed by httpx.
+_CROSS_ORIGIN_KEEP_HEADERS = frozenset(
+    {"accept", "accept-language", "user-agent", "content-type", "content-length", "accept-encoding"}
+)
 
 # --- connection seam -----------------------------------------------------------------------------
 
@@ -245,8 +250,9 @@ class EgressClient:
                 for h in ("content-type", "content-length"):
                     out_headers.pop(h, None)
             if not _same_origin(target.url, nxt):
-                for h in _CREDENTIAL_HEADERS:
-                    out_headers.pop(h, None)
+                out_headers = httpx.Headers(
+                    [(k, v) for k, v in out_headers.multi_items() if k.lower() in _CROSS_ORIGIN_KEEP_HEADERS]
+                )
             current = nxt
         raise AssertionError("unreachable")  # pragma: no cover
 

@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 
+from matrix_server import users
 from matrix_server.api import (
     admin,
     annotations,
@@ -28,6 +29,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="MATRIX")
     settings = settings or get_settings()
     app.state.settings = settings
+    users.configure_hash_concurrency(settings.password_hash_concurrency)
     app.add_middleware(
         BodyLimitMiddleware,
         max_body_bytes=settings.max_body_bytes,

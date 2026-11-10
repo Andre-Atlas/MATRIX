@@ -164,7 +164,7 @@ def _check_m4(series, max_points, raw):
 
 def test_m4_stores_agree_on_random_data(both, project):
     rng = random.Random(7)
-    steps = sorted(rng.sample(range(0, 300_000), 20_000))  # gaps and non-uniform spacing
+    steps = sorted(rng.sample(range(300_000), 20_000))  # gaps and non-uniform spacing
     values = [rng.gauss(0, 1) for _ in steps]
     for i in rng.sample(range(len(values)), 50):
         values[i] = rng.choice([math.nan, math.inf, -math.inf])
@@ -180,7 +180,7 @@ def test_m4_stores_agree_on_random_data(both, project):
     memory, clickhouse = both
     for max_points in (4, 100, 1000, 5000):
         for x in ("step", "time"):
-            args = dict(max_points=max_points, x=x)
+            args = {"max_points": max_points, "x": x}
             got_m = memory.read_series(project, ["r", "r2"], ["noise", "ties", "short"], **args)
             got_c = clickhouse.read_series(project, ["r", "r2"], ["noise", "ties", "short"], **args)
             assert got_m == got_c, (max_points, x)

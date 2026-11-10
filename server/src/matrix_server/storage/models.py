@@ -424,6 +424,6 @@ class LoginAttempt(Base):
 
 # --- Model modules registered here (one import per module, appended by each task) ------------
 # Keeps Base.metadata complete for Alembic and create_all without every task editing this file.
-import matrix_server.runs.models  # noqa: E402, F401
 import matrix_server.artifacts.models
 import matrix_server.egress.models  # noqa: F401
+import matrix_server.runs.models

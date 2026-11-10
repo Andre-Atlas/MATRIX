@@ -13,7 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from matrix_server import audit, users
-from matrix_server.api.auth import parse_body, request_detail, user_out
+from matrix_server.api.auth import hasher_busy, parse_body, request_detail, user_out
 from matrix_server.auth import ProjectExistsError, create_api_key, create_project, require_admin
 from matrix_server.storage.db import as_utc, get_db
 from matrix_server.storage.models import Project
@@ -68,6 +68,8 @@ def post_user(request: Request, db: DbSession, payload: Annotated[Any, Body()] =
         raise HTTPException(status_code=409, detail=str(exc)) from None
     except users.UserError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
+    except users.PasswordHasherBusy:
+        raise hasher_busy() from None
     audit.record(db, action="user.create", target=user.id, detail=request_detail(request))
     return user_out(user)
 

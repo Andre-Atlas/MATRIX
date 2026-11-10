@@ -288,36 +288,49 @@ def hash_stream(stream: BinaryIO, limit: int | None = None) -> tuple[str, int]:
 
 
 def complete_upload(session: Session, store: ArtifactStore, artifact: Artifact, limits: Limits) -> Artifact:
-    """Settle a pending presigned upload: check size (and the hash up to `verify_hash_max_bytes`),
-    move the staged object into place and mark the artifact ready. On a mismatch the staged object
-    and the row are removed and `HashMismatch` (422) is raised; `UploadMissing` (409) when nothing
-    was uploaded yet. Idempotent for an already ready artifact."""
+    """Settle a pending presigned upload: check the staged object's size and prove its sha256, then
+    move it to the blob key and mark the artifact ready. Idempotent for a ready artifact.
+
+    Invariant (audit S11): a blob key `{project}/{aa}/{sha256}` only ever holds content proven to
+    hash to `sha256` — hashed by `put`, re-hashed here up to `verify_hash_max_bytes`, or, above it,
+    checked by the S3 server (`x-amz-checksum-sha256`, signed into the presigned PUT; trusted only
+    with `MATRIX_S3_TRUST_CHECKSUM=1`). An object that cannot be proven is never promoted: it is
+    removed with its row and `HashMismatch` (422) is raised; the client can use the direct upload,
+    which hashes any size. `UploadMissing` (409) when nothing was uploaded yet."""
     if artifact.status == "ready":
         return artifact
     pid, sha, size = artifact.project_id, artifact.sha256, artifact.size
-    verify = size <= limits.verify_hash_max_bytes
     staged = store.stat_upload(pid, artifact.id)
     if staged is not None:
-        ok = staged == size
-        if ok and verify:
+        detail = None
+        if staged != size:  # audit S10: never accept more (or less) than was declared and reserved
+            detail = "uploaded object does not match the declared size"
+        elif size <= limits.verify_hash_max_bytes:
             got, read = hash_stream(store.open_upload(pid, artifact.id), size)
-            ok = got == sha and read == size
-        if not ok:
+            if got != sha or read != size:
+                detail = "uploaded object does not match the declared sha256"
+        elif store.upload_checksum(pid, artifact.id) != sha:
+            detail = (
+                "uploaded object is larger than MATRIX_VERIFY_HASH_MAX_BYTES and its sha256 cannot be "
+                "verified; use the direct upload (POST /api/v1/artifacts)"
+            )
+        if detail is not None:
             store.delete_upload(pid, artifact.id)
             session.delete(artifact)
             session.flush()
-            raise HashMismatch("uploaded object does not match the declared size or sha256")
+            raise HashMismatch(detail)
         store.promote_upload(pid, artifact.id, sha)
     else:
+        # Content already stored under this digest (dedup within the project, or the local
+        # backend's content route, which hashes while writing).
         existing = store.size(pid, sha)
         if existing is None:
             raise UploadMissing("upload not received")
         if existing != size:
-            # A different blob size under this digest: never trust or delete the shared blob here.
             session.delete(artifact)
             session.flush()
             raise HashMismatch("uploaded object does not match the declared size")
-        if verify:
+        if size <= limits.verify_hash_max_bytes:  # defence in depth; blob keys are verified by construction
             try:
                 got, _ = hash_stream(store.open(pid, sha), size)
             except BlobNotFound as exc:
@@ -327,7 +340,7 @@ def complete_upload(session: Session, store: ArtifactStore, artifact: Artifact, 
                 session.flush()
                 raise HashMismatch("stored object does not match the declared sha256")
     artifact.status = "ready"
-    artifact.verified = verify
+    artifact.verified = True
     session.flush()
     return artifact
 
