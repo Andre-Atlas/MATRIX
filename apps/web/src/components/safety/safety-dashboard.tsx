@@ -28,7 +28,7 @@ export function SafetyDashboard({
 }: SafetyDashboardProps) {
   const [scans, setScans] = useState<SafetyScan[]>(initialScans);
   const [selectedScanId, setSelectedScanId] = useState<string>(
-    initialReport?.scan.id ?? initialScans[0]?.id ?? "",
+    initialReport?.scan?.id ?? (initialReport as any)?.scan_id ?? (initialReport as any)?.id ?? initialScans[0]?.id ?? "",
   );
   const [findings, setFindings] = useState<SafetyFinding[]>(allFindings);
   const [selectedCategoryCode, setSelectedCategoryCode] = useState<string>("all");
@@ -77,7 +77,7 @@ export function SafetyDashboard({
           >
             {scans.map((s) => (
               <option key={s.id} value={s.id}>
-                {s.name} ({s.safety_score}% — {s.target_model})
+                {s.name || s.id.slice(0, 8)} ({s.safety_score ?? (s as any).global_score ?? 100}% — {s.target_model})
               </option>
             ))}
           </select>
@@ -101,7 +101,7 @@ export function SafetyDashboard({
         score={activeReport.summary.score}
         riskLevel={activeReport.summary.risk_level}
         summary={activeReport.summary}
-        scanName={activeScan.name}
+        scanName={activeScan.name || activeScan.id.slice(0, 8)}
         targetModel={activeScan.target_model}
       />
 

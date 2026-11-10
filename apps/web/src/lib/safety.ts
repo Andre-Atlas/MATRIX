@@ -210,7 +210,7 @@ export function summarizeScan(
   };
 }
 
-export function formatRiskLevel(risk: RiskLevel) {
+export function formatRiskLevel(risk?: RiskLevel | string) {
   switch (risk) {
     case "low":
       return {
@@ -240,6 +240,13 @@ export function formatRiskLevel(risk: RiskLevel) {
         color: "text-red-400",
         stroke: "#ef4444",
       };
+    default:
+      return {
+        label: "Low Risk",
+        badge: "bg-emerald-950/60 text-emerald-300 border-emerald-800/60",
+        color: "text-emerald-400",
+        stroke: "#10b981",
+      };
   }
 }
 
@@ -262,6 +269,12 @@ export function formatComplianceStatus(status: ComplianceStatus) {
         label: "Vulnerable",
         badge: "bg-red-950/60 text-red-300 border-red-800/60",
         dot: "bg-red-400",
+      };
+    default:
+      return {
+        label: "Compliant",
+        badge: "bg-emerald-950/60 text-emerald-300 border-emerald-800/60",
+        dot: "bg-emerald-400",
       };
   }
 }

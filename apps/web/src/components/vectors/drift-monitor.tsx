@@ -192,7 +192,7 @@ export function DriftMonitor({ driftData }: DriftMonitorProps) {
           <div>
             <span className="text-zinc-500">Analyzed Queries:</span>
             <div className="font-mono text-zinc-300">
-              {metrics.total_queries_analyzed.toLocaleString()}
+              {(metrics.total_queries_analyzed ?? 0).toLocaleString()}
             </div>
           </div>
           <div>
