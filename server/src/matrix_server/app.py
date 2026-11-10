@@ -11,6 +11,7 @@ from matrix_server.api import (
     prompts,
     query,
     rules,
+    safety,
     vectors,
 )
 from matrix_server.config import Settings, get_settings
@@ -52,6 +53,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         experiments,
         annotations,
         rules,
+        safety,
         online_evals,
         vectors,
     ):

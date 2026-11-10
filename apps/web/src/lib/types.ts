@@ -513,3 +513,148 @@ export type VectorDriftResponse = {
     centroid_cosine: number;
   }[];
 };
+
+// ── Safety & OWASP LLM Top 10 (Trilha C) ──
+
+export type RiskLevel = "low" | "medium" | "high" | "critical";
+
+export type ComplianceStatus = "compliant" | "needs_review" | "vulnerable";
+
+export type SafetySeverity = "info" | "low" | "medium" | "high" | "critical";
+
+export type SafetyCategoryCode =
+  | "LLM01"
+  | "LLM02"
+  | "LLM03"
+  | "LLM04"
+  | "LLM05"
+  | "LLM06"
+  | "LLM07"
+  | "LLM08"
+  | "LLM09"
+  | "LLM10";
+
+export type SafetyProbe = {
+  id: string;
+  category_id: string;
+  category_code: SafetyCategoryCode;
+  name: string;
+  description: string;
+  attack_vector: string;
+  payload_prompt: string;
+  expected_defense: string;
+  recommended_guardrail: string;
+  severity: SafetySeverity;
+};
+
+export type SafetyCategory = {
+  id: string;
+  code: SafetyCategoryCode;
+  name: string;
+  short_description: string;
+  description: string;
+  probes_count: number;
+  severity_default: SafetySeverity;
+  owasp_url?: string;
+  probes?: SafetyProbe[];
+};
+
+export type SafetyFinding = {
+  id: string;
+  scan_id: string;
+  category_id: string;
+  category_code: SafetyCategoryCode;
+  category_name: string;
+  probe_id: string;
+  probe_name: string;
+  severity: SafetySeverity;
+  status: "passed" | "failed" | "flagged";
+  passed?: boolean;
+  attack_prompt: string;
+  prompt?: string;
+  observed_output: string;
+  response?: string;
+  defense_analysis: string;
+  analysis?: string;
+  recommended_guardrail: string;
+  mitigation?: string;
+  cwe_id?: string;
+  mitigation_applied?: boolean;
+  created_at: string;
+};
+
+export type SafetyCategoryScore = {
+  category_id: string;
+  category_code: SafetyCategoryCode;
+  name: string;
+  probes_tested: number;
+  probes_passed: number;
+  probes_failed: number;
+  pass_rate: number; // 0.0 to 1.0
+  status: ComplianceStatus;
+  findings_count: number;
+  critical_findings: number;
+};
+
+export type SafetyScanStatus = "queued" | "running" | "completed" | "failed" | "passed" | "warning";
+
+export type SafetyScan = {
+  id: string;
+  name: string;
+  target_model: string;
+  target_prompt?: string;
+  target_system_prompt?: string;
+  status: SafetyScanStatus;
+  categories_tested: string[];
+  total_probes: number;
+  probes_passed: number;
+  passed_count?: number;
+  probes_failed: number;
+  failed_count?: number;
+  pass_rate?: number;
+  safety_score: number; // 0 to 100
+  global_score?: number;
+  risk_level: RiskLevel;
+  findings_count: number;
+  created_at: string;
+  completed_at?: string;
+  duration_ms?: number;
+};
+
+export type SafetyScanSummary = {
+  total_probes: number;
+  passed: number;
+  failed: number;
+  compliance_rate: number; // 0 to 100
+  score: number; // 0 to 100
+  risk_level: RiskLevel;
+  critical_count: number;
+  high_count: number;
+  medium_count: number;
+  low_count: number;
+};
+
+export type SafetyScanReport = {
+  scan: SafetyScan;
+  category_scores: SafetyCategoryScore[];
+  findings: SafetyFinding[];
+  summary: SafetyScanSummary;
+};
+
+export type CreateSafetyScanRequest = {
+  name: string;
+  target_model: string;
+  target_prompt?: string;
+  target_system_prompt?: string;
+  categories?: string[];
+  max_probes_per_category?: number;
+};
+
+export type SafetyCategoriesResponse = {
+  categories: SafetyCategory[];
+};
+
+export type SafetyScansResponse = {
+  scans: SafetyScan[];
+  total: number;
+};

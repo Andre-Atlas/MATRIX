@@ -821,3 +821,14 @@ export function mockVectorProjection(params?: Record<string, string | number | u
 export function mockVectorDrift(_params?: Record<string, string | number | undefined>): VectorDriftResponse {
   return MOCK_DRIFT_RESPONSE;
 }
+
+// ── Safety & OWASP Top 10 Mock Data & Handlers ──
+export {
+  MOCK_SAFETY_CATEGORIES,
+  MOCK_PROBES,
+  MOCK_FINDINGS,
+  MOCK_SAFETY_SCANS,
+  getMockSafetyScans,
+  getMockSafetyReport,
+  createMockSafetyScan,
+} from "./mock-safety";

@@ -362,3 +362,26 @@ class Job(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+# --- Defensive Security & OWASP Top 10 Scans --------------------------------
+
+
+class SafetyScan(Base):
+    """Defensive safety audit and compliance scan report (OWASP Top 10 for LLMs)."""
+
+    __tablename__ = "safety_scans"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    target_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    target_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="passed")
+    global_score: Mapped[float] = mapped_column(Float, nullable=False, default=100.0)
+    total_probes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    passed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    categories_summary: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    findings: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+

@@ -1,9 +1,27 @@
 // In-memory implementation of the API, used only when MATRIX_MOCK=1.
 import { ApiError } from "./api-error";
-import { mockDb, mockVectorDrift, mockVectorProjection } from "./mock-data";
+import {
+  createMockSafetyScan,
+  getMockSafetyReport,
+  getMockSafetyScans,
+  MOCK_SAFETY_CATEGORIES,
+  mockDb,
+  mockVectorDrift,
+  mockVectorProjection,
+} from "./mock-data";
 import { evalExportJsonl, evalGet, evalSend } from "./mock-evals";
 import { dpoExportJsonl, opsGet, opsSend } from "./mock-ops";
-import type { ListResponse, OverviewStats, Score, SessionDetail, TraceDetail, TraceSummary } from "./types";
+import type {
+  CreateSafetyScanRequest,
+  ListResponse,
+  OverviewStats,
+  SafetyCategoriesResponse,
+  SafetyScansResponse,
+  Score,
+  SessionDetail,
+  TraceDetail,
+  TraceSummary,
+} from "./types";
 
 type Params = Record<string, string | number | undefined>;
 
@@ -120,6 +138,23 @@ export async function mockGet<T>(path: string, params: Params = {}): Promise<T> 
     return mockVectorDrift(params) as T;
   }
 
+  if (p === "/api/v1/safety/categories") {
+    const resp: SafetyCategoriesResponse = { categories: MOCK_SAFETY_CATEGORIES };
+    return resp as T;
+  }
+
+  if (p === "/api/v1/safety/scans") {
+    const scans = getMockSafetyScans();
+    const resp: SafetyScansResponse = { scans, total: scans.length };
+    return resp as T;
+  }
+
+  if ((m = /^\/api\/v1\/safety\/scans\/([^/]+)$/.exec(p))) {
+    const report = getMockSafetyReport(m[1]);
+    if (!report) throw new ApiError(404, "safety scan not found");
+    return report as T;
+  }
+
   const evalResult = evalGet(p);
   if (evalResult !== undefined) return evalResult as T;
 
@@ -132,6 +167,11 @@ export async function mockGet<T>(path: string, params: Params = {}): Promise<T> 
 export async function mockSend<T>(method: string, path: string, body?: unknown): Promise<T> {
   const m = method.toUpperCase();
   const p = path.replace(/\/+$/, "");
+
+  if (m === "POST" && p === "/api/v1/safety/scans") {
+    return createMockSafetyScan(body as CreateSafetyScanRequest) as T;
+  }
+
   const out = evalSend(m, p, body) ?? opsSend(m, p, body);
   if (out === undefined) throw new ApiError(404, `mock: no handler for ${method} ${path}`);
   return out as T;
