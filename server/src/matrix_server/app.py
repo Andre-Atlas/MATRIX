@@ -11,6 +11,7 @@ from matrix_server.api import (
     prompts,
     query,
     rules,
+    vectors,
 )
 from matrix_server.config import Settings, get_settings
 from matrix_server.hooks import install_api_hooks
@@ -41,6 +42,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    for module in (auth, ingest, admin, query, prompts, datasets, experiments, annotations, rules, online_evals):
+    for module in (
+        auth,
+        ingest,
+        admin,
+        query,
+        prompts,
+        datasets,
+        experiments,
+        annotations,
+        rules,
+        online_evals,
+        vectors,
+    ):
         app.include_router(module.router)
     return app

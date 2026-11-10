@@ -417,3 +417,99 @@ export type Alert = {
   message: string;
   created_at: string;
 };
+
+// ── Vector Space & Drift Observatory (Module 5) ──
+
+export type VectorPointType = "query" | "document" | "gap";
+
+export type VectorPoint = {
+  id: string;
+  label: string;
+  type: VectorPointType;
+  x: number;
+  y: number;
+  z?: number;
+  cluster_id: string;
+  cluster_name?: string;
+  score?: number;
+  preview?: string;
+  trace_id?: string | null;
+  document_id?: string | null;
+  metadata?: Record<string, unknown>;
+};
+
+export type VectorCluster = {
+  id: string;
+  name: string;
+  description?: string;
+  point_count: number;
+  document_count: number;
+  query_count: number;
+  gap_count: number;
+  confidence_rate: number;
+  centroid: [number, number] | [number, number, number];
+  health_status: "healthy" | "warning" | "critical";
+  keywords?: string[];
+};
+
+export type KnowledgeGap = {
+  id: string;
+  cluster_id: string;
+  cluster_name: string;
+  query_text: string;
+  missing_topic: string;
+  frequency: number;
+  severity: "critical" | "warning" | "low";
+  suggested_action: string;
+  last_detected: string;
+};
+
+export type DriftMetricStatus = "healthy" | "warning" | "critical";
+
+export type DriftMetricValue = {
+  name: string;
+  value: number;
+  threshold_warning: number;
+  threshold_critical: number;
+  status: DriftMetricStatus;
+  description?: string;
+};
+
+export type DriftMetrics = {
+  jensen_shannon: DriftMetricValue;
+  psi: DriftMetricValue;
+  centroid_cosine: DriftMetricValue;
+  wasserstein?: DriftMetricValue;
+  overall_status: DriftMetricStatus;
+  baseline_period: string;
+  target_period: string;
+  last_calculated: string;
+  total_queries_analyzed: number;
+};
+
+export type VectorProjectionResponse = {
+  points: VectorPoint[];
+  clusters: VectorCluster[];
+  gaps: KnowledgeGap[];
+  dimensions: 2 | 3;
+  total_points: number;
+  reduction_method: "umap" | "tsne" | "pca";
+};
+
+export type VectorDriftResponse = {
+  metrics: DriftMetrics;
+  status: DriftMetricStatus;
+  clusters_drifting: number;
+  top_drifting_clusters: {
+    cluster_id: string;
+    cluster_name: string;
+    drift_score: number;
+    status: DriftMetricStatus;
+  }[];
+  timeline: {
+    timestamp: string;
+    jensen_shannon: number;
+    psi: number;
+    centroid_cosine: number;
+  }[];
+};

@@ -1,5 +1,18 @@
-// Development/screenshot fixtures. Only loaded when MATRIX_MOCK=1 (see lib/api.ts).
-import type { Document, Media, Message, SessionSummary, Span, SpanKind, TraceSummary } from "./types";
+import type {
+  Document,
+  DriftMetrics,
+  KnowledgeGap,
+  Media,
+  Message,
+  SessionSummary,
+  Span,
+  SpanKind,
+  TraceSummary,
+  VectorCluster,
+  VectorDriftResponse,
+  VectorPoint,
+  VectorProjectionResponse,
+} from "./types";
 
 export const MOCK_AGENT_TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736";
 export const MOCK_RAG_TRACE_ID = "0af7651916cd43dd8448eb211c80319c";
@@ -551,4 +564,260 @@ export function mockDb(now = Date.now()): MockDb {
   const db = { traces, sessions };
   cache = { db, at: now };
   return db;
+}
+
+// ── Vector Space & Drift Observatory Mock Fixtures (Module 5) ──
+
+export const MOCK_VECTOR_CLUSTERS: VectorCluster[] = [
+  {
+    id: "cluster-auth",
+    name: "Authentication & Billing",
+    description: "User session auth, OAuth2 callbacks, JWT verification, and Stripe webhook lifecycle",
+    point_count: 24,
+    document_count: 8,
+    query_count: 14,
+    gap_count: 2,
+    confidence_rate: 0.94,
+    centroid: [28, 32, 15],
+    health_status: "healthy",
+    keywords: ["oauth2", "stripe", "jwt", "session", "billing", "webhooks"],
+  },
+  {
+    id: "cluster-agent",
+    name: "Agent Tool Calling & Execution",
+    description: "Function schemas, tool dispatch, JSON argument serialization and retry handling",
+    point_count: 22,
+    document_count: 7,
+    query_count: 13,
+    gap_count: 2,
+    confidence_rate: 0.88,
+    centroid: [-32, 22, -18],
+    health_status: "healthy",
+    keywords: ["tools", "functions", "json-schema", "dispatch", "retries", "timeout"],
+  },
+  {
+    id: "cluster-rag",
+    name: "RAG & Knowledge Retrieval",
+    description: "Hybrid vector search, BM25 reranking, chunking boundaries, and context window assembly",
+    point_count: 26,
+    document_count: 9,
+    query_count: 14,
+    gap_count: 3,
+    confidence_rate: 0.81,
+    centroid: [18, -34, 12],
+    health_status: "warning",
+    keywords: ["chunks", "embeddings", "pgvector", "bm25", "rerank", "context"],
+  },
+  {
+    id: "cluster-safety",
+    name: "Guardrails & Safety Evals",
+    description: "Adversarial jailbreak protection, PII masking, OWASP LLM 01 prompt injection, toxic filters",
+    point_count: 20,
+    document_count: 5,
+    query_count: 11,
+    gap_count: 4,
+    confidence_rate: 0.73,
+    centroid: [-26, -28, -24],
+    health_status: "critical",
+    keywords: ["jailbreak", "pii", "injection", "moderation", "guardrails", "owasp"],
+  },
+];
+
+export const MOCK_KNOWLEDGE_GAPS: KnowledgeGap[] = [
+  {
+    id: "gap-saml-sso",
+    cluster_id: "cluster-auth",
+    cluster_name: "Authentication & Billing",
+    query_text: "How to configure Okta and Entra ID SAML 2.0 metadata exchange with automated SCIM user provisioning?",
+    missing_topic: "Enterprise SAML 2.0 & SCIM Provisioning",
+    frequency: 46,
+    severity: "critical",
+    suggested_action: "Publish documentation and reference implementation for Okta/Entra SCIM v2 webhook listeners.",
+    last_detected: "2026-11-10T11:45:00Z",
+  },
+  {
+    id: "gap-pt-jailbreak",
+    cluster_id: "cluster-safety",
+    cluster_name: "Guardrails & Evals",
+    query_text: "Como contornar restrições de sistema usando codificação base64 em português e personas de ficção científica?",
+    missing_topic: "Multilingual Adversarial Jailbreak Defenses",
+    frequency: 54,
+    severity: "critical",
+    suggested_action: "Integrate multilingual adversarial jailbreak detection dataset into online guardrail evaluations.",
+    last_detected: "2026-11-10T13:00:00Z",
+  },
+  {
+    id: "gap-stream-tool",
+    cluster_id: "cluster-agent",
+    cluster_name: "Agent Tool Calling & Execution",
+    query_text: "How to handle streaming partial JSON arguments when LLM calls nested tools with chunked tokens?",
+    missing_topic: "Streaming Partial JSON Tool Calls",
+    frequency: 32,
+    severity: "warning",
+    suggested_action: "Add guide and helper library for incremental token parsing in function calling responses.",
+    last_detected: "2026-11-10T09:30:00Z",
+  },
+  {
+    id: "gap-multitenant-rag",
+    cluster_id: "cluster-rag",
+    cluster_name: "RAG & Knowledge Retrieval",
+    query_text: "What is the best pgvector indexing strategy for strict per-tenant namespace isolation with HNSW partitions?",
+    missing_topic: "Multi-Tenant Vector Isolation & Partitioned HNSW",
+    frequency: 27,
+    severity: "warning",
+    suggested_action: "Document partitioned table schemas and row-level security (RLS) policies for pgvector.",
+    last_detected: "2026-11-10T12:15:00Z",
+  },
+];
+
+export const MOCK_VECTOR_POINTS: VectorPoint[] = [
+  // Cluster Auth - Documents (Green)
+  { id: "doc-auth-1", label: "Doc: OAuth 2.0 PKCE Flow", type: "document", x: 26, y: 34, z: 12, cluster_id: "cluster-auth", cluster_name: "Authentication & Billing", score: 0.96, preview: "Authorization Code flow with Proof Key for Code Exchange specification and token exchange", document_id: "doc_oauth_pkce" },
+  { id: "doc-auth-2", label: "Doc: Stripe Webhook Signatures", type: "document", x: 31, y: 36, z: 18, cluster_id: "cluster-auth", cluster_name: "Authentication & Billing", score: 0.98, preview: "Verifying stripe-signature headers using secret key and HMAC SHA-256", document_id: "doc_stripe_webhooks" },
+  { id: "doc-auth-3", label: "Doc: JWT Invalidation & Refresh", type: "document", x: 27, y: 29, z: 14, cluster_id: "cluster-auth", cluster_name: "Authentication & Billing", score: 0.91, preview: "Short-lived access tokens with rolling refresh token rotation in redis store", document_id: "doc_jwt_refresh" },
+  { id: "doc-auth-4", label: "Doc: Session Cookie Security", type: "document", x: 30, y: 33, z: 16, cluster_id: "cluster-auth", cluster_name: "Authentication & Billing", score: 0.94, preview: "HttpOnly, SameSite=Lax, and Secure flags on matrix_session cookie", document_id: "doc_cookie_sec" },
+  { id: "doc-auth-5", label: "Doc: Customer Portal Integration", type: "document", x: 29, y: 38, z: 11, cluster_id: "cluster-auth", cluster_name: "Authentication & Billing", score: 0.89, preview: "Directing users to self-serve Stripe Billing Customer Portal for plan management", document_id: "doc_stripe_portal" },
+
+  // Cluster Auth - Queries (Blue)
+  { id: "q-auth-1", label: "User: Webhook signature verification failed", type: "query", x: 32, y: 37, z: 17, cluster_id: "cluster-auth", cluster_name: "Authentication & Billing", score: 0.93, preview: "Error verifying stripe signature header in production next.js endpoint", trace_id: "tr_auth_441" },
+  { id: "q-auth-2", label: "User: Refresh token expired after 7 days", type: "query", x: 26, y: 31, z: 13, cluster_id: "cluster-auth", cluster_name: "Authentication & Billing", score: 0.88, preview: "User is forced to log in again because refresh token TTL expired", trace_id: "tr_auth_442" },
+  { id: "q-auth-3", label: "User: Google OAuth redirect mismatch URI", type: "query", x: 25, y: 35, z: 15, cluster_id: "cluster-auth", cluster_name: "Authentication & Billing", score: 0.87, preview: "redirect_uri_mismatch on staging environment callback url", trace_id: "tr_auth_443" },
+  { id: "q-auth-4", label: "User: Cancel subscription prorated refund", type: "query", x: 30, y: 39, z: 12, cluster_id: "cluster-auth", cluster_name: "Authentication & Billing", score: 0.84, preview: "How does invoice proration calculate when downgrading tier mid-month?", trace_id: "tr_auth_444" },
+  { id: "q-auth-5", label: "User: Session cookie not sent on cross-domain", type: "query", x: 28, y: 30, z: 16, cluster_id: "cluster-auth", cluster_name: "Authentication & Billing", score: 0.92, preview: "CORS preflight request does not include matrix_session cookie", trace_id: "tr_auth_445" },
+
+  // Cluster Auth - Gap (Red/Amber)
+  { id: "gap-pt-auth-1", label: "Gap: SAML 2.0 SCIM Provisioning", type: "gap", x: 38, y: 44, z: 24, cluster_id: "cluster-auth", cluster_name: "Authentication & Billing", score: 0.42, preview: "Zero docs found for Okta SCIM v2 user synchronization endpoint", trace_id: "tr_gap_saml" },
+  { id: "gap-pt-auth-2", label: "Gap: Multi-currency tax ID validation", type: "gap", x: 36, y: 42, z: 20, cluster_id: "cluster-auth", cluster_name: "Authentication & Billing", score: 0.48, preview: "No coverage for Brazilian CNPJ / EU VAT automated tax calculation", trace_id: "tr_gap_tax" },
+
+  // Cluster Agent - Documents (Green)
+  { id: "doc-agent-1", label: "Doc: OpenAI Function Calling Spec", type: "document", x: -33, y: 24, z: -16, cluster_id: "cluster-agent", cluster_name: "Agent Tool Calling & Execution", score: 0.97, preview: "JSON schema parameter definitions, required fields, and enum values", document_id: "doc_agent_fcall" },
+  { id: "doc-agent-2", label: "Doc: Tool Timeout & Retry Backoff", type: "document", x: -30, y: 21, z: -19, cluster_id: "cluster-agent", cluster_name: "Agent Tool Calling & Execution", score: 0.95, preview: "Exponential backoff with jitter on tool HTTP 504 and transient network errors", document_id: "doc_agent_retry" },
+  { id: "doc-agent-3", label: "Doc: Dynamic Tool Dispatch Registry", type: "document", x: -35, y: 26, z: -14, cluster_id: "cluster-agent", cluster_name: "Agent Tool Calling & Execution", score: 0.92, preview: "Registering server-side actions and validating client input args", document_id: "doc_agent_registry" },
+  { id: "doc-agent-4", label: "Doc: Parallel Tool Execution", type: "document", x: -31, y: 19, z: -20, cluster_id: "cluster-agent", cluster_name: "Agent Tool Calling & Execution", score: 0.94, preview: "Invoking independent tools concurrently via Promise.allSettled", document_id: "doc_agent_parallel" },
+
+  // Cluster Agent - Queries (Blue)
+  { id: "q-agent-1", label: "User: Tool arguments JSON parse error", type: "query", x: -34, y: 23, z: -17, cluster_id: "cluster-agent", cluster_name: "Agent Tool Calling & Execution", score: 0.89, preview: "LLM truncated JSON argument string before closing curly brace", trace_id: "tr_agent_501" },
+  { id: "q-agent-2", label: "User: Tool invocation exceeded 30s timeout", type: "query", x: -29, y: 20, z: -18, cluster_id: "cluster-agent", cluster_name: "Agent Tool Calling & Execution", score: 0.86, preview: "Database query tool timed out waiting for analytical pool connection", trace_id: "tr_agent_502" },
+  { id: "q-agent-3", label: "User: How to pass authorization header to tools", type: "query", x: -36, y: 25, z: -13, cluster_id: "cluster-agent", cluster_name: "Agent Tool Calling & Execution", score: 0.91, preview: "Forwarding user session token into subagent tool fetch context", trace_id: "tr_agent_503" },
+  { id: "q-agent-4", label: "User: Retry policy on rate limited API", type: "query", x: -32, y: 18, z: -21, cluster_id: "cluster-agent", cluster_name: "Agent Tool Calling & Execution", score: 0.88, preview: "Handling 429 Too Many Requests response with retry-after header", trace_id: "tr_agent_504" },
+
+  // Cluster Agent - Gap (Red/Amber)
+  { id: "gap-pt-agent-1", label: "Gap: Streaming Partial JSON Tool Calls", type: "gap", x: -44, y: 32, z: -26, cluster_id: "cluster-agent", cluster_name: "Agent Tool Calling & Execution", score: 0.44, preview: "High query volume asking for partial token JSON parsers during streaming", trace_id: "tr_gap_stream" },
+  { id: "gap-pt-agent-2", label: "Gap: Multi-agent Tool Handoff Protocol", type: "gap", x: -42, y: 30, z: -24, cluster_id: "cluster-agent", cluster_name: "Agent Tool Calling & Execution", score: 0.49, preview: "No documentation for structured handoff between supervisor and specialist agents", trace_id: "tr_gap_handoff" },
+
+  // Cluster RAG - Documents (Green)
+  { id: "doc-rag-1", label: "Doc: Hybrid Dense + BM25 Search", type: "document", x: 19, y: -33, z: 11, cluster_id: "cluster-rag", cluster_name: "RAG & Knowledge Retrieval", score: 0.95, preview: "Reciprocal Rank Fusion (RRF) combining dense vector embeddings and sparse lexical tokens", document_id: "doc_rag_hybrid" },
+  { id: "doc-rag-2", label: "Doc: Sentence Window Chunking", type: "document", x: 16, y: -36, z: 14, cluster_id: "cluster-rag", cluster_name: "RAG & Knowledge Retrieval", score: 0.92, preview: "Chunking documents by sentence with dynamic surrounding context expansion", document_id: "doc_rag_chunking" },
+  { id: "doc-rag-3", label: "Doc: Cohere Reranker Integration", type: "document", x: 21, y: -32, z: 9, cluster_id: "cluster-rag", cluster_name: "RAG & Knowledge Retrieval", score: 0.97, preview: "Cross-encoder scoring top 50 retrieved chunks down to top 5 candidates", document_id: "doc_rag_rerank" },
+  { id: "doc-rag-4", label: "Doc: pgvector HNSW Index Tuning", type: "document", x: 17, y: -38, z: 15, cluster_id: "cluster-rag", cluster_name: "RAG & Knowledge Retrieval", score: 0.93, preview: "Setting m=16, ef_construction=64 and ef_search=40 for optimal recall vs latency", document_id: "doc_rag_hnsw" },
+
+  // Cluster RAG - Queries (Blue)
+  { id: "q-rag-1", label: "User: Vector search returning irrelevant chunks", type: "query", x: 18, y: -31, z: 13, cluster_id: "cluster-rag", cluster_name: "RAG & Knowledge Retrieval", score: 0.77, preview: "Cos similarity 0.68 retrieved snippet that does not answer specific user question", trace_id: "tr_rag_601" },
+  { id: "q-rag-2", label: "User: Reranker latency spiking over 400ms", type: "query", x: 22, y: -35, z: 8, cluster_id: "cluster-rag", cluster_name: "RAG & Knowledge Retrieval", score: 0.82, preview: "Cross-encoder p95 latency causes timeout on client chat completion stream", trace_id: "tr_rag_602" },
+  { id: "q-rag-3", label: "User: Chunk overlap size recommendation", type: "query", x: 15, y: -35, z: 12, cluster_id: "cluster-rag", cluster_name: "RAG & Knowledge Retrieval", score: 0.85, preview: "What overlap ratio is optimal for markdown code blocks vs plain text prose?", trace_id: "tr_rag_603" },
+  { id: "q-rag-4", label: "User: HNSW index build out of memory", type: "query", x: 20, y: -40, z: 16, cluster_id: "cluster-rag", cluster_name: "RAG & Knowledge Retrieval", score: 0.79, preview: "Postgres OOM when building HNSW index on 2M 1536-dim embeddings", trace_id: "tr_rag_604" },
+
+  // Cluster RAG - Gap (Red/Amber)
+  { id: "gap-pt-rag-1", label: "Gap: Multi-Tenant Vector Namespace Isolation", type: "gap", x: 29, y: -46, z: 22, cluster_id: "cluster-rag", cluster_name: "RAG & Knowledge Retrieval", score: 0.38, preview: "No guidance on Row-Level Security vs schema-per-tenant for pgvector", trace_id: "tr_gap_tenant" },
+  { id: "gap-pt-rag-2", label: "Gap: GraphRAG Entity Disambiguation", type: "gap", x: 26, y: -48, z: 20, cluster_id: "cluster-rag", cluster_name: "RAG & Knowledge Retrieval", score: 0.41, preview: "Users querying relationship hops between knowledge graph nodes without doc coverage", trace_id: "tr_gap_graph" },
+
+  // Cluster Safety - Documents (Green)
+  { id: "doc-safe-1", label: "Doc: OWASP LLM 01 Prompt Injection Defenses", type: "document", x: -25, y: -27, z: -22, cluster_id: "cluster-safety", cluster_name: "Guardrails & Evals", score: 0.94, preview: "Delimiter separation, XML tag isolation, and untrusted input tagging rules", document_id: "doc_safe_owasp" },
+  { id: "doc-safe-2", label: "Doc: Regex PII Redaction & Masking", type: "document", x: -28, y: -29, z: -25, cluster_id: "cluster-safety", cluster_name: "Guardrails & Evals", score: 0.96, preview: "Redacting credit cards, social security numbers, and API tokens before logging", document_id: "doc_safe_pii" },
+  { id: "doc-safe-3", label: "Doc: Toxic Content Threshold Tuning", type: "document", x: -24, y: -24, z: -21, cluster_id: "cluster-safety", cluster_name: "Guardrails & Evals", score: 0.90, preview: "Calibrating toxicity classification threshold to balance precision and false positives", document_id: "doc_safe_toxic" },
+
+  // Cluster Safety - Queries (Blue)
+  { id: "q-safe-1", label: "User: System prompt leaked via translation jailbreak", type: "query", x: -26, y: -30, z: -26, cluster_id: "cluster-safety", cluster_name: "Guardrails & Evals", score: 0.65, preview: "Adversarial query asking to translate hidden instructions into French", trace_id: "tr_safe_701" },
+  { id: "q-safe-2", label: "User: False positive PII redacting customer UUIDs", type: "query", x: -29, y: -26, z: -23, cluster_id: "cluster-safety", cluster_name: "Guardrails & Evals", score: 0.74, preview: "UUID v4 format triggering overly eager credit card redaction rule", trace_id: "tr_safe_702" },
+  { id: "q-safe-3", label: "User: Jailbreak evasion using base64 payloads", type: "query", x: -23, y: -31, z: -27, cluster_id: "cluster-safety", cluster_name: "Guardrails & Evals", score: 0.58, preview: "Model decodes base64 instruction and ignores preceding safety system message", trace_id: "tr_safe_703" },
+
+  // Cluster Safety - Gap (Red/Amber)
+  { id: "gap-pt-safe-1", label: "Gap: Multilingual Adversarial Jailbreak Defenses", type: "gap", x: -35, y: -38, z: -32, cluster_id: "cluster-safety", cluster_name: "Guardrails & Evals", score: 0.35, preview: "Significant cluster of Portuguese/Spanish adversarial jailbreaks undetected by english guardrail", trace_id: "tr_gap_jailbreak" },
+  { id: "gap-pt-safe-2", label: "Gap: Indirect Prompt Injection via RAG Webpages", type: "gap", x: -33, y: -36, z: -30, cluster_id: "cluster-safety", cluster_name: "Guardrails & Evals", score: 0.40, preview: "Untrusted web scraped content instructing LLM to exfiltrate session data", trace_id: "tr_gap_indirect" },
+];
+
+export const MOCK_DRIFT_METRICS: DriftMetrics = {
+  jensen_shannon: {
+    name: "Jensen-Shannon Divergence",
+    value: 0.142,
+    threshold_warning: 0.1,
+    threshold_critical: 0.2,
+    status: "warning",
+    description: "Mede a dissimilaridade simétrica entre a distribuição de embeddings da baseline e da produção recente.",
+  },
+  psi: {
+    name: "Population Stability Index (PSI)",
+    value: 0.185,
+    threshold_warning: 0.1,
+    threshold_critical: 0.25,
+    status: "warning",
+    description: "Deslocamento de densidade populacional entre os clusters de queries nas últimas 24h vs baseline histórica.",
+  },
+  centroid_cosine: {
+    name: "Centroid Cosine Drift",
+    value: 0.088,
+    threshold_warning: 0.08,
+    threshold_critical: 0.15,
+    status: "warning",
+    description: "Distância cosseno (1 - cos_sim) entre o centróide da base documental e o centróide das queries recebidas.",
+  },
+  wasserstein: {
+    name: "Wasserstein Distance (EMD)",
+    value: 0.076,
+    threshold_warning: 0.07,
+    threshold_critical: 0.14,
+    status: "warning",
+    description: "Earth Mover's Distance calculada sobre as projeções latentes de queries.",
+  },
+  overall_status: "warning",
+  baseline_period: "2026-11-01 a 2026-11-07",
+  target_period: "2026-11-08 a 2026-11-10 (últimas 48h)",
+  last_calculated: "2026-11-10T13:30:00Z",
+  total_queries_analyzed: 4280,
+};
+
+export const MOCK_DRIFT_RESPONSE: VectorDriftResponse = {
+  metrics: MOCK_DRIFT_METRICS,
+  status: "warning",
+  clusters_drifting: 2,
+  top_drifting_clusters: [
+    { cluster_id: "cluster-safety", cluster_name: "Guardrails & Safety Evals", drift_score: 0.218, status: "critical" },
+    { cluster_id: "cluster-rag", cluster_name: "RAG & Knowledge Retrieval", drift_score: 0.144, status: "warning" },
+    { cluster_id: "cluster-auth", cluster_name: "Authentication & Billing", drift_score: 0.062, status: "healthy" },
+    { cluster_id: "cluster-agent", cluster_name: "Agent Tool Calling & Execution", drift_score: 0.048, status: "healthy" },
+  ],
+  timeline: [
+    { timestamp: "2026-11-04T00:00:00Z", jensen_shannon: 0.042, psi: 0.055, centroid_cosine: 0.031 },
+    { timestamp: "2026-11-05T00:00:00Z", jensen_shannon: 0.048, psi: 0.061, centroid_cosine: 0.034 },
+    { timestamp: "2026-11-06T00:00:00Z", jensen_shannon: 0.065, psi: 0.082, centroid_cosine: 0.045 },
+    { timestamp: "2026-11-07T00:00:00Z", jensen_shannon: 0.078, psi: 0.095, centroid_cosine: 0.052 },
+    { timestamp: "2026-11-08T00:00:00Z", jensen_shannon: 0.105, psi: 0.124, centroid_cosine: 0.068 },
+    { timestamp: "2026-11-09T00:00:00Z", jensen_shannon: 0.128, psi: 0.162, centroid_cosine: 0.079 },
+    { timestamp: "2026-11-10T13:30:00Z", jensen_shannon: 0.142, psi: 0.185, centroid_cosine: 0.088 },
+  ],
+};
+
+export function mockVectorProjection(params?: Record<string, string | number | undefined>): VectorProjectionResponse {
+  let points = [...MOCK_VECTOR_POINTS];
+  if (params?.cluster && params.cluster !== "all") {
+    points = points.filter((p) => p.cluster_id === params.cluster);
+  }
+  if (params?.type && params.type !== "all") {
+    points = points.filter((p) => p.type === params.type);
+  }
+
+  const dimensions = params?.dimensions === "3" || params?.dimensions === 3 ? 3 : 2;
+
+  return {
+    points,
+    clusters: MOCK_VECTOR_CLUSTERS,
+    gaps: MOCK_KNOWLEDGE_GAPS,
+    dimensions,
+    total_points: points.length,
+    reduction_method: "umap",
+  };
+}
+
+export function mockVectorDrift(_params?: Record<string, string | number | undefined>): VectorDriftResponse {
+  return MOCK_DRIFT_RESPONSE;
 }

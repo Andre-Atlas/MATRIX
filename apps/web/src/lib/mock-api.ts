@@ -1,6 +1,6 @@
 // In-memory implementation of the API, used only when MATRIX_MOCK=1.
 import { ApiError } from "./api-error";
-import { mockDb } from "./mock-data";
+import { mockDb, mockVectorDrift, mockVectorProjection } from "./mock-data";
 import { evalExportJsonl, evalGet, evalSend } from "./mock-evals";
 import { dpoExportJsonl, opsGet, opsSend } from "./mock-ops";
 import type { ListResponse, OverviewStats, Score, SessionDetail, TraceDetail, TraceSummary } from "./types";
@@ -110,6 +110,14 @@ export async function mockGet<T>(path: string, params: Params = {}): Promise<T> 
     const { items, next_cursor } = page(traces, params);
     const detail: SessionDetail = { session: s, traces: items, next_cursor };
     return detail as T;
+  }
+
+  if (p === "/api/v1/vectors/projection") {
+    return mockVectorProjection(params) as T;
+  }
+
+  if (p === "/api/v1/vectors/drift") {
+    return mockVectorDrift(params) as T;
   }
 
   const evalResult = evalGet(p);
