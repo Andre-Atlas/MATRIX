@@ -1,4 +1,5 @@
 import type { NextRequest } from "next/server";
+import { cleanBaseUrl } from "@/lib/api";
 
 async function forward(req: NextRequest, ctx: { params: Promise<{ path: string[] }> }) {
   const { path } = await ctx.params;
@@ -18,13 +19,13 @@ async function forward(req: NextRequest, ctx: { params: Promise<{ path: string[]
   }
 
   // Development/screenshot fixtures; the module is only loaded when the flag is set.
-  if (process.env.MATRIX_MOCK === "1") {
+  if (process.env.MATRIX_MOCK === "1" || process.env.NEXT_PUBLIC_MATRIX_MOCK === "1") {
     const { mockFetch } = await import("@/lib/mock-api");
     const params = Object.fromEntries(req.nextUrl.searchParams);
     return mockFetch(req.method, apiPath, params, hasBody ? await req.text() : null);
   }
 
-  const base = process.env.MATRIX_API_URL ?? "http://localhost:8000";
+  const base = cleanBaseUrl();
   const url = new URL(`${base}${apiPath}`);
   url.search = req.nextUrl.search;
   const headers: Record<string, string> = {};
@@ -45,23 +46,42 @@ async function forward(req: NextRequest, ctx: { params: Promise<{ path: string[]
 
   const bodyText = hasBody ? await req.text() : undefined;
 
-  let res = await fetch(url, {
-    method: req.method,
-    headers,
-    body: bodyText,
-    cache: "no-store",
-  });
-
-  if (res.status === 401 && cookie && key) {
+  let res: Response;
+  try {
     res = await fetch(url, {
       method: req.method,
-      headers: {
-        ...headers,
-        authorization: `Bearer ${key}`,
-      },
+      headers,
       body: bodyText,
       cache: "no-store",
     });
+  } catch (err) {
+    if (process.env.MATRIX_FALLBACK_TO_MOCK === "1") {
+      const { mockFetch } = await import("@/lib/mock-api");
+      const params = Object.fromEntries(req.nextUrl.searchParams);
+      return mockFetch(req.method, apiPath, params, bodyText ?? null);
+    }
+    return new Response(
+      JSON.stringify({
+        detail: `Failed to connect to MATRIX backend at ${url.origin}: ${(err as Error).message}. Check MATRIX_API_URL or run with MATRIX_MOCK=1`,
+      }),
+      { status: 502, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  if (res.status === 401 && cookie && key) {
+    try {
+      res = await fetch(url, {
+        method: req.method,
+        headers: {
+          ...headers,
+          authorization: `Bearer ${key}`,
+        },
+        body: bodyText,
+        cache: "no-store",
+      });
+    } catch {
+      // keep original 401 response if retry fails
+    }
   }
 
   const respHeaders = new Headers();

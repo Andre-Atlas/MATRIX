@@ -3,7 +3,24 @@ import { ApiError } from "./api-error";
 
 export { ApiError, isNotFound } from "./api-error";
 
-const base = () => process.env.MATRIX_API_URL ?? "http://localhost:8000";
+export function cleanBaseUrl(raw?: string): string {
+  let b = (raw ?? process.env.MATRIX_API_URL ?? "http://localhost:8000").trim();
+  b = b.replace(/\/+$/, "");
+  b = b.replace(/\/api\/v1$/, "").replace(/\/api$/, "");
+  return b;
+}
+
+export function buildApiUrl(path: string, params?: Record<string, string | number | undefined>): URL {
+  const b = cleanBaseUrl();
+  const cleanPath = path.startsWith("/") ? path : `/${path}`;
+  const url = new URL(`${b}${cleanPath}`);
+  for (const [k, v] of Object.entries(params ?? {})) {
+    if (v !== undefined && v !== "") url.searchParams.set(k, String(v));
+  }
+  return url;
+}
+
+const base = () => cleanBaseUrl();
 
 async function headers(json: boolean): Promise<Record<string, string>> {
   const h: Record<string, string> = {};
@@ -29,8 +46,17 @@ async function headers(json: boolean): Promise<Record<string, string>> {
   return h;
 }
 
-async function parse<T>(res: Response): Promise<T> {
-  if (!res.ok) throw new ApiError(res.status, await res.text());
+async function parse<T>(res: Response, reqUrl?: string): Promise<T> {
+  if (!res.ok) {
+    const body = await res.text();
+    let hint = "";
+    if (res.status === 404) {
+      hint = ` (endpoint not found on backend${reqUrl ? ` at ${reqUrl}` : ""}; check MATRIX_API_URL or run with MATRIX_MOCK=1)`;
+    } else if (res.status === 401) {
+      hint = ` (unauthorized; check MATRIX_API_KEY in .env.local)`;
+    }
+    throw new ApiError(res.status, `${body}${hint}`);
+  }
   return (await res.json()) as T;
 }
 
@@ -39,28 +65,45 @@ export async function apiGet<T>(
   params?: Record<string, string | number | undefined>,
 ): Promise<T> {
   // Development/screenshot fixtures; the module is only loaded when the flag is set.
-  if (process.env.MATRIX_MOCK === "1") {
+  if (process.env.MATRIX_MOCK === "1" || process.env.NEXT_PUBLIC_MATRIX_MOCK === "1") {
     const { mockGet } = await import("./mock-api");
     return mockGet<T>(path, params);
   }
-  const url = new URL(`${base()}${path}`);
-  for (const [k, v] of Object.entries(params ?? {})) {
-    if (v !== undefined && v !== "") url.searchParams.set(k, String(v));
+  const url = buildApiUrl(path, params);
+  try {
+    const res = await fetch(url, { headers: await headers(false), cache: "no-store" });
+    return await parse<T>(res, url.toString());
+  } catch (err) {
+    if (process.env.MATRIX_FALLBACK_TO_MOCK === "1") {
+      console.warn(`[MATRIX] Backend call to ${url} failed. Falling back to mock data (MATRIX_FALLBACK_TO_MOCK=1).`);
+      const { mockGet } = await import("./mock-api");
+      return mockGet<T>(path, params);
+    }
+    throw err;
   }
-  const res = await fetch(url, { headers: await headers(false), cache: "no-store" });
-  return parse<T>(res);
 }
 
 export async function apiSend<T>(method: string, path: string, body?: unknown): Promise<T> {
-  if (process.env.MATRIX_MOCK === "1") {
+  if (process.env.MATRIX_MOCK === "1" || process.env.NEXT_PUBLIC_MATRIX_MOCK === "1") {
     const { mockSend } = await import("./mock-api");
     return mockSend<T>(method, path, body);
   }
-  const res = await fetch(`${base()}${path}`, {
-    method,
-    headers: await headers(true),
-    body: body === undefined ? undefined : JSON.stringify(body),
-    cache: "no-store",
-  });
-  return parse<T>(res);
+  const url = buildApiUrl(path);
+  try {
+    const res = await fetch(url, {
+      method,
+      headers: await headers(true),
+      body: body === undefined ? undefined : JSON.stringify(body),
+      cache: "no-store",
+    });
+    return await parse<T>(res, url.toString());
+  } catch (err) {
+    if (process.env.MATRIX_FALLBACK_TO_MOCK === "1") {
+      console.warn(`[MATRIX] Backend call to ${url} failed. Falling back to mock data (MATRIX_FALLBACK_TO_MOCK=1).`);
+      const { mockSend } = await import("./mock-api");
+      return mockSend<T>(method, path, body);
+    }
+    throw err;
+  }
 }
+
