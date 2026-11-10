@@ -131,6 +131,13 @@ def _content_text(content: Any) -> str:
     return str(content)
 
 
+def _clean_no_proxy() -> None:
+    for var in ("NO_PROXY", "no_proxy"):
+        val = os.environ.get(var)
+        if val and "[::1]" in val:
+            os.environ[var] = ",".join(p.strip() for p in val.split(",") if p.strip() != "[::1]")
+
+
 class _HTTPBase:
     provider_name = "http"
 
@@ -151,6 +158,7 @@ class _HTTPBase:
         self._sleep = sleep
 
     def _post(self, url: str, headers: dict, payload: dict, key: str | None) -> dict:
+        _clean_no_proxy()
         attempt = 0
         while True:
             try:

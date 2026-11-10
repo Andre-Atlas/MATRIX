@@ -34,6 +34,13 @@ def _seg(value: Any) -> str:
     return quote(str(value), safe="")
 
 
+def _clean_no_proxy() -> None:
+    for var in ("NO_PROXY", "no_proxy"):
+        val = os.environ.get(var)
+        if val and "[::1]" in val:
+            os.environ[var] = ",".join(p.strip() for p in val.split(",") if p.strip() != "[::1]")
+
+
 class MatrixClient:
     def __init__(
         self,
@@ -47,6 +54,7 @@ class MatrixClient:
         owns_provider: bool = True,
         span_processors: list[SpanProcessor] | None = None,
     ) -> None:
+        _clean_no_proxy()
         self.api_key = api_key
         self.endpoint = endpoint.rstrip("/")
         self.project_name = project_name
