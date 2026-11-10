@@ -1,8 +1,9 @@
 import Link from "next/link";
+import { Suspense } from "react";
 import { apiGet } from "@/lib/api";
 import { formatCost, formatDuration, formatTimestamp, formatTokens, truncate } from "@/lib/format";
 import { SPAN_KINDS, type ListResponse, type TraceSummary } from "@/lib/types";
-import { EmptyState, KindBadge, Mono, PageHeader, ScoreChips, StatusBadge, td, th } from "@/components/ui";
+import { EmptyState, KindBadge, Mono, PageHeader, ScoreChips, StatusBadge, TableSkeleton, td, th } from "@/components/ui";
 
 export const dynamic = "force-dynamic";
 
@@ -21,8 +22,7 @@ function qs(sp: SP, extra: Record<string, string | undefined> = {}): string {
 const input =
   "h-7 rounded border border-zinc-700 bg-zinc-900 px-2 text-zinc-100 placeholder:text-zinc-600 hover:border-zinc-600";
 
-export default async function TracesPage({ searchParams }: { searchParams: Promise<SP> }) {
-  const sp = await searchParams;
+async function TraceList({ sp }: { sp: SP }) {
   const data = await apiGet<ListResponse<TraceSummary>>("/api/v1/traces", {
     name: sp.name,
     status: sp.status,
@@ -34,55 +34,7 @@ export default async function TracesPage({ searchParams }: { searchParams: Promi
   const filtered = FILTER_KEYS.some((k) => sp[k]);
 
   return (
-    <div>
-      <PageHeader title="Traces" subtitle="Most recent first" />
-
-      <form method="get" role="search" aria-label="Filter traces" className="mb-3 flex flex-wrap items-end gap-2">
-        <label className="flex flex-col gap-1 text-[11px] uppercase tracking-wider text-zinc-500">
-          Name
-          <input name="name" defaultValue={sp.name} placeholder="support-agent" className={`${input} w-44`} />
-        </label>
-        <label className="flex flex-col gap-1 text-[11px] uppercase tracking-wider text-zinc-500">
-          Status
-          <select name="status" defaultValue={sp.status ?? ""} className={input}>
-            <option value="">any</option>
-            <option value="ok">ok</option>
-            <option value="error">error</option>
-          </select>
-        </label>
-        <label className="flex flex-col gap-1 text-[11px] uppercase tracking-wider text-zinc-500">
-          Root kind
-          <select name="kind" defaultValue={sp.kind ?? ""} className={input}>
-            <option value="">any</option>
-            {SPAN_KINDS.map((k) => (
-              <option key={k} value={k}>
-                {k}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="flex flex-col gap-1 text-[11px] uppercase tracking-wider text-zinc-500">
-          Session
-          <input
-            name="session_id"
-            defaultValue={sp.session_id}
-            placeholder="session id"
-            className={`${input} w-48 font-mono`}
-          />
-        </label>
-        <button
-          type="submit"
-          className="h-7 rounded border border-emerald-700/70 bg-emerald-900/40 px-3 text-emerald-200 hover:bg-emerald-900/70"
-        >
-          Apply
-        </button>
-        {filtered && (
-          <Link href="/traces" className="h-7 px-2 leading-7 text-zinc-400 hover:text-zinc-100">
-            Clear
-          </Link>
-        )}
-      </form>
-
+    <>
       {data.items.length === 0 ? (
         <EmptyState title={filtered ? "No traces match these filters" : "No traces yet"}>
           {filtered
@@ -180,6 +132,67 @@ export default async function TracesPage({ searchParams }: { searchParams: Promi
           </Link>
         )}
       </nav>
+    </>
+  );
+}
+
+export default async function TracesPage({ searchParams }: { searchParams: Promise<SP> }) {
+  const sp = await searchParams;
+  const filtered = FILTER_KEYS.some((k) => sp[k]);
+
+  return (
+    <div>
+      <PageHeader title="Traces" subtitle="Most recent first" />
+
+      <form method="get" role="search" aria-label="Filter traces" className="mb-3 flex flex-wrap items-end gap-2">
+        <label className="flex flex-col gap-1 text-[11px] uppercase tracking-wider text-zinc-500">
+          Name
+          <input name="name" defaultValue={sp.name} placeholder="support-agent" className={`${input} w-44`} />
+        </label>
+        <label className="flex flex-col gap-1 text-[11px] uppercase tracking-wider text-zinc-500">
+          Status
+          <select name="status" defaultValue={sp.status ?? ""} className={input}>
+            <option value="">any</option>
+            <option value="ok">ok</option>
+            <option value="error">error</option>
+          </select>
+        </label>
+        <label className="flex flex-col gap-1 text-[11px] uppercase tracking-wider text-zinc-500">
+          Root kind
+          <select name="kind" defaultValue={sp.kind ?? ""} className={input}>
+            <option value="">any</option>
+            {SPAN_KINDS.map((k) => (
+              <option key={k} value={k}>
+                {k}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="flex flex-col gap-1 text-[11px] uppercase tracking-wider text-zinc-500">
+          Session
+          <input
+            name="session_id"
+            defaultValue={sp.session_id}
+            placeholder="session id"
+            className={`${input} w-48 font-mono`}
+          />
+        </label>
+        <button
+          type="submit"
+          className="h-7 rounded border border-emerald-700/70 bg-emerald-900/40 px-3 text-emerald-200 hover:bg-emerald-900/70"
+        >
+          Apply
+        </button>
+        {filtered && (
+          <Link href="/traces" className="h-7 px-2 leading-7 text-zinc-400 hover:text-zinc-100">
+            Clear
+          </Link>
+        )}
+      </form>
+
+      <Suspense key={qs(sp, { cursor: sp.cursor })} fallback={<TableSkeleton />}>
+        <TraceList sp={sp} />
+      </Suspense>
     </div>
   );
 }

@@ -3,6 +3,7 @@
 import { useRouter } from "next/navigation";
 import { useMemo, useState } from "react";
 import { proxy } from "@/lib/proxy-client";
+import { useCan } from "@/components/auth/role-context";
 import type { CreateDatasetItemRequest } from "@/lib/types";
 import { area, label, primaryBtn, secondaryBtn } from "./ui";
 
@@ -20,6 +21,7 @@ export function parseJsonObject(text: string): { value: Record<string, unknown> 
 
 export function AddItemForm({ datasetId }: { datasetId: string }) {
   const router = useRouter();
+  const canWrite = useCan("member");
   const [open, setOpen] = useState(false);
   const [input, setInput] = useState(TEMPLATE);
   const [expected, setExpected] = useState("");
@@ -56,6 +58,8 @@ export function AddItemForm({ datasetId }: { datasetId: string }) {
       setBusy(false);
     }
   }
+
+  if (!canWrite) return null;
 
   if (!open) {
     return (

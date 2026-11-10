@@ -1,18 +1,16 @@
 import Link from "next/link";
+import { Suspense } from "react";
 import { apiGet } from "@/lib/api";
 import { formatCost, formatDuration, formatTimestamp } from "@/lib/format";
 import type { ListResponse, SessionSummary } from "@/lib/types";
-import { EmptyState, Mono, PageHeader, td, th } from "@/components/ui";
+import { EmptyState, Mono, PageHeader, TableSkeleton, td, th } from "@/components/ui";
 
 export const dynamic = "force-dynamic";
 
-export default async function SessionsPage({ searchParams }: { searchParams: Promise<{ cursor?: string }> }) {
-  const sp = await searchParams;
-  const data = await apiGet<ListResponse<SessionSummary>>("/api/v1/sessions", { cursor: sp.cursor, limit: 50 });
-
+async function SessionList({ cursor }: { cursor?: string }) {
+  const data = await apiGet<ListResponse<SessionSummary>>("/api/v1/sessions", { cursor, limit: 50 });
   return (
-    <div className="max-w-6xl">
-      <PageHeader title="Sessions" subtitle="Multi-turn conversations grouped by session.id" />
+    <>
       {data.items.length === 0 ? (
         <EmptyState title="No sessions yet">
           Set the <code className="font-mono text-zinc-300">session.id</code> attribute on your root spans to group
@@ -79,6 +77,18 @@ export default async function SessionsPage({ searchParams }: { searchParams: Pro
           </Link>
         </nav>
       )}
+    </>
+  );
+}
+
+export default async function SessionsPage({ searchParams }: { searchParams: Promise<{ cursor?: string }> }) {
+  const sp = await searchParams;
+  return (
+    <div className="max-w-6xl">
+      <PageHeader title="Sessions" subtitle="Multi-turn conversations grouped by session.id" />
+      <Suspense key={sp.cursor ?? ""} fallback={<TableSkeleton />}>
+        <SessionList cursor={sp.cursor} />
+      </Suspense>
     </div>
   );
 }

@@ -11,8 +11,8 @@ export default function RouteError({ error, reset }: { error: Error & { digest?:
       <h2 className="font-medium text-red-300">Could not load this page</h2>
       <p className="mt-1 text-zinc-400">
         The MATRIX API did not answer as expected. Check that the API is running and that{" "}
-        <code className="font-mono text-zinc-300">MATRIX_API_URL</code> and{" "}
-        <code className="font-mono text-zinc-300">MATRIX_API_KEY</code> are set.
+        <code className="font-mono text-zinc-300">MATRIX_API_URL</code> is set. If you were just added to or removed
+        from this project, pick it again from the project menu.
       </p>
       {error.digest && <p className="mt-2 font-mono text-xs text-zinc-500">digest {error.digest}</p>}
       <button

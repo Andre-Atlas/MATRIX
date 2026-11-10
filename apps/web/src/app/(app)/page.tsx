@@ -1,37 +1,22 @@
+import { Suspense } from "react";
 import { apiGet } from "@/lib/api";
 import { formatCost, formatDuration, formatPercent, formatTokens } from "@/lib/format";
 import type { OverviewStats } from "@/lib/types";
-import { EmptyState, Kpi, Mono, PageHeader, Segmented, td, th } from "@/components/ui";
+import { EmptyState, Kpi, Mono, PageHeader, Segmented, Skeleton, td, th } from "@/components/ui";
 
 export const dynamic = "force-dynamic";
 
 const WINDOWS = { "1h": 3600_000, "24h": 86_400_000, "7d": 7 * 86_400_000 } as const;
 type Window = keyof typeof WINDOWS;
 
-export default async function Overview({ searchParams }: { searchParams: Promise<{ since?: string }> }) {
-  const sp = await searchParams;
-  const win: Window = sp.since && sp.since in WINDOWS ? (sp.since as Window) : "24h";
+async function OverviewBody({ win }: { win: Window }) {
   const since = new Date(Date.now() - WINDOWS[win]).toISOString();
   const stats = await apiGet<OverviewStats>("/api/v1/stats/overview", { since });
   const maxCost = Math.max(0, ...stats.by_model.map((m) => m.cost_usd));
   const errTone = stats.error_rate >= 0.05 ? "error" : stats.error_rate > 0 ? "warn" : "default";
 
   return (
-    <div className="max-w-6xl">
-      <PageHeader
-        title="Overview"
-        subtitle={`Last ${win}`}
-        actions={
-          <Segmented
-            label="Time window"
-            options={(Object.keys(WINDOWS) as Window[]).map((w) => ({
-              href: `/?since=${w}`,
-              label: w,
-              active: w === win,
-            }))}
-          />
-        }
-      />
+    <>
       <section aria-label="Key metrics" className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-6">
         <Kpi label="Traces" value={stats.trace_count.toLocaleString("en-US")} />
         <Kpi label="Error rate" value={formatPercent(stats.error_rate)} tone={errTone} />
@@ -97,6 +82,46 @@ export default async function Overview({ searchParams }: { searchParams: Promise
           </div>
         )}
       </section>
+    </>
+  );
+}
+
+function OverviewSkeleton() {
+  return (
+    <div role="status" aria-label="Loading overview">
+      <div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-6">
+        {Array.from({ length: 6 }, (_, i) => (
+          <Skeleton key={i} className="h-[74px]" />
+        ))}
+      </div>
+      <Skeleton className="mt-6 h-40 w-full" />
+      <span className="sr-only">Loading…</span>
+    </div>
+  );
+}
+
+export default async function Overview({ searchParams }: { searchParams: Promise<{ since?: string }> }) {
+  const sp = await searchParams;
+  const win: Window = sp.since && sp.since in WINDOWS ? (sp.since as Window) : "24h";
+  return (
+    <div className="max-w-6xl">
+      <PageHeader
+        title="Overview"
+        subtitle={`Last ${win}`}
+        actions={
+          <Segmented
+            label="Time window"
+            options={(Object.keys(WINDOWS) as Window[]).map((w) => ({
+              href: `/?since=${w}`,
+              label: w,
+              active: w === win,
+            }))}
+          />
+        }
+      />
+      <Suspense key={win} fallback={<OverviewSkeleton />}>
+        <OverviewBody win={win} />
+      </Suspense>
     </div>
   );
 }

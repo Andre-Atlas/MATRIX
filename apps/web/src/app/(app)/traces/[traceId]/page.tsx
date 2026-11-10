@@ -14,15 +14,15 @@ export const dynamic = "force-dynamic";
 
 type Tab = "waterfall" | "graph";
 
-export default async function TracePage({
-  params,
-  searchParams,
-}: {
-  params: Promise<{ traceId: string }>;
-  searchParams: Promise<{ span?: string; tab?: string }>;
-}) {
-  const { traceId } = await params;
-  const sp = await searchParams;
+type SP = { span?: string; tab?: string };
+
+/**
+ * The data-dependent part of the page. Deliberately NOT inside a <Suspense>: span and tab switches
+ * are searchParams navigations of this same page, and an un-keyed boundary freezes that transition
+ * (the URL never commits) while a keyed one flashes a skeleton on every click. Without a boundary
+ * the current view stays until the new one is ready (verified with 300 ms latency, e2e/g0.cjs).
+ */
+async function traceBody({ traceId, sp }: { traceId: string; sp: SP }) {
   let detail: TraceDetail;
   try {
     detail = await apiGet<TraceDetail>(`/api/v1/traces/${encodeURIComponent(traceId)}`);
@@ -46,13 +46,7 @@ export default async function TracePage({
   const errors = spans.filter((s) => s.status === "error").length;
 
   return (
-    <div>
-      <nav aria-label="Breadcrumb" className="mb-1 text-xs text-zinc-500">
-        <Link href="/traces" className="hover:text-zinc-200">
-          Traces
-        </Link>{" "}
-        / <Mono>{traceId.slice(0, 12)}…</Mono>
-      </nav>
+    <>
       <header className="mb-4 flex flex-wrap items-center gap-x-6 gap-y-2 border-b border-zinc-800 pb-3">
         <div className="flex min-w-0 items-center gap-2">
           <KindBadge kind={trace.root_kind} />
@@ -136,6 +130,28 @@ export default async function TracePage({
           </aside>
         </div>
       )}
+    </>
+  );
+}
+
+export default async function TracePage({
+  params,
+  searchParams,
+}: {
+  params: Promise<{ traceId: string }>;
+  searchParams: Promise<SP>;
+}) {
+  const { traceId } = await params;
+  const sp = await searchParams;
+  return (
+    <div>
+      <nav aria-label="Breadcrumb" className="mb-1 text-xs text-zinc-500">
+        <Link href="/traces" className="hover:text-zinc-200">
+          Traces
+        </Link>{" "}
+        / <Mono>{traceId.slice(0, 12)}…</Mono>
+      </nav>
+      {await traceBody({ traceId, sp })}
     </div>
   );
 }

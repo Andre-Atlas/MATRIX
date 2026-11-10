@@ -5,6 +5,7 @@ import { useState } from "react";
 import { buildOnlineEvalRequest, describeFilter, emptyOnlineEvalForm, type OnlineEvalForm } from "@/lib/annotation-form";
 import { formatPercent, formatTimestamp } from "@/lib/format";
 import { proxy } from "@/lib/proxy-client";
+import { useCan } from "@/components/auth/role-context";
 import { METRIC_TYPES, MODEL_PROVIDERS, SPAN_KINDS, type OnlineEval, type SpanKind } from "@/lib/types";
 import { Mono, td, th } from "@/components/ui";
 import { field, label, primaryBtn } from "@/components/evals/ui";
@@ -12,6 +13,7 @@ import { DeleteButton } from "./delete-button";
 
 export function OnlineEvalsSection({ evals }: { evals: OnlineEval[] }) {
   const router = useRouter();
+  const isAdmin = useCan("admin");
   const [form, setForm] = useState<OnlineEvalForm>(emptyOnlineEvalForm);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -72,7 +74,7 @@ export function OnlineEvalsSection({ evals }: { evals: OnlineEval[] }) {
                     <Mono className="text-xs text-zinc-400">{formatTimestamp(ev.created_at)}</Mono>
                   </td>
                   <td className={`${td} text-right`}>
-                    <DeleteButton path={`online-evals/${encodeURIComponent(ev.id)}`} what={`online eval ${ev.name}`} />
+                    <DeleteButton min="admin" path={`online-evals/${encodeURIComponent(ev.id)}`} what={`online eval ${ev.name}`} />
                   </td>
                 </tr>
               ))}
@@ -81,6 +83,7 @@ export function OnlineEvalsSection({ evals }: { evals: OnlineEval[] }) {
         </div>
       )}
 
+      {isAdmin ? (
       <form onSubmit={submit} aria-label="Create online eval" className="space-y-3 rounded-md border border-zinc-800 bg-zinc-900/30 p-3">
         <div className="flex flex-wrap items-end gap-2">
           <label className={label}>
@@ -148,6 +151,9 @@ export function OnlineEvalsSection({ evals }: { evals: OnlineEval[] }) {
           </p>
         )}
       </form>
+      ) : (
+        <p className="text-xs text-zinc-500">Creating and deleting these requires the admin role.</p>
+      )}
     </section>
   );
 }

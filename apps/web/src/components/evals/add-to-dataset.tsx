@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { proxy } from "@/lib/proxy-client";
+import { useCan } from "@/components/auth/role-context";
 import type { Dataset, DatasetItem, ListResponse } from "@/lib/types";
 import { field, primaryBtn, secondaryBtn } from "./ui";
 
@@ -22,6 +23,7 @@ export function AddToDataset({ traceId, spanId }: { traceId: string; spanId: str
   const root = useRef<HTMLDivElement>(null);
   const button = useRef<HTMLButtonElement>(null);
   const popId = useId();
+  const canWrite = useCan("member");
 
   const fetchDatasets = useCallback(async () => {
     setLoad({ state: "loading" });
@@ -94,6 +96,8 @@ export function AddToDataset({ traceId, spanId }: { traceId: string; spanId: str
       setBusy(false);
     }
   }
+
+  if (!canWrite) return null;
 
   return (
     <div ref={root} className="relative">

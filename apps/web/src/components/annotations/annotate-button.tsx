@@ -3,11 +3,13 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { proxy } from "@/lib/proxy-client";
+import { useCan } from "@/components/auth/role-context";
 import type { Annotation } from "@/lib/types";
 
 /** Opens (or reuses) a pending annotation for the trace and jumps to its review screen. */
 export function AnnotateButton({ traceId }: { traceId: string }) {
   const router = useRouter();
+  const canWrite = useCan("member");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -22,6 +24,8 @@ export function AnnotateButton({ traceId }: { traceId: string }) {
       setBusy(false);
     }
   }
+
+  if (!canWrite) return null;
 
   return (
     <span className="inline-flex items-center gap-2">
