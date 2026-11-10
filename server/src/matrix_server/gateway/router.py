@@ -73,12 +73,20 @@ class BaseProvider:
         self._latencies.append(latency_ms)
 
     def to_dict(self) -> dict[str, Any]:
+        if self.name == "openai":
+            models = ["gpt-4o", "gpt-4o-mini", "o3-mini"]
+        elif self.name == "anthropic":
+            models = ["claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022"]
+        else:
+            models = ["mock-gpt-4o", "mock-fast"]
         return {
             "name": self.name,
             "circuit_breaker": self.circuit_breaker.state,
             "failure_count": self.circuit_breaker.failure_count,
+            "failure_threshold": self.failure_threshold,
             "avg_latency_ms": self.avg_latency_ms,
             "total_requests": self._total_requests,
+            "models": models,
         }
 
     async def complete(
@@ -372,18 +380,29 @@ class GatewayRequestLog:
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
+            "request_id": self.id,
             "timestamp": self.timestamp,
             "project_id": self.project_id,
             "model": self.model,
             "provider": self.provider,
             "status": self.status,
+            "status_code": 503 if self.status == "ERROR" else 200,
             "latency_ms": round(self.latency_ms, 2),
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
             "tokens": {
                 "prompt_tokens": self.prompt_tokens,
                 "completion_tokens": self.completion_tokens,
                 "total_tokens": self.total_tokens,
+                "prompt": self.prompt_tokens,
+                "completion": self.completion_tokens,
+                "total": self.total_tokens,
             },
             "cost_usd": round(self.cost_usd, 6),
+            "saved_cost_usd": round(self.cost_usd, 6) if self.status == "CACHE_HIT" else 0.0,
+            "cache_hit": self.status == "CACHE_HIT",
+            "fallback_triggered": self.status == "FALLBACK",
         }
 
 
@@ -580,22 +599,86 @@ class GatewayRouter:
         """Returns aggregate gateway telemetry."""
         cache_stats = self.cache.stats()
         total_requests = len(self._logs)
+        sorted_latencies = sorted(self._latencies)
         avg_latency = (
-            round(sum(self._latencies) / len(self._latencies), 2)
-            if self._latencies
+            round(sum(sorted_latencies) / len(sorted_latencies), 2)
+            if sorted_latencies
             else 0.0
         )
+        p50_latency = (
+            round(sorted_latencies[int(len(sorted_latencies) * 0.50)], 2)
+            if sorted_latencies
+            else 0.0
+        )
+        p99_latency = (
+            round(sorted_latencies[min(len(sorted_latencies) - 1, int(len(sorted_latencies) * 0.99))], 2)
+            if sorted_latencies
+            else 0.0
+        )
+        total_cost = round(
+            sum(log.cost_usd for log in self._logs if log.status != "CACHE_HIT"),
+            6,
+        )
+        active_providers = len(self.providers)
+        healthy_providers = sum(
+            1 for p in self.providers.values() if p.circuit_breaker.state != "OPEN"
+        )
+        fallback_events = sum(1 for log in self._logs if log.status == "FALLBACK")
+
         return {
             "total_requests": total_requests,
+            "cache_hits": cache_stats["hits"],
             "cache_hit_rate": cache_stats["hit_rate"],
             "tokens_saved": cache_stats["tokens_saved"],
             "cost_saved_usd": cache_stats["cost_saved_usd"],
+            "saved_cost_usd": cache_stats["cost_saved_usd"],
+            "total_cost_usd": total_cost,
             "avg_latency_ms": avg_latency,
+            "latency_p50_ms": p50_latency,
+            "latency_p99_ms": p99_latency,
+            "active_providers": active_providers,
+            "healthy_providers": healthy_providers,
+            "fallback_events_24h": fallback_events,
         }
 
     def get_providers_status(self) -> list[dict[str, Any]]:
         """Returns health and performance status of all registered providers."""
         return [provider.to_dict() for provider in self.providers.values()]
+
+    def get_rules(self) -> list[dict[str, Any]]:
+        """Returns active gateway routing rules."""
+        return [
+            {
+                "id": "rule-tier-frontier",
+                "name": "Frontier Production Cascade",
+                "description": "Primary OpenAI GPT-4o routing with automatic Anthropic Claude 3.5 Sonnet failover and semantic caching.",
+                "match_pattern": "gpt-4*",
+                "primary_provider": "openai",
+                "primary_model": "gpt-4o",
+                "fallback_chain": ["anthropic/claude-3-5-sonnet-20241022", "mock/gpt-4o"],
+                "semantic_cache_enabled": self.cache.enable_semantic_cache,
+                "cache_similarity_threshold": 0.95,
+                "rate_limit_rpm": self.rate_limiter.default_rpm,
+                "retry_count": 2,
+                "timeout_ms": 30000,
+                "is_active": True,
+            },
+            {
+                "id": "rule-tier-claude",
+                "name": "Anthropic Direct & Failover",
+                "description": "Routes Claude model family requests to Anthropic with OpenAI GPT-4o cascading fallback.",
+                "match_pattern": "claude-*",
+                "primary_provider": "anthropic",
+                "primary_model": "claude-3-5-sonnet-20241022",
+                "fallback_chain": ["openai/gpt-4o", "mock/claude-fallback"],
+                "semantic_cache_enabled": self.cache.enable_semantic_cache,
+                "cache_similarity_threshold": 0.95,
+                "rate_limit_rpm": self.rate_limiter.default_rpm,
+                "retry_count": 2,
+                "timeout_ms": 30000,
+                "is_active": True,
+            },
+        ]
 
     def get_logs(self, limit: int = 50, project_id: str | None = None) -> list[dict[str, Any]]:
         """Returns the most recent request audit logs."""

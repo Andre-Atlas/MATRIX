@@ -93,7 +93,7 @@ export function RoutingRulesPanel({ rules }: RoutingRulesPanelProps) {
                       <span className="h-2 w-2 rounded-full bg-emerald-400" />
                       Primário (P0)
                     </span>
-                    <span className="uppercase text-[10px] rounded bg-emerald-900/60 px-1.5 py-0.2">
+                    <span className="uppercase text-[10px] rounded bg-emerald-900/60 px-1.5 py-0.5">
                       {rule.primary_provider}
                     </span>
                   </div>
@@ -126,7 +126,7 @@ export function RoutingRulesPanel({ rules }: RoutingRulesPanelProps) {
                     <div className="flex-1 rounded-lg border border-amber-800/50 bg-amber-950/20 p-3">
                       <div className="flex items-center justify-between text-[11px] font-semibold text-amber-300">
                         <span>Fallback {idx + 1} (P{fallback.priority})</span>
-                        <span className="uppercase text-[10px] rounded bg-amber-900/60 px-1.5 py-0.2">
+                        <span className="uppercase text-[10px] rounded bg-amber-900/60 px-1.5 py-0.5">
                           {fallback.provider}
                         </span>
                       </div>

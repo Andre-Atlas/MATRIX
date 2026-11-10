@@ -43,34 +43,73 @@ class ChatCompletionRequest(BaseModel):
 
 class GatewayStatsResponse(BaseModel):
     total_requests: int
+    cache_hits: int
     cache_hit_rate: float
     tokens_saved: int
     cost_saved_usd: float
+    saved_cost_usd: float
+    total_cost_usd: float
     avg_latency_ms: float
+    latency_p50_ms: float
+    latency_p99_ms: float
+    active_providers: int
+    healthy_providers: int
+    fallback_events_24h: int
 
 
 class ProviderStatusItem(BaseModel):
     name: str
     circuit_breaker: str
     failure_count: int
+    failure_threshold: int
     avg_latency_ms: float
     total_requests: int
+    models: list[str]
 
 
 class GatewayProvidersResponse(BaseModel):
     providers: list[ProviderStatusItem]
 
 
+class GatewayRoutingRuleItem(BaseModel):
+    id: str
+    name: str
+    description: str
+    match_pattern: str
+    primary_provider: str
+    primary_model: str
+    fallback_chain: list[str]
+    semantic_cache_enabled: bool
+    cache_similarity_threshold: float
+    rate_limit_rpm: int
+    retry_count: int
+    timeout_ms: int
+    is_active: bool
+
+
+class GatewayRulesResponse(BaseModel):
+    rules: list[GatewayRoutingRuleItem]
+    total: int
+
+
 class RequestLogItem(BaseModel):
     id: str
+    request_id: str
     timestamp: str
     project_id: str
     model: str
     provider: str
     status: str  # CACHE_HIT, DIRECT, FALLBACK
+    status_code: int
     latency_ms: float
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
     tokens: dict[str, int]
     cost_usd: float
+    saved_cost_usd: float
+    cache_hit: bool
+    fallback_triggered: bool
 
 
 class GatewayLogsResponse(BaseModel):
@@ -121,6 +160,16 @@ def get_gateway_providers(
     return {"providers": gateway.get_providers_status()}
 
 
+@router.get("/rules", response_model=GatewayRulesResponse)
+def get_gateway_rules(
+    ctx: ViewerAuth,
+    gateway: Annotated[GatewayRouter, Depends(get_gateway)],
+) -> dict[str, Any]:
+    """Returns active gateway routing and cascading fallback rules."""
+    rules = gateway.get_rules()
+    return {"rules": rules, "total": len(rules)}
+
+
 @router.get("/logs", response_model=GatewayLogsResponse)
 def get_gateway_logs(
     ctx: ViewerAuth,
@@ -130,3 +179,4 @@ def get_gateway_logs(
     """Returns recent routed request logs with latency, tokens, provider, and cache/fallback status."""
     logs = gateway.get_logs(limit=limit, project_id=ctx.project_id)
     return {"logs": logs, "total": len(logs)}
+

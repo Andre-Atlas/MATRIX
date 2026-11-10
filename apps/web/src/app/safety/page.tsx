@@ -2,6 +2,7 @@ import { PageHeader } from "@/components/ui";
 import { SafetyDashboard } from "@/components/safety/safety-dashboard";
 import { apiGet } from "@/lib/api";
 import { MOCK_FINDINGS } from "@/lib/mock-data";
+import { adaptSafetyData } from "@/lib/safety";
 import type {
   SafetyCategoriesResponse,
   SafetyScanReport,
@@ -16,19 +17,29 @@ export default async function SafetyPage() {
     apiGet<SafetyScansResponse>("/api/v1/safety/scans"),
   ]);
 
-  const firstScanId = scansData.scans[0]?.id;
-  let initialReport: SafetyScanReport | null = null;
+  const firstScan = scansData.scans?.[0];
+  const firstScanId = firstScan?.id ?? (firstScan as any)?.scan_id;
+  let rawReport: SafetyScanReport | null = null;
 
   if (firstScanId) {
     try {
-      initialReport = await apiGet<SafetyScanReport>(
+      rawReport = await apiGet<SafetyScanReport>(
         `/api/v1/safety/scans/${encodeURIComponent(firstScanId)}`,
       );
     } catch {
       // Fallback if detail fetch fails
-      initialReport = null;
+      rawReport = null;
     }
   }
+
+  const adapted = adaptSafetyData(
+    categoriesData.categories,
+    scansData.scans,
+    rawReport,
+  );
+
+  const allFindings =
+    adapted.findings.length > 0 ? adapted.findings : MOCK_FINDINGS;
 
   return (
     <div className="space-y-6">
@@ -37,10 +48,10 @@ export default async function SafetyPage() {
         subtitle="Auditorias defensivas contínuas contra injeção de prompts, vazamento de contexto, consumo excessivo e agência desregulada em LLMs."
       />
       <SafetyDashboard
-        categories={categoriesData.categories}
-        scans={scansData.scans}
-        initialReport={initialReport}
-        allFindings={MOCK_FINDINGS}
+        categories={adapted.categories}
+        scans={adapted.scans}
+        initialReport={adapted.initialReport}
+        allFindings={allFindings}
       />
     </div>
   );

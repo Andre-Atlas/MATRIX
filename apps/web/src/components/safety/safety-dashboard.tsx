@@ -1,7 +1,7 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { summarizeScan } from "@/lib/safety";
+import { useEffect, useMemo, useState } from "react";
+import { adaptSafetyFindings, adaptSafetyScan, summarizeScan } from "@/lib/safety";
 import type {
   SafetyCategory,
   SafetyFinding,
@@ -26,13 +26,58 @@ export function SafetyDashboard({
   initialReport,
   allFindings,
 }: SafetyDashboardProps) {
-  const [scans, setScans] = useState<SafetyScan[]>(initialScans);
+  const [scans, setScans] = useState<SafetyScan[]>(() =>
+    initialScans.map((s) => adaptSafetyScan(s)),
+  );
   const [selectedScanId, setSelectedScanId] = useState<string>(
-    initialReport?.scan?.id ?? (initialReport as any)?.scan_id ?? (initialReport as any)?.id ?? initialScans[0]?.id ?? "",
+    initialReport?.scan?.id ??
+      (initialReport as any)?.scan_id ??
+      (initialReport as any)?.id ??
+      initialScans[0]?.id ??
+      (initialScans[0] as any)?.scan_id ??
+      "",
   );
   const [findings, setFindings] = useState<SafetyFinding[]>(allFindings);
   const [selectedCategoryCode, setSelectedCategoryCode] = useState<string>("all");
   const [isModalOpen, setIsModalOpen] = useState(false);
+
+  // Fetch findings for selectedScanId if not yet loaded
+  useEffect(() => {
+    if (!selectedScanId) return;
+    const hasFindingsForScan = findings.some((f) => f.scan_id === selectedScanId);
+    if (hasFindingsForScan) return;
+
+    let cancelled = false;
+    fetch(`/api/proxy/safety/scans/${encodeURIComponent(selectedScanId)}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (cancelled || !data) return;
+        const rawFindings = Array.isArray(data.findings) ? data.findings : [];
+        if (rawFindings.length > 0) {
+          const adaptedFindings = adaptSafetyFindings(
+            rawFindings,
+            selectedScanId,
+            categories,
+            data.created_at ?? data.scan?.created_at,
+          );
+          setFindings((prev) => {
+            const existingIds = new Set(prev.map((f) => f.id));
+            const merged = [...prev];
+            for (const f of adaptedFindings) {
+              if (!existingIds.has(f.id)) merged.push(f);
+            }
+            return merged;
+          });
+        }
+      })
+      .catch(() => {
+        // Ignore fetch errors in offline/test environments
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedScanId, findings, categories]);
 
   // Find currently active scan
   const activeScan = useMemo(() => {
@@ -45,7 +90,20 @@ export function SafetyDashboard({
     return summarizeScan(activeScan, findings, categories);
   }, [activeScan, findings, categories]);
 
-  const handleScanCreated = (newScan: SafetyScan) => {
+  const handleScanCreated = (rawNewScan: SafetyScan) => {
+    const newScan = adaptSafetyScan(rawNewScan);
+    const rawFindings = Array.isArray((rawNewScan as any)?.findings)
+      ? (rawNewScan as any).findings
+      : [];
+    if (rawFindings.length > 0) {
+      const adaptedFindings = adaptSafetyFindings(
+        rawFindings,
+        newScan.id,
+        categories,
+        newScan.created_at,
+      );
+      setFindings((prev) => [...adaptedFindings, ...prev]);
+    }
     setScans((prev) => [newScan, ...prev]);
     setSelectedScanId(newScan.id);
   };

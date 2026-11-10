@@ -122,12 +122,12 @@ export function filterFindings(
 
     if (searchLower) {
       const match =
-        f.probe_name.toLowerCase().includes(searchLower) ||
-        f.category_name.toLowerCase().includes(searchLower) ||
-        f.attack_prompt.toLowerCase().includes(searchLower) ||
-        f.observed_output.toLowerCase().includes(searchLower) ||
-        f.recommended_guardrail.toLowerCase().includes(searchLower) ||
-        f.defense_analysis.toLowerCase().includes(searchLower);
+        (f.probe_name ?? "").toLowerCase().includes(searchLower) ||
+        (f.category_name ?? "").toLowerCase().includes(searchLower) ||
+        (f.attack_prompt ?? "").toLowerCase().includes(searchLower) ||
+        (f.observed_output ?? "").toLowerCase().includes(searchLower) ||
+        (f.recommended_guardrail ?? "").toLowerCase().includes(searchLower) ||
+        (f.defense_analysis ?? "").toLowerCase().includes(searchLower);
       if (!match) return false;
     }
 
@@ -143,7 +143,8 @@ export function summarizeScan(
   findings: SafetyFinding[],
   categories: SafetyCategory[],
 ): SafetyScanReport {
-  const scanFindings = findings.filter((f) => f.scan_id === scan.id);
+  const scanId = scan.id ?? (scan as any).scan_id;
+  const scanFindings = findings.filter((f) => f.scan_id === scanId || !f.scan_id);
 
   let critical = 0;
   let high = 0;
@@ -160,19 +161,27 @@ export function summarizeScan(
   }
 
   const categoryScores: SafetyCategoryScore[] = categories.map((cat) => {
+    const catCode = (cat.code ?? cat.id) as SafetyCategoryCode;
     const catFindings = scanFindings.filter(
-      (f) => f.category_id === cat.id || f.category_code === cat.code,
+      (f) =>
+        f.category_id === cat.id ||
+        f.category_code === catCode ||
+        f.category_id === catCode ||
+        f.category_code === cat.id,
     );
-    const catProbesTested = Math.max(1, catFindings.length);
+    const catProbesTested = catFindings.length > 0 ? catFindings.length : cat.probes_count || 1;
     const failedFindings = catFindings.filter((f) => f.status === "failed");
-    const passedCount = catProbesTested - failedFindings.length;
+    const passedCount =
+      catFindings.length > 0
+        ? catFindings.filter((f) => f.status !== "failed").length
+        : catProbesTested;
     const catCritical = failedFindings.filter((f) => f.severity === "critical").length;
     const passRate = Number((passedCount / catProbesTested).toFixed(2));
     const status = getComplianceStatus(passRate, catCritical);
 
     return {
       category_id: cat.id,
-      category_code: cat.code,
+      category_code: catCode,
       name: cat.name,
       probes_tested: catProbesTested,
       probes_passed: passedCount,
@@ -184,18 +193,25 @@ export function summarizeScan(
     };
   });
 
+  const probesPassed = scan.probes_passed ?? (scan as any).passed_count ?? 0;
+  const probesFailed = scan.probes_failed ?? (scan as any).failed_count ?? 0;
+  const totalProbes = scan.total_probes ?? probesPassed + probesFailed;
+  const safetyScore =
+    scan.safety_score ??
+    (scan as any).global_score ??
+    calculateSafetyScore(totalProbes, probesPassed, scanFindings);
+  const riskLevel = scan.risk_level ?? getRiskLevel(safetyScore);
+
   const complianceRate =
-    scan.total_probes > 0
-      ? Math.round((scan.probes_passed / scan.total_probes) * 100)
-      : 100;
+    totalProbes > 0 ? Math.round((probesPassed / totalProbes) * 100) : 100;
 
   const summary: SafetyScanSummary = {
-    total_probes: scan.total_probes,
-    passed: scan.probes_passed,
-    failed: scan.probes_failed,
+    total_probes: totalProbes,
+    passed: probesPassed,
+    failed: probesFailed,
     compliance_rate: complianceRate,
-    score: scan.safety_score,
-    risk_level: scan.risk_level,
+    score: safetyScore,
+    risk_level: riskLevel,
     critical_count: critical,
     high_count: high,
     medium_count: medium,
@@ -203,10 +219,136 @@ export function summarizeScan(
   };
 
   return {
-    scan,
+    scan: {
+      ...scan,
+      id: scanId,
+      total_probes: totalProbes,
+      probes_passed: probesPassed,
+      probes_failed: probesFailed,
+      safety_score: safetyScore,
+      risk_level: riskLevel,
+    },
     category_scores: categoryScores,
     findings: scanFindings,
     summary,
+  };
+}
+
+export function adaptSafetyCategories(rawCategories: any[] = []): SafetyCategory[] {
+  return rawCategories.map((cat: any) => ({
+    ...cat,
+    id: String(cat.id ?? cat.code ?? ""),
+    code: (cat.code ?? cat.id ?? "LLM01") as SafetyCategoryCode,
+    name: cat.name ?? String(cat.code ?? cat.id ?? "Category"),
+    short_description: cat.short_description ?? cat.description ?? "",
+    description: cat.description ?? cat.short_description ?? "",
+    probes_count: cat.probes_count ?? 4,
+    severity_default: (cat.severity_default ?? cat.default_severity ?? "medium") as SafetySeverity,
+  }));
+}
+
+export function adaptSafetyScan(s: any): SafetyScan {
+  const id = String(s?.id ?? s?.scan_id ?? "");
+  const probesPassed = s?.probes_passed ?? s?.passed_count ?? 0;
+  const probesFailed = s?.probes_failed ?? s?.failed_count ?? 0;
+  const totalProbes = s?.total_probes ?? probesPassed + probesFailed;
+  const safetyScore = s?.safety_score ?? s?.global_score ?? 100;
+  const riskLevel = s?.risk_level ?? getRiskLevel(safetyScore);
+
+  return {
+    ...s,
+    id,
+    name: s?.name || `Audit ${id.slice(0, 8)}`,
+    target_model: s?.target_model ?? "gpt-4o-mini",
+    status: s?.status ?? "completed",
+    safety_score: safetyScore,
+    probes_passed: probesPassed,
+    probes_failed: probesFailed,
+    total_probes: totalProbes,
+    risk_level: riskLevel,
+    categories_tested: s?.categories_tested ?? [],
+    findings_count: s?.findings_count ?? s?.failed_count ?? probesFailed,
+    created_at: s?.created_at ?? new Date().toISOString(),
+  };
+}
+
+export function adaptSafetyFindings(
+  rawFindings: any[] = [],
+  scanId: string,
+  categories: SafetyCategory[] = [],
+  defaultCreatedAt?: string,
+): SafetyFinding[] {
+  const catByIdOrCode = new Map<string, SafetyCategory>();
+  for (const c of categories) {
+    catByIdOrCode.set(c.id, c);
+    catByIdOrCode.set(c.code, c);
+  }
+
+  return rawFindings.map((f: any, idx: number) => {
+    const rawCatKey = String(f.category_code ?? f.category_id ?? "LLM01");
+    const cat = catByIdOrCode.get(rawCatKey) ?? catByIdOrCode.get(String(f.category_id ?? ""));
+    const catCode = (cat?.code ?? f.category_code ?? f.category_id ?? "LLM01") as SafetyCategoryCode;
+    const catId = cat?.id ?? f.category_id ?? catCode;
+    const catName = cat?.name ?? f.category_name ?? catCode;
+    const probeId = String(f.probe_id ?? `probe-${idx + 1}`);
+    const fScanId = String(f.scan_id ?? scanId ?? "");
+    const status = f.status ?? (f.passed ? "passed" : "failed");
+
+    return {
+      ...f,
+      id: String(f.id ?? `${fScanId}-${probeId}-${idx}`),
+      scan_id: fScanId,
+      category_id: catId,
+      category_code: catCode,
+      category_name: catName,
+      probe_id: probeId,
+      probe_name: f.probe_name ?? f.name ?? probeId,
+      severity: (f.severity ?? cat?.severity_default ?? "medium") as SafetySeverity,
+      status,
+      attack_prompt: f.attack_prompt ?? f.prompt ?? "Security audit probe",
+      observed_output: f.observed_output ?? f.raw_output_snippet ?? f.response ?? "",
+      defense_analysis: f.defense_analysis ?? f.details ?? f.analysis ?? "",
+      recommended_guardrail:
+        f.recommended_guardrail ?? f.mitigation ?? "Maintain input/output safety guardrails.",
+      created_at: f.created_at ?? defaultCreatedAt ?? new Date().toISOString(),
+    };
+  });
+}
+
+export function adaptSafetyData(
+  rawCategories: any[] = [],
+  rawScans: any[] = [],
+  rawReport: any = null,
+): {
+  categories: SafetyCategory[];
+  scans: SafetyScan[];
+  initialReport: SafetyScanReport | null;
+  findings: SafetyFinding[];
+} {
+  const categories = adaptSafetyCategories(rawCategories);
+  const scans = (rawScans || []).map((s: any) => adaptSafetyScan(s));
+
+  let initialReport: SafetyScanReport | null = null;
+  let findings: SafetyFinding[] = [];
+
+  if (rawReport) {
+    const rawScanObj = rawReport.scan ?? rawReport;
+    const adaptedScan = adaptSafetyScan(rawScanObj);
+    const rawFindingsList = Array.isArray(rawReport.findings) ? rawReport.findings : [];
+    findings = adaptSafetyFindings(
+      rawFindingsList,
+      adaptedScan.id,
+      categories,
+      adaptedScan.created_at,
+    );
+    initialReport = summarizeScan(adaptedScan, findings, categories);
+  }
+
+  return {
+    categories,
+    scans,
+    initialReport,
+    findings,
   };
 }
 

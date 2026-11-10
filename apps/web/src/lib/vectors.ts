@@ -184,32 +184,66 @@ export function adaptVectorsData(rawProj: any, rawDrift: any): { projection: any
     document_id: p.document_id || undefined,
   }));
 
-  const clusters = (rawProj?.clusters || []).map((c: any) => ({
-    id: String(c.id ?? c.cluster_id ?? 0),
-    name: c.name || c.label || `Cluster ${c.cluster_id ?? c.id ?? 0}`,
-    confidence_rate: c.confidence_rate ?? 0.88,
-    point_count: c.count ?? c.point_count ?? points.filter((p: any) => p.cluster_id === String(c.id ?? c.cluster_id)).length,
-    document_count: c.document_count ?? points.filter((p: any) => p.cluster_id === String(c.id ?? c.cluster_id) && p.type === "document").length,
-    query_count: c.query_count ?? points.filter((p: any) => p.cluster_id === String(c.id ?? c.cluster_id) && p.type === "query").length,
-    gap_count: c.gap_count ?? points.filter((p: any) => p.cluster_id === String(c.id ?? c.cluster_id) && p.type === "gap").length,
-    centroid: c.centroid || [0, 0, 0],
-    health_status: c.health_status || "healthy",
-    top_keywords: c.top_keywords || ["query", "document"],
-  }));
+  const clusters = (rawProj?.clusters || []).map((c: any) => {
+    const kws = c.keywords || c.top_keywords || ["query", "document"];
+    return {
+      id: String(c.id ?? c.cluster_id ?? 0),
+      name: c.name || c.label || `Cluster ${c.cluster_id ?? c.id ?? 0}`,
+      description: c.description,
+      confidence_rate: c.confidence_rate ?? 0.88,
+      point_count:
+        c.count ??
+        c.point_count ??
+        points.filter((p: any) => p.cluster_id === String(c.id ?? c.cluster_id)).length,
+      document_count:
+        c.document_count ??
+        points.filter((p: any) => p.cluster_id === String(c.id ?? c.cluster_id) && p.type === "document")
+          .length,
+      query_count:
+        c.query_count ??
+        points.filter((p: any) => p.cluster_id === String(c.id ?? c.cluster_id) && p.type === "query")
+          .length,
+      gap_count:
+        c.gap_count ??
+        points.filter((p: any) => p.cluster_id === String(c.id ?? c.cluster_id) && p.type === "gap")
+          .length,
+      centroid: c.centroid || [0, 0, 0],
+      health_status: c.health_status || "healthy",
+      keywords: kws,
+      top_keywords: kws,
+    };
+  });
 
-  const gaps = (rawProj?.gaps || []).length > 0
-    ? rawProj.gaps
-    : points.filter((p: any) => p.type === "gap").map((p: any, idx: number) => ({
-        id: `gap-${idx}`,
-        cluster_id: p.cluster_id,
-        cluster_name: p.cluster_name,
-        missing_topic: p.label || "Tópico sem cobertura documental",
-        query_text: p.preview || "Consulta de usuário com baixa proximidade aos documentos",
-        severity: "warning",
-        unanswered_query_count: 1,
-        recommended_action: "Indexar documentação adicional para este tópico",
-        created_at: new Date().toISOString(),
-      }));
+  const rawGaps =
+    (rawProj?.gaps || []).length > 0
+      ? rawProj.gaps
+      : points.filter((p: any) => p.type === "gap");
+
+  const gaps = rawGaps.map((p: any, idx: number) => {
+    const freq = p.frequency ?? p.unanswered_query_count ?? 1;
+    const action =
+      p.suggested_action ??
+      p.recommended_action ??
+      "Indexar documentação adicional para este tópico";
+    const detected = p.last_detected ?? p.created_at ?? new Date().toISOString();
+    return {
+      id: String(p.id ?? `gap-${idx}`),
+      cluster_id: String(p.cluster_id ?? 0),
+      cluster_name: p.cluster_name || `Cluster ${p.cluster_id ?? 0}`,
+      missing_topic: p.missing_topic || p.label || "Tópico sem cobertura documental",
+      query_text:
+        p.query_text ||
+        p.preview ||
+        "Consulta de usuário com baixa proximidade aos documentos",
+      severity: p.severity || "warning",
+      frequency: freq,
+      unanswered_query_count: freq,
+      suggested_action: action,
+      recommended_action: action,
+      last_detected: detected,
+      created_at: detected,
+    };
+  });
 
   const projAdapted = {
     points,
@@ -220,45 +254,118 @@ export function adaptVectorsData(rawProj: any, rawDrift: any): { projection: any
     reduction_method: rawProj?.reduction_method || "umap",
   };
 
-  const jsdVal = typeof rawDrift?.metrics?.jsd === "number" ? rawDrift.metrics.jsd : (rawDrift?.metrics?.jensen_shannon?.value ?? 0.05);
-  const psiVal = typeof rawDrift?.metrics?.psi === "number" ? rawDrift.metrics.psi : (rawDrift?.metrics?.psi?.value ?? 0.04);
-  const cosVal = typeof rawDrift?.metrics?.centroid_drift === "number" ? rawDrift.metrics.centroid_drift : (rawDrift?.metrics?.centroid_cosine?.value ?? 0.02);
+  const jsdVal =
+    typeof rawDrift?.metrics?.jsd === "number"
+      ? rawDrift.metrics.jsd
+      : (rawDrift?.metrics?.jensen_shannon?.value ?? 0.05);
+  const psiVal =
+    typeof rawDrift?.metrics?.psi === "number"
+      ? rawDrift.metrics.psi
+      : (rawDrift?.metrics?.psi?.value ?? 0.04);
+  const cosVal =
+    typeof rawDrift?.metrics?.centroid_drift === "number"
+      ? rawDrift.metrics.centroid_drift
+      : (rawDrift?.metrics?.centroid_cosine?.value ?? 0.02);
+  const wassVal =
+    typeof rawDrift?.metrics?.wasserstein === "number"
+      ? rawDrift.metrics.wasserstein
+      : (rawDrift?.metrics?.wasserstein?.value ?? 0.042);
 
-  const driftStatus = rawDrift?.status || (jsdVal >= 0.25 ? "critical" : jsdVal >= 0.1 ? "warning" : "healthy");
+  const driftStatus =
+    rawDrift?.status || (jsdVal >= 0.25 ? "critical" : jsdVal >= 0.1 ? "warning" : "healthy");
+
+  const computedTopDrifting =
+    Array.isArray(rawDrift?.top_drifting_clusters) && rawDrift.top_drifting_clusters.length > 0
+      ? rawDrift.top_drifting_clusters
+      : Array.isArray(rawDrift?.cluster_distribution) && rawDrift.cluster_distribution.length > 0
+        ? rawDrift.cluster_distribution.map((cd: any, i: number) => {
+            const score = Number(
+              (
+                cd.drift_score ??
+                Math.abs((cd.current_share ?? 0.2) - (cd.baseline_share ?? 0.2))
+              ).toFixed(3),
+            );
+            const st = score >= 0.2 ? "critical" : score >= 0.08 ? "warning" : "healthy";
+            return {
+              cluster_id: String(cd.cluster_id ?? cd.id ?? i),
+              cluster_name: cd.cluster_name ?? cd.label ?? `Cluster ${cd.cluster_id ?? i}`,
+              drift_score: score,
+              status: st,
+            };
+          })
+        : clusters.slice(0, 4).map((c: any, i: number) => {
+            const score = Number((jsdVal * (1 - i * 0.18)).toFixed(3));
+            const st =
+              c.health_status && c.health_status !== "healthy"
+                ? c.health_status
+                : score >= 0.2
+                  ? "critical"
+                  : score >= 0.08
+                    ? "warning"
+                    : "healthy";
+            return {
+              cluster_id: c.id,
+              cluster_name: c.name,
+              drift_score: score,
+              status: st,
+            };
+          });
+
+  const clustersDriftingCount =
+    rawDrift?.clusters_drifting ??
+    computedTopDrifting.filter((c: any) => c.status !== "healthy").length;
 
   const driftAdapted = {
     status: driftStatus,
-    clusters_drifting: rawDrift?.clusters_drifting ?? 0,
-    top_drifting_clusters: rawDrift?.top_drifting_clusters || [],
+    clusters_drifting: clustersDriftingCount,
+    top_drifting_clusters: computedTopDrifting,
     metrics: {
       overall_status: rawDrift?.metrics?.overall_status || driftStatus,
       baseline_period: rawDrift?.metrics?.baseline_period || "Last 7 days",
       target_period: rawDrift?.metrics?.target_period || "Current session",
       last_calculated: rawDrift?.metrics?.last_calculated || new Date().toISOString(),
-      total_queries_analyzed: rawDrift?.metrics?.total_queries_analyzed ?? points.filter((p: any) => p.type === "query").length,
+      total_queries_analyzed:
+        rawDrift?.metrics?.total_queries_analyzed ??
+        points.filter((p: any) => p.type === "query").length,
       jensen_shannon: {
+        name: rawDrift?.metrics?.jensen_shannon?.name || "Jensen-Shannon Divergence",
+        description:
+          rawDrift?.metrics?.jensen_shannon?.description ||
+          "Measures symmetric divergence between baseline and current query embedding distributions.",
         value: jsdVal,
-        threshold_warning: 0.1,
-        threshold_critical: 0.25,
+        threshold_warning: rawDrift?.metrics?.jensen_shannon?.threshold_warning ?? 0.1,
+        threshold_critical: rawDrift?.metrics?.jensen_shannon?.threshold_critical ?? 0.25,
         status: jsdVal >= 0.25 ? "critical" : jsdVal >= 0.1 ? "warning" : "healthy",
       },
       psi: {
+        name: rawDrift?.metrics?.psi?.name || "Population Stability Index (PSI)",
+        description:
+          rawDrift?.metrics?.psi?.description ||
+          "Quantifies population shift across semantic cluster buckets over time.",
         value: psiVal,
-        threshold_warning: 0.1,
-        threshold_critical: 0.25,
+        threshold_warning: rawDrift?.metrics?.psi?.threshold_warning ?? 0.1,
+        threshold_critical: rawDrift?.metrics?.psi?.threshold_critical ?? 0.25,
         status: psiVal >= 0.25 ? "critical" : psiVal >= 0.1 ? "warning" : "healthy",
       },
       centroid_cosine: {
+        name: rawDrift?.metrics?.centroid_cosine?.name || "Centroid Cosine Drift",
+        description:
+          rawDrift?.metrics?.centroid_cosine?.description ||
+          "Angular displacement (1 - cosine similarity) between query and document cluster centroids.",
         value: cosVal,
-        threshold_warning: 0.15,
-        threshold_critical: 0.3,
+        threshold_warning: rawDrift?.metrics?.centroid_cosine?.threshold_warning ?? 0.15,
+        threshold_critical: rawDrift?.metrics?.centroid_cosine?.threshold_critical ?? 0.3,
         status: cosVal >= 0.3 ? "critical" : cosVal >= 0.15 ? "warning" : "healthy",
       },
       wasserstein: {
-        value: 0.042,
-        threshold_warning: 0.2,
-        threshold_critical: 0.4,
-        status: "healthy",
+        name: rawDrift?.metrics?.wasserstein?.name || "Wasserstein Distance (EMD)",
+        description:
+          rawDrift?.metrics?.wasserstein?.description ||
+          "Earth Mover's Distance across latent vector activation dimensions.",
+        value: wassVal,
+        threshold_warning: rawDrift?.metrics?.wasserstein?.threshold_warning ?? 0.2,
+        threshold_critical: rawDrift?.metrics?.wasserstein?.threshold_critical ?? 0.4,
+        status: wassVal >= 0.4 ? "critical" : wassVal >= 0.2 ? "warning" : "healthy",
       },
     },
     timeline: (rawDrift?.history || rawDrift?.timeline || []).map((h: any) => ({

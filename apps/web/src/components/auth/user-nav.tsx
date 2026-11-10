@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import Link from "next/link";
 
 interface UserProfile {
@@ -14,12 +14,13 @@ interface UserProfile {
 
 export function UserNav() {
   const router = useRouter();
+  const pathname = usePathname();
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     let active = true;
-    fetch("/api/proxy/auth/me")
+    fetch("/api/proxy/auth/me", { cache: "no-store" })
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => {
         if (active) {
@@ -33,11 +34,13 @@ export function UserNav() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [pathname]);
 
-  function handleLogout() {
+  async function handleLogout() {
+    await fetch("/api/proxy/auth/logout", { method: "POST" }).catch(() => {});
     document.cookie = "matrix_session=; path=/; max-age=0";
     document.cookie = "matrix_project_id=; path=/; max-age=0";
+    setProfile(null);
     router.push("/login");
     router.refresh();
   }
@@ -51,9 +54,21 @@ export function UserNav() {
     return <div className="mt-auto px-2 py-3 text-[11px] text-zinc-600">Loading auth...</div>;
   }
 
+  const currentProj = profile?.current_project || profile?.project;
+
   if (!profile || (profile.is_api_key && !profile.user)) {
     return (
-      <div className="mt-auto border-t border-zinc-800/80 pt-3">
+      <div className="mt-auto space-y-2 border-t border-zinc-800/80 pt-3">
+        {profile?.is_api_key && (
+          <div className="rounded border border-zinc-800/60 bg-zinc-950/80 px-2 py-1.5 text-[11px] text-zinc-400">
+            <div className="flex items-center justify-between">
+              <span className="font-mono text-[10px] text-emerald-400">API Key</span>
+              <span className="truncate font-medium text-zinc-300">
+                {currentProj?.name || "default"}
+              </span>
+            </div>
+          </div>
+        )}
         <Link
           href="/login"
           className="flex items-center justify-center rounded border border-zinc-800 bg-zinc-950 px-2.5 py-1.5 text-xs font-medium text-zinc-300 hover:bg-zinc-800/80 hover:text-zinc-100"
@@ -65,7 +80,6 @@ export function UserNav() {
   }
 
   const user = profile.user;
-  const currentProj = profile.current_project || profile.project;
   const role = currentProj?.role ?? "viewer";
 
   const roleStyle =
@@ -88,7 +102,7 @@ export function UserNav() {
         <div className="mb-2 rounded border border-zinc-800/60 bg-zinc-950/80 p-1.5">
           <div className="mb-1 flex items-center justify-between text-[10px] text-zinc-400">
             <span>Project</span>
-            <span className={`rounded border px-1 py-0.2 font-mono uppercase text-[9px] ${roleStyle}`}>
+            <span className={`rounded border px-1 py-0.5 font-mono uppercase text-[9px] ${roleStyle}`}>
               {role}
             </span>
           </div>

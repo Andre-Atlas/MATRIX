@@ -187,6 +187,29 @@ export async function mockGet<T>(path: string, params: Params = {}): Promise<T> 
   }
 
 
+  if (p === "/api/v1/auth/me") {
+    return {
+      is_api_key: false,
+      user: {
+        id: "user-admin-01",
+        email: "admin@matrix.local",
+        name: "Matrix Admin",
+      },
+      current_project: {
+        id: "proj-default",
+        name: "default",
+        role: "admin",
+      },
+      projects: [
+        {
+          id: "proj-default",
+          name: "default",
+          role: "admin",
+        },
+      ],
+    } as T;
+  }
+
   const evalResult = evalGet(p);
   if (evalResult !== undefined) return evalResult as T;
 
@@ -199,6 +222,29 @@ export async function mockGet<T>(path: string, params: Params = {}): Promise<T> 
 export async function mockSend<T>(method: string, path: string, body?: unknown): Promise<T> {
   const m = method.toUpperCase();
   const p = path.replace(/\/+$/, "");
+
+  if (m === "POST" && (p === "/api/v1/auth/login" || p === "/api/v1/auth/register")) {
+    const reqBody = (body ?? {}) as { email?: string; name?: string };
+    return {
+      token: "mock-jwt-token",
+      user: {
+        id: "user-admin-01",
+        email: reqBody.email || "admin@matrix.local",
+        name: reqBody.name || "Matrix Admin",
+      },
+      projects: [
+        {
+          id: "proj-default",
+          name: "default",
+          role: "admin",
+        },
+      ],
+    } as T;
+  }
+
+  if (m === "POST" && p === "/api/v1/auth/logout") {
+    return { ok: true } as T;
+  }
 
   if (m === "POST" && p === "/api/v1/safety/scans") {
     return createMockSafetyScan(body as CreateSafetyScanRequest) as T;

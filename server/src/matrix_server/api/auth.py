@@ -136,6 +136,13 @@ def login(req: LoginRequest, request: Request, session: DbSession, response: Res
     }
 
 
+@router.post("/auth/logout")
+@router.post("/logout", include_in_schema=False)
+def logout(response: Response) -> dict[str, str]:
+    response.delete_cookie("matrix_session", path="/")
+    return {"status": "ok"}
+
+
 @router.get("/auth/me")
 def me(
     request: Request,
@@ -145,9 +152,12 @@ def me(
     if ctx.is_api_key or ctx.user_id is None:
         # API key context
         proj = session.get(Project, ctx.project_id)
+        proj_info = {"id": ctx.project_id, "name": proj.name if proj else "Unknown", "role": "admin"}
         return {
             "is_api_key": True,
-            "project": {"id": ctx.project_id, "name": proj.name if proj else "Unknown", "role": "admin"},
+            "project": proj_info,
+            "current_project": proj_info,
+            "projects": [proj_info],
         }
 
     user = session.get(User, ctx.user_id)

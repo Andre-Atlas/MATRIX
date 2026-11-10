@@ -158,13 +158,21 @@ export function GatewayLogsTable({ logs }: GatewayLogsTableProps) {
                 const srvModel = log.served_model ?? log.model ?? "gpt-4o";
                 const isRerouted = reqModel !== srvModel;
                 const isExpanded = expandedLogId === log.id;
+                const promptTokens =
+                  log.prompt_tokens ??
+                  log.tokens?.prompt ??
+                  (log.tokens as any)?.prompt_tokens ??
+                  0;
+                const completionTokens =
+                  log.completion_tokens ??
+                  log.tokens?.completion ??
+                  (log.tokens as any)?.completion_tokens ??
+                  0;
                 const totalTokens =
                   log.total_tokens ??
                   log.tokens?.total ??
-                  ((log.prompt_tokens ?? log.tokens?.prompt ?? 0) +
-                    (log.completion_tokens ?? log.tokens?.completion ?? 0));
-                const promptTokens = log.prompt_tokens ?? log.tokens?.prompt ?? 0;
-                const completionTokens = log.completion_tokens ?? log.tokens?.completion ?? 0;
+                  (log.tokens as any)?.total_tokens ??
+                  promptTokens + completionTokens;
                 const savedCost = log.saved_cost_usd ?? log.cost_saved_usd ?? 0;
                 const costUsd = log.cost_usd ?? 0;
                 const routeName = log.route_name ?? `${log.provider} Route`;
@@ -215,7 +223,7 @@ export function GatewayLogsTable({ logs }: GatewayLogsTableProps) {
                         </span>
                         {isRerouted && (
                           <span
-                            className="rounded bg-amber-950/80 border border-amber-800/60 px-1 py-0.2 text-[9px] text-amber-300"
+                            className="rounded bg-amber-950/80 border border-amber-800/60 px-1 py-0.5 text-[9px] text-amber-300"
                             title={`Solicitado originalmente: ${reqModel}`}
                           >
                             rerouted
@@ -294,10 +302,14 @@ export function GatewayLogsTable({ logs }: GatewayLogsTableProps) {
           {(() => {
             const item = logs.find((l) => l.id === expandedLogId);
             if (!item) return null;
+            const itemReqId = item.request_id ?? item.id;
+            const itemStatusCode = item.status_code ?? (item.status === "ERROR" ? 503 : 200);
+            const itemCacheHit = item.cache_hit ?? (item.status === "CACHE_HIT");
+            const itemFallbackTriggered = item.fallback_triggered ?? (item.status === "FALLBACK");
             return (
               <div className="space-y-1.5 font-mono">
                 <div className="flex items-center justify-between text-zinc-400 font-sans">
-                  <span className="font-semibold text-zinc-200">Detalhes da Requisição {item.request_id}</span>
+                  <span className="font-semibold text-zinc-200">Detalhes da Requisição {itemReqId}</span>
                   <button
                     type="button"
                     onClick={() => setExpandedLogId(null)}
@@ -319,9 +331,9 @@ export function GatewayLogsTable({ logs }: GatewayLogsTableProps) {
                 )}
                 <div className="text-zinc-400 text-[11px] flex flex-wrap gap-4 pt-1">
                   <span>Client IP: {item.client_ip ?? "127.0.0.1"}</span>
-                  <span>Status Code: HTTP {item.status_code}</span>
-                  <span>Cache Hit: {item.cache_hit ? "Sim (Zero Inference Cost)" : "Não"}</span>
-                  <span>Fallback Ativado: {item.fallback_triggered ? "Sim" : "Não"}</span>
+                  <span>Status Code: HTTP {itemStatusCode}</span>
+                  <span>Cache Hit: {itemCacheHit ? "Sim (Zero Inference Cost)" : "Não"}</span>
+                  <span>Fallback Ativado: {itemFallbackTriggered ? "Sim" : "Não"}</span>
                 </div>
               </div>
             );

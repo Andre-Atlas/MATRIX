@@ -26,7 +26,11 @@ export function errorMessage(status: number, body: string): string {
   return body.trim() ? `${status}: ${body.slice(0, 200)}` : `Request failed (${status})`;
 }
 
-export async function proxy<T>(method: "GET" | "POST" | "DELETE", path: string, body?: unknown): Promise<T> {
+export async function proxy<T>(
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE",
+  path: string,
+  body?: unknown,
+): Promise<T> {
   let res: Response;
   try {
     res = await fetch(`/api/proxy/${path.replace(/^\/+/, "")}`, {

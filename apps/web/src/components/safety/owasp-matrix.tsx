@@ -42,21 +42,23 @@ export function OwaspMatrix({
 
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
         {categories.map((cat) => {
-          const score = scoresByCode.get(cat.code);
+          const catCode = cat.code ?? (cat.id as string);
+          const score = scoresByCode.get(catCode as any) ?? scoresByCode.get(cat.id as any);
           const passRate = score ? Math.round(score.pass_rate * 100) : 100;
           const status = score ? score.status : "compliant";
           const statusMeta = formatComplianceStatus(status);
-          const isSelected = selectedCategoryCode === cat.code;
+          const isSelected = selectedCategoryCode === catCode;
+          const probesCount = cat.probes_count ?? 4;
 
           return (
             <button
-              key={cat.id}
+              key={cat.id ?? catCode}
               type="button"
               onClick={() => {
                 if (isSelected) {
                   onSelectCategory?.("all");
                 } else {
-                  onSelectCategory?.(cat.code);
+                  onSelectCategory?.(catCode);
                 }
               }}
               className={`group flex flex-col justify-between rounded-lg border p-3 text-left transition-all duration-200 ${
@@ -69,7 +71,7 @@ export function OwaspMatrix({
               <div>
                 <div className="flex items-center justify-between gap-1.5">
                   <span className="font-mono text-xs font-bold text-zinc-300 group-hover:text-emerald-300">
-                    {cat.code}
+                    {catCode}
                   </span>
                   <span
                     className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium leading-none ${statusMeta.badge}`}
@@ -86,7 +88,7 @@ export function OwaspMatrix({
 
                 {/* Short description */}
                 <p className="mt-1 line-clamp-2 text-[11px] leading-relaxed text-zinc-400">
-                  {cat.short_description}
+                  {cat.short_description ?? cat.description}
                 </p>
               </div>
 
@@ -115,7 +117,7 @@ export function OwaspMatrix({
 
                 <div className="mt-2 flex items-center justify-between text-[10px] text-zinc-400">
                   <span>
-                    Probes: <strong className="text-zinc-300">{score ? `${score.probes_passed}/${score.probes_tested}` : `${cat.probes_count}/${cat.probes_count}`}</strong>
+                    Probes: <strong className="text-zinc-300">{score ? `${score.probes_passed}/${score.probes_tested}` : `${probesCount}/${probesCount}`}</strong>
                   </span>
                   <span>
                     {score && score.findings_count > 0 ? (

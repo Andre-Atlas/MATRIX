@@ -184,7 +184,7 @@ export function ProviderCircuitBoard({ providers }: ProviderCircuitBoardProps) {
               <div className="mt-3 border-t border-zinc-800/80 pt-2.5">
                 <div className="flex items-center justify-between text-[11px] text-zinc-400 mb-1.5">
                   <span>Modelos Registrados ({modelCount}):</span>
-                  <span className={`inline-flex items-center gap-1 rounded px-1.5 py-0.2 text-[10px] ${health.badgeClass}`}>
+                  <span className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] ${health.badgeClass}`}>
                     <span className={`h-1.5 w-1.5 rounded-full ${health.dotClass}`} />
                     {health.label}
                   </span>
