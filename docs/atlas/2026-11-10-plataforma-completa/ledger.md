@@ -25,6 +25,8 @@ Formato: `T<n> · [tag] · C<n> → modelo/esforço (papel)`.
 
 ## Progresso
 
+- Contratos prontos: g0, g1, g2, g3 (em `contracts/`). Próximos a escrever: g4 (vetores/drift), g5 (red-team), g8 (gateway), g6/g7 (runners), g9.
+
 - Gate 1 aprovado; G0 iniciado.
 
 - Ruling: o downsampling de séries usa **M4 dentro do ClickHouse** (ADR-008) em vez de LTTB em Python (que a spec citava) — preserva picos e vales, é exato para gráficos de linha e não traz pontos brutos para a API — custo: nenhum para a UI.
