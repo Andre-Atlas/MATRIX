@@ -1,9 +1,10 @@
 import Link from "next/link";
 import { apiGet } from "@/lib/api";
+import { summaryMeta, summaryVariants, usesHeuristicJudge } from "@/lib/eval-matrix";
 import { formatTimestamp } from "@/lib/format";
 import type { Dataset, ExperimentListItem, ExperimentSummary, ListResponse } from "@/lib/types";
 import { EmptyState, Mono, PageHeader, ScoreChips, td, th } from "@/components/ui";
-import { ExperimentStatusBadge, primaryBtn } from "@/components/evals/ui";
+import { ExperimentStatusBadge, HeuristicJudgeBadge, PartialBadge, primaryBtn } from "@/components/evals/ui";
 import { StatusPoller } from "@/components/evals/status-poller";
 
 export const dynamic = "force-dynamic";
@@ -11,7 +12,7 @@ export const dynamic = "force-dynamic";
 /** Best variant mean per metric: the headline number of a run. */
 function headline(summary: ExperimentSummary | null): Record<string, number> {
   const out: Record<string, number> = {};
-  for (const metrics of Object.values(summary ?? {})) {
+  for (const [, metrics] of summaryVariants(summary)) {
     for (const [m, agg] of Object.entries(metrics)) {
       if (agg.mean === null) continue;
       out[m] = Math.max(out[m] ?? -Infinity, agg.mean);
@@ -83,7 +84,11 @@ export default async function ExperimentsPage() {
                     </Link>
                   </td>
                   <td className={td}>
-                    <ExperimentStatusBadge status={e.status} />
+                    <div className="flex flex-wrap items-center gap-1">
+                      <ExperimentStatusBadge status={e.status} />
+                      {usesHeuristicJudge(e.summary) && <HeuristicJudgeBadge />}
+                      {summaryMeta(e.summary)?.partial && <PartialBadge meta={summaryMeta(e.summary)!} />}
+                    </div>
                   </td>
                   <td className={td}>
                     <Mono className="text-xs text-zinc-400">{formatTimestamp(e.created_at)}</Mono>
@@ -96,7 +101,13 @@ export default async function ExperimentsPage() {
                     )}
                   </td>
                   <td className={td}>
-                    <ScoreChips scores={headline(e.summary)} max={3} labelWidth="max-w-[7rem]" />
+                    {e.status === "failed" && e.error ? (
+                      <span className="block max-w-[22rem] truncate font-mono text-xs text-red-300" title={e.error}>
+                        {e.error}
+                      </span>
+                    ) : (
+                      <ScoreChips scores={headline(e.summary)} max={3} labelWidth="max-w-[7rem]" />
+                    )}
                   </td>
                 </tr>
               ))}

@@ -219,8 +219,13 @@ export type ExperimentStatus = "queued" | "running" | "done" | "failed";
 
 export type MetricAggregate = { mean: number | null; pass_rate: number | null };
 
-/** variant label → metric name → aggregate. */
-export type ExperimentSummary = Record<string, Record<string, MetricAggregate>>;
+export type JudgeKind = "heuristic" | "llm";
+
+/** Reserved `_meta` key of a summary; every other key is a variant label. */
+export type ExperimentMeta = { cells_total: number; cells_failed: number; partial: boolean; judge: JudgeKind | null };
+
+/** variant label → metric name → aggregate, plus the reserved `_meta` entry (never a variant). */
+export type ExperimentSummary = Record<string, Record<string, MetricAggregate> | ExperimentMeta>;
 
 export type Experiment = {
   id: string;
@@ -239,7 +244,7 @@ export type Experiment = {
 
 export type ExperimentListItem = Pick<
   Experiment,
-  "id" | "name" | "dataset_id" | "status" | "created_at" | "finished_at" | "summary"
+  "id" | "name" | "dataset_id" | "status" | "created_at" | "finished_at" | "summary" | "error"
 >;
 
 export type FaithfulnessStatement = { statement: string; supported: boolean; reason: string };
@@ -270,6 +275,8 @@ export type Regression = {
   metric: string;
   baseline: number | null;
   current: number | null;
+  /** The current cell errored where the baseline had a value. */
+  errored: boolean;
 };
 
 export type ExperimentDetail = {

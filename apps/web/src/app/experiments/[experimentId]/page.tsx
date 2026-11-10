@@ -5,6 +5,8 @@ import {
   inputPreview,
   matrixRows,
   regressionMap,
+  summaryMeta,
+  usesHeuristicJudge,
   summarizeMatrix,
   type MatrixCell,
   type MatrixSummary,
@@ -29,6 +31,8 @@ import { StatusPoller } from "@/components/evals/status-poller";
 import { VariantChart } from "@/components/evals/variant-chart";
 import {
   ExperimentStatusBadge,
+  HeuristicJudgeBadge,
+  PartialBadge,
   MetricChip,
   VariantSwatch,
   formatMetricValue,
@@ -44,7 +48,8 @@ function promptLabel(v: Variant): string {
 }
 
 function regressionText(r: Regression): string {
-  return `${r.metric} ${formatMetricValue(r.baseline)} → ${formatMetricValue(r.current)}`;
+  const text = `${r.metric} ${formatMetricValue(r.baseline)} → ${formatMetricValue(r.current)}`;
+  return r.errored ? `${text} (erro na célula)` : text;
 }
 
 function SummaryTable({ summary, experiment }: { summary: MatrixSummary; experiment: Experiment }) {
@@ -450,6 +455,8 @@ export default async function ExperimentPage({
         <div className="flex min-w-0 items-center gap-2">
           <h1 className="truncate text-base font-semibold text-zinc-50">{experiment.name}</h1>
           <ExperimentStatusBadge status={experiment.status} />
+          {usesHeuristicJudge(experiment.summary, results) && <HeuristicJudgeBadge />}
+          {summaryMeta(experiment.summary)?.partial && <PartialBadge meta={summaryMeta(experiment.summary)!} />}
           {active && <StatusPoller />}
         </div>
         <dl className="flex flex-wrap items-center gap-x-5 gap-y-1 text-xs">
@@ -515,7 +522,7 @@ export default async function ExperimentPage({
       {experiment.status === "failed" && experiment.error && (
         <div role="alert" className="mb-4 rounded border border-red-900/70 bg-red-950/40 px-3 py-2 text-xs">
           <span className="font-medium text-red-300">Experiment failed</span>
-          <p className="mt-0.5 font-mono text-red-200">{experiment.error}</p>
+          <p className="mt-0.5 font-mono text-sm font-semibold text-red-200">{experiment.error}</p>
         </div>
       )}
 

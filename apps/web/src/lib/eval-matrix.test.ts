@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cellKey, inputPreview, matrixRows, regressionMap, summarizeMatrix, toSummaryRecord } from "./eval-matrix";
+import { cellKey, inputPreview, matrixRows, regressionMap, summarizeMatrix, summaryMeta, summaryVariants, toSummaryRecord, usesHeuristicJudge } from "./eval-matrix";
 import type { DatasetItem, ExperimentResult, MetricScore, Regression } from "./types";
 
 const s = (value: number | null, passed: boolean | null = value === null ? null : value >= 0.7): MetricScore => ({
@@ -86,9 +86,9 @@ describe("summarizeMatrix", () => {
 describe("regressionMap", () => {
   it("groups regressions per cell", () => {
     const regs: Regression[] = [
-      { item_id: "i1", variant: "A", metric: "f", baseline: 1, current: 0.5 },
-      { item_id: "i1", variant: "A", metric: "lat", baseline: 1, current: 0 },
-      { item_id: "i2", variant: "A", metric: "f", baseline: 0.9, current: 0.4 },
+      { item_id: "i1", variant: "A", metric: "f", baseline: 1, current: 0.5, errored: false },
+      { item_id: "i1", variant: "A", metric: "lat", baseline: 1, current: 0, errored: false },
+      { item_id: "i2", variant: "A", metric: "f", baseline: 0.9, current: 0.4, errored: false },
     ];
     const map = regressionMap(regs);
     expect(map.size).toBe(2);
@@ -106,7 +106,7 @@ describe("matrixRows", () => {
     result("i2", "B", { f: s(0.9), g: s(0.9) }),
     result("gone", "A", { f: s(1) }),
   ];
-  const regs = regressionMap([{ item_id: "i2", variant: "A", metric: "f", baseline: 1, current: 0.3 }]);
+  const regs = regressionMap([{ item_id: "i2", variant: "A", metric: "f", baseline: 1, current: 0.3, errored: false }]);
 
   it("lays out items × variants, keeping pending cells and orphaned results", () => {
     const rows = matrixRows(items, results, ["A", "B"]);
@@ -143,5 +143,29 @@ describe("inputPreview", () => {
   it("renders keys compactly and truncates", () => {
     expect(inputPreview({ question: "hi", k: 3 })).toBe("question: hi\nk: 3");
     expect(inputPreview({ q: "x".repeat(50) }, 10)).toHaveLength(10);
+  });
+});
+
+describe("summary _meta", () => {
+  const meta = { cells_total: 4, cells_failed: 1, partial: true, judge: "heuristic" as const };
+  const summary = { ...toSummaryRecord(summarizeMatrix([result("i1", "A", { f: s(1) })], ["f"])), _meta: meta };
+
+  it("is not a variant and yields no NaN", () => {
+    expect(summaryVariants(summary).map(([k]) => k)).toEqual(["A"]);
+    expect(summaryMeta(summary)).toEqual(meta);
+    const means = summaryVariants(summary).flatMap(([, m]) => Object.values(m).map((a) => a.mean));
+    expect(means.every((x) => x === null || Number.isFinite(x))).toBe(true);
+  });
+
+  it("detects the heuristic judge from _meta or cell details", () => {
+    expect(usesHeuristicJudge(summary)).toBe(true);
+    expect(usesHeuristicJudge({ _meta: { ...meta, judge: "llm" } })).toBe(false);
+    const r = result("i1", "A", { f: { ...s(1), details: { judge: "heuristic" } } });
+    expect(usesHeuristicJudge(null, [r])).toBe(true);
+  });
+
+  it("groups errored regressions", () => {
+    const reg: Regression = { item_id: "i1", variant: "A", metric: "f", baseline: 1, current: null, errored: true };
+    expect(regressionMap([reg]).get(cellKey("i1", "A"))?.[0].errored).toBe(true);
   });
 });

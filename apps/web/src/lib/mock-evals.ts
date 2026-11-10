@@ -518,7 +518,7 @@ function seed(now: number): Store {
     all: run(sweepVariants, RAG_METRICS, (i, v) => ({
       hallucinate: hall.has(`${i}|${v.label}`),
       latency: v === V1_CLAUDE && i === 2 ? 2930 : undefined,
-      error: v === V2_CLAUDE && i === 5 ? "anthropic: 529 overloaded_error after 3 attempts" : undefined,
+      error: v === V1_CLAUDE && i === 5 ? "anthropic: 529 overloaded_error after 3 attempts" : undefined,
     })),
     startAt: sweepStart,
     msPerCell: 7000,
@@ -593,7 +593,15 @@ function experimentView(rec: ExperimentRec, now = Date.now()): { experiment: Exp
   const summary =
     status === "queued" || status === "failed"
       ? null
-      : toSummaryRecord(summarizeMatrix(results, rec.exp.metrics, rec.exp.variants.map((v) => v.label)));
+      : {
+          ...toSummaryRecord(summarizeMatrix(results, rec.exp.metrics, rec.exp.variants.map((v) => v.label))),
+          _meta: {
+            cells_total: total,
+            cells_failed: results.filter((r) => r.error).length,
+            partial: results.some((r) => r.error),
+            judge: "heuristic" as const,
+          },
+        };
   return {
     experiment: {
       ...rec.exp,
@@ -616,10 +624,18 @@ function regressionsFor(s: Store, rec: ExperimentRec, results: ExperimentResult[
   for (const r of results) {
     const b = byCell.get(cellKey(r.item_id, r.variant));
     if (!b) continue;
+    if (r.error) {
+      for (const [metric, prev] of Object.entries(b.scores)) {
+        if (typeof prev.value === "number") {
+          out.push({ item_id: r.item_id, variant: r.variant, metric, baseline: prev.value, current: null, errored: true });
+        }
+      }
+      continue;
+    }
     for (const [metric, cur] of Object.entries(r.scores)) {
       const prev = b.scores[metric];
       if (prev?.passed === true && cur.passed === false) {
-        out.push({ item_id: r.item_id, variant: r.variant, metric, baseline: prev.value, current: cur.value });
+        out.push({ item_id: r.item_id, variant: r.variant, metric, baseline: prev.value, current: cur.value, errored: false });
       }
     }
   }
@@ -644,7 +660,7 @@ export function evalGet(p: string): unknown {
     const items: ExperimentListItem[] = s.experiments
       .map((e) => experimentView(e).experiment)
       .sort((a, b) => b.created_at.localeCompare(a.created_at))
-      .map(({ id, name, dataset_id, status, created_at, finished_at, summary }) => ({
+      .map(({ id, name, dataset_id, status, created_at, finished_at, summary, error }) => ({
         id,
         name,
         dataset_id,
@@ -652,6 +668,7 @@ export function evalGet(p: string): unknown {
         created_at,
         finished_at,
         summary,
+        error,
       }));
     return { items, next_cursor: null };
   }
