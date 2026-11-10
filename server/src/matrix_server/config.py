@@ -12,6 +12,8 @@ class Settings(BaseSettings):
     clickhouse_url: str = "http://localhost:8123"
     clickhouse_database: str = "matrix"
     admin_token: str | None = None
+    jwt_secret: str = "matrix-insecure-dev-secret-change-in-prod"
+    jwt_exp_hours: int = 72
     # Every request body (OTLP ingest included) is bounded by max_body_bytes; the JSON API
     # (/api/v1/*) by the smaller max_json_body_bytes. Larger bodies get 413.
     max_body_bytes: int = 10_000_000

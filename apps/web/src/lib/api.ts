@@ -1,13 +1,30 @@
+import { cookies } from "next/headers";
 import { ApiError } from "./api-error";
 
 export { ApiError, isNotFound } from "./api-error";
 
 const base = () => process.env.MATRIX_API_URL ?? "http://localhost:8000";
 
-function headers(json: boolean): Record<string, string> {
+async function headers(json: boolean): Promise<Record<string, string>> {
   const h: Record<string, string> = {};
-  const key = process.env.MATRIX_API_KEY;
-  if (key) h.Authorization = `Bearer ${key}`;
+  let sessionToken: string | undefined;
+  let projectId: string | undefined;
+  try {
+    const c = await cookies();
+    sessionToken = c.get("matrix_session")?.value;
+    projectId = c.get("matrix_project_id")?.value;
+  } catch {
+    // cookies() unavailable outside request context (e.g. build / tests)
+  }
+  if (sessionToken) {
+    h.Authorization = `Bearer ${sessionToken}`;
+  } else {
+    const key = process.env.MATRIX_API_KEY;
+    if (key) h.Authorization = `Bearer ${key}`;
+  }
+  if (projectId) {
+    h["x-matrix-project-id"] = projectId;
+  }
   if (json) h["Content-Type"] = "application/json";
   return h;
 }
@@ -30,7 +47,7 @@ export async function apiGet<T>(
   for (const [k, v] of Object.entries(params ?? {})) {
     if (v !== undefined && v !== "") url.searchParams.set(k, String(v));
   }
-  const res = await fetch(url, { headers: headers(false), cache: "no-store" });
+  const res = await fetch(url, { headers: await headers(false), cache: "no-store" });
   return parse<T>(res);
 }
 
@@ -41,7 +58,7 @@ export async function apiSend<T>(method: string, path: string, body?: unknown): 
   }
   const res = await fetch(`${base()}${path}`, {
     method,
-    headers: headers(true),
+    headers: await headers(true),
     body: body === undefined ? undefined : JSON.stringify(body),
     cache: "no-store",
   });

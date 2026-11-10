@@ -15,22 +15,34 @@ async function forward(req: NextRequest, ctx: { params: Promise<{ path: string[]
   const headers: Record<string, string> = {};
   const ct = req.headers.get("content-type");
   if (ct) headers["content-type"] = ct;
-  const key = process.env.MATRIX_API_KEY;
-  if (key) headers.authorization = `Bearer ${key}`;
+  const cookie = req.cookies.get("matrix_session")?.value;
+  if (cookie) {
+    headers.authorization = `Bearer ${cookie}`;
+  } else {
+    const key = process.env.MATRIX_API_KEY;
+    if (key) headers.authorization = `Bearer ${key}`;
+  }
+  const proj = req.cookies.get("matrix_project_id")?.value;
+  if (proj) headers["x-matrix-project-id"] = proj;
+
   const res = await fetch(url, {
     method: req.method,
     headers,
     body: hasBody ? await req.text() : undefined,
     cache: "no-store",
   });
+  const respHeaders: Record<string, string> = {
+    "content-type": res.headers.get("content-type") ?? "application/json",
+    ...(res.headers.get("content-disposition")
+      ? { "content-disposition": res.headers.get("content-disposition")! }
+      : {}),
+  };
+  const setCookie = res.headers.get("set-cookie");
+  if (setCookie) respHeaders["set-cookie"] = setCookie;
+
   return new Response(res.body, {
     status: res.status,
-    headers: {
-      "content-type": res.headers.get("content-type") ?? "application/json",
-      ...(res.headers.get("content-disposition")
-        ? { "content-disposition": res.headers.get("content-disposition")! }
-        : {}),
-    },
+    headers: respHeaders,
   });
 }
 

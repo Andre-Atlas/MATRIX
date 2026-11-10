@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from matrix_server.api import (
     admin,
     annotations,
+    auth,
     datasets,
     experiments,
     ingest,
@@ -40,6 +41,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    for module in (ingest, admin, query, prompts, datasets, experiments, annotations, rules, online_evals):
+    for module in (auth, ingest, admin, query, prompts, datasets, experiments, annotations, rules, online_evals):
         app.include_router(module.router)
     return app
