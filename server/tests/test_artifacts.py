@@ -426,15 +426,130 @@ def test_presigned_mismatch_removes_object(env):
     assert env.blobs(env.p1.id) == [] and env.leftovers(env.p1.id) == []
 
 
-def test_unverified_above_hash_limit(make_env):
+def test_above_hash_limit_local_content_route_is_hashed(make_env, backend):
+    if backend["artifact_backend"] != "local":
+        pytest.skip("local content route only")
     env = make_env(verify_hash_max_bytes=1000)
     data = os.urandom(2000)
     resp = env.client.post("/api/v1/artifacts/uploads", headers=env.h1,
                            json={"filename": "x", "size": len(data), "sha256": sha(data)})
     art, upload = resp.json()["artifact"], resp.json()["upload"]
-    assert _presigned_put(env, upload, data).status_code in (200, 204)
+    assert _presigned_put(env, upload, os.urandom(2000)).status_code == 422  # hashed while streaming
+    assert _presigned_put(env, upload, data).status_code == 204
     done = env.client.post(f"/api/v1/artifacts/{art['id']}/complete", headers=env.h1).json()
-    assert done["status"] == "ready" and done["verified"] is False
+    assert done["status"] == "ready" and done["verified"] is True
+
+
+class StagingStore(LocalArtifactStore):
+    """Local store with an S3-like staging area: staged bytes are not checked on upload, and
+    `promote_upload` copies them verbatim to the declared sha's key (like an S3 copy)."""
+
+    def __init__(self, root, checksum: str | None = None) -> None:
+        super().__init__(root)
+        self.staged: dict[tuple[str, str], bytes] = {}
+        self.checksum = checksum
+
+    def stat_upload(self, project_id, upload_id):
+        data = self.staged.get((project_id, upload_id))
+        return None if data is None else len(data)
+
+    def open_upload(self, project_id, upload_id):
+        import io
+
+        return io.BytesIO(self.staged[(project_id, upload_id)])
+
+    def upload_checksum(self, project_id, upload_id):
+        return self.checksum
+
+    def promote_upload(self, project_id, upload_id, sha256):
+        data = self.staged.pop((project_id, upload_id))
+        path = self._blob_path(project_id, sha256)
+        self._mkdir(path.parent)
+        path.write_bytes(data)
+
+    def delete_upload(self, project_id, upload_id):
+        self.staged.pop((project_id, upload_id), None)
+
+
+def _pending(env: Env, data_size: int, declared_sha: str) -> Artifact:
+    with env.factory() as s, s.begin():
+        art = Artifact(project_id=env.p1.id, name="big", media_type="application/octet-stream",
+                       size=data_size, sha256=declared_sha, verified=False, status="pending")
+        s.add(art)
+    return art
+
+
+def _complete(env: Env, store, art: Artifact, verify_max: int):
+    with env.factory() as s:
+        row = s.get(Artifact, art.id)
+        try:
+            svc.complete_upload(s, store, row, svc.Limits(verify_hash_max_bytes=verify_max))
+            return row.status
+        except svc.ArtifactError as exc:
+            return exc.status_code
+        finally:
+            s.commit()
+
+
+def test_s11_unproven_upload_above_hash_limit_is_never_promoted(env, tmp_path):
+    store = StagingStore(tmp_path / "staging")
+    legit, forged = os.urandom(2000), os.urandom(2000)
+    art = _pending(env, len(forged), sha(legit))  # declares the sha of other content
+    store.staged[(env.p1.id, art.id)] = forged
+    assert _complete(env, store, art, verify_max=1000) == 422
+    assert not store.exists(env.p1.id, sha(legit)) and store.staged == {}
+    with env.factory() as s:
+        assert s.get(Artifact, art.id) is None
+    # Later uploads of the real content do not dedup against forged bytes.
+    with env.factory() as s:
+        real = svc.store_bytes(s, store, env.p1.id, "real", legit)
+        s.commit()
+    with store.open(env.p1.id, real.sha256) as fh:
+        assert fh.read() == legit
+
+
+def test_s11_trusted_server_checksum_promotes_above_limit(env, tmp_path):
+    data = os.urandom(2000)
+    store = StagingStore(tmp_path / "staging", checksum=sha(data))
+    art = _pending(env, len(data), sha(data))
+    store.staged[(env.p1.id, art.id)] = data
+    assert _complete(env, store, art, verify_max=1000) == "ready"
+    with env.factory() as s:
+        assert s.get(Artifact, art.id).verified is True
+    # A checksum for different content is refused.
+    store.checksum = sha(b"other")
+    art = _pending(env, len(data), sha(os.urandom(8)))
+    store.staged[(env.p1.id, art.id)] = data
+    assert _complete(env, store, art, verify_max=1000) == 422
+
+
+def test_s10_staged_size_must_match_declared(env, tmp_path):
+    store = StagingStore(tmp_path / "staging")
+    data = os.urandom(100)
+    art = _pending(env, len(data), sha(data))
+    store.staged[(env.p1.id, art.id)] = data + os.urandom(10_000)  # more than declared/reserved
+    assert _complete(env, store, art, verify_max=10**9) == 422
+    assert store.staged == {} and env.blobs(env.p1.id) == []
+
+
+def test_s10_presigned_put_signs_length_and_checksum():
+    import base64
+    from urllib.parse import parse_qs, urlparse
+
+    from matrix_server.artifacts.s3 import S3ArtifactStore
+
+    # Signing is offline: no server needed.
+    store = S3ArtifactStore(bucket="b", endpoint="http://s3.internal:9000", access_key="k", secret_key="s",
+                            public_endpoint="http://s3.example.test")
+    digest = sha(b"abc")
+    req = store.presign_put("proj1", digest, 3, 60, upload_id="up1")
+    query = parse_qs(urlparse(req.url).query)
+    signed = query["X-Amz-SignedHeaders"][0].split(";")
+    assert "content-length" in signed and "x-amz-checksum-sha256" in signed
+    assert req.url.startswith("http://s3.example.test/b/proj1/uploads/up1?")
+    assert req.headers["Content-Length"] == "3"
+    assert req.headers["x-amz-checksum-sha256"] == base64.b64encode(bytes.fromhex(digest)).decode()
+    assert store.upload_checksum("proj1", "up1") is None  # checksums untrusted by default: no network
 
 
 def test_svg_never_inline_png_inline_sandboxed(env):

@@ -62,6 +62,9 @@ def run_experiment_job(session: Session, job: Job) -> None:
     try:
         exp = session.get(Experiment, exp_id, populate_existing=True)
         run_experiment(session, exp)
+        if exp.status == "failed":
+            # Every cell failed: a recorded outcome, not a systemic error. The job succeeds (no retry).
+            log.warning("experiment %s failed: %s", exp_id, exp.error)
     except JobLost:
         session.rollback()
         log.warning("job %s: lease lost, experiment %s left to its current owner", job.id, exp_id)

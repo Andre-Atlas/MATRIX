@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -35,6 +36,36 @@ DEFAULT_CONCURRENCY = 4
 MAX_CONCURRENCY = 32
 MAX_CELL_ERROR_CHARS = 500
 DEFAULT_MAX_CELLS = 5000
+MAX_FAILURE_REASON_CHARS = 200
+# Metric types scored by the judge: their cell scores carry `details.judge` (heuristic|llm).
+JUDGE_METRIC_TYPES = frozenset({"faithfulness", "answer_relevancy", "context_precision", "g_eval"})
+# Reserved summary key for experiment-level facts (cells_total, cells_failed, partial, judge);
+# every other key is a variant label.
+SUMMARY_META_KEY = "_meta"
+HEURISTIC_JUDGE_WARNING = (
+    "using the offline heuristic judge: scores are for tests/demo only; set MATRIX_JUDGE_PROVIDER"
+)
+
+_heuristic_warned = False
+_heuristic_warned_lock = threading.Lock()
+
+
+def warn_heuristic_judge_once() -> None:
+    """Log, once per process, that the default (unconfigured) judge is the offline heuristic."""
+    global _heuristic_warned
+    with _heuristic_warned_lock:
+        if _heuristic_warned:
+            return
+        _heuristic_warned = True
+    log.warning(HEURISTIC_JUDGE_WARNING)
+
+
+def judge_kind(deps: EvalDeps | None) -> str | None:
+    """`heuristic` for the offline judge, `llm` for an LLM judge, None without a judge."""
+    judge = deps.judge if deps is not None else None
+    if judge is None:
+        return None
+    return "heuristic" if isinstance(judge, HeuristicJudge) else "llm"
 
 
 class ExperimentConfigError(ValueError):
@@ -65,8 +96,11 @@ def max_cells() -> int:
 
 def build_eval_deps() -> EvalDeps:
     """Judge/embedder from `MATRIX_JUDGE_PROVIDER` / `MATRIX_JUDGE_MODEL` (default: offline heuristics)."""
-    provider = (os.environ.get("MATRIX_JUDGE_PROVIDER") or "fake").strip().lower()
+    configured = (os.environ.get("MATRIX_JUDGE_PROVIDER") or "").strip().lower()
+    provider = configured or "fake"
     if provider == "fake":
+        if not configured:
+            warn_heuristic_judge_once()
         return EvalDeps(judge=HeuristicJudge(), embedder=HashingEmbedder())
     model = (os.environ.get("MATRIX_JUDGE_MODEL") or "").strip()
     if not model:
@@ -182,6 +216,7 @@ class CellResult:
     output_tokens: int | None = None
     error: str | None = None
     scores: dict[str, Any] = field(default_factory=dict)
+    failed: bool = False  # the provider call failed: no output, scores n/a
 
 
 def _na_scores(metrics: list[Metric], reason: str) -> dict[str, Any]:
@@ -208,11 +243,13 @@ def run_cell(item: dict[str, Any], variant: ResolvedVariant, metrics: list[Metri
     except ProviderError as exc:
         cell.error = "; ".join([*notes, str(exc)])[:MAX_CELL_ERROR_CHARS]
         cell.scores = _na_scores(metrics, "skipped: provider error")
+        cell.failed = True
         return cell
     except Exception as exc:  # noqa: BLE001 - one cell must never sink the experiment
         log.warning("experiment cell failed: %s", type(exc).__name__)
         cell.error = "; ".join([*notes, f"provider call failed: {type(exc).__name__}"])[:MAX_CELL_ERROR_CHARS]
         cell.scores = _na_scores(metrics, "skipped: provider error")
+        cell.failed = True
         return cell
     cell.output = completion.text
     cell.latency_ms = _clean_number(float(completion.latency_ms or measured))
@@ -229,6 +266,11 @@ def run_cell(item: dict[str, Any], variant: ResolvedVariant, metrics: list[Metri
         cost_usd=cell.cost_usd,
     )
     cell.scores = {name: _score_dict(r) for name, r in evaluate_case(metrics, case, deps).items()}
+    kind = judge_kind(deps)
+    if kind is not None:
+        for m in metrics:
+            if m.type in JUDGE_METRIC_TYPES and m.name in cell.scores:
+                cell.scores[m.name]["details"] = {"judge": kind}
     return cell
 
 
@@ -263,7 +305,9 @@ def resolve_variants(session: Session, exp: Experiment) -> list[ResolvedVariant]
 
 
 def summarize(results: list[Any], metric_names: list[str]) -> dict[str, dict[str, dict[str, float | None]]]:
-    """`{variant: {metric: {mean, pass_rate}}}`; mean over non-null values, pass_rate over non-null passed."""
+    """`{variant: {metric: {mean, pass_rate}}}`; mean over non-null values, pass_rate over non-null passed.
+
+    `run_experiment` adds the reserved `_meta` key (see `SUMMARY_META_KEY`)."""
     acc: dict[str, dict[str, tuple[list[float], list[bool]]]] = {}
     for r in results:
         per = acc.setdefault(r.variant, {name: ([], []) for name in metric_names})
@@ -285,25 +329,44 @@ def summarize(results: list[Any], metric_names: list[str]) -> dict[str, dict[str
     }
 
 
+def cell_errored(r: Any) -> bool:
+    """The cell's provider call failed (no output, error recorded): its scores are n/a, not ok."""
+    return bool(getattr(r, "error", None)) and getattr(r, "output", None) is None
+
+
 def find_regressions(baseline: list[Any], current: list[Any]) -> list[dict[str, Any]]:
-    """Cells (same item and variant label) where a metric went passed -> failed or dropped > 0.1."""
+    """Cells (same item and variant label) where a metric went passed -> failed, dropped > 0.1, or
+    had a baseline result and now errored (`errored: true`; an error is never "no regression")."""
     base = {(r.item_id, r.variant): r.scores or {} for r in baseline}
     out = []
     for r in current:
         before = base.get((r.item_id, r.variant))
         if before is None:
             continue
+        errored = cell_errored(r)
         for metric, now in sorted((r.scores or {}).items()):
             prev = before.get(metric)
             if prev is None:
                 continue
-            failed = prev.get("passed") is True and now.get("passed") is False
             pv, cv = prev.get("value"), now.get("value")
+            if errored:
+                if prev.get("passed") is True or pv is not None:
+                    out.append({"item_id": r.item_id, "variant": r.variant, "metric": metric,
+                                "baseline": pv, "current": cv, "errored": True})
+                continue
+            failed = prev.get("passed") is True and now.get("passed") is False
             dropped = pv is not None and cv is not None and pv - cv > REGRESSION_DELTA
             if failed or dropped:
                 out.append({"item_id": r.item_id, "variant": r.variant, "metric": metric,
-                            "baseline": pv, "current": cv})
+                            "baseline": pv, "current": cv, "errored": False})
     return out
+
+
+def _failure_reason(error: str | None) -> str:
+    text = " ".join((error or "unknown error").split())
+    if len(text) > MAX_FAILURE_REASON_CHARS:
+        text = text[: MAX_FAILURE_REASON_CHARS - 3] + "..."
+    return text
 
 
 def run_experiment(session: Session, exp: Experiment) -> None:
@@ -367,8 +430,23 @@ def run_experiment(session: Session, exp: Experiment) -> None:
     for key, stale in existing.items():  # items deleted since a previous attempt
         if key not in computed:
             session.delete(stale)
-    exp.summary = summarize(rows, [m.name for m in metrics])
-    exp.status = "done"
-    exp.error = None
+    summary: dict[str, Any] = summarize(rows, [m.name for m in metrics])
+    failed = [c for c in cells if c.failed]
+    total = len(cells)
+    summary[SUMMARY_META_KEY] = {
+        "cells_total": total,
+        "cells_failed": len(failed),
+        "partial": 0 < len(failed) < total,
+        "judge": judge_kind(deps),
+    }
+    exp.summary = summary
+    if total and len(failed) == total:
+        # Every provider call failed (bad key, unknown model, provider down): not a finished run.
+        # Recorded as a normal outcome (the job succeeds; no retry loop). Cell errors are sanitized.
+        exp.status = "failed"
+        exp.error = f"all {total} cells failed: {_failure_reason(failed[0].error)}"
+    else:
+        exp.status = "done"
+        exp.error = None
     exp.finished_at = utcnow()
     session.flush()

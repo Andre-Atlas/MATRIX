@@ -1,13 +1,20 @@
 name: matrix
 
+# Required variables (put them in deploy/.env; see README "Stack completa via docker compose"):
+# POSTGRES_PASSWORD, CLICKHOUSE_PASSWORD (URL-safe characters: they are embedded in URLs).
+# Published ports bind to 127.0.0.1 only: the web has no login yet and MATRIX_API_KEY gives full
+# read/write access to whoever reaches port 3000. Expose it only behind an authenticating proxy.
+
 services:
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
+    restart: unless-stopped
     ports:
-      - "8123:8123"
+      - "127.0.0.1:8123:8123"
     environment:
       CLICKHOUSE_DB: matrix
       CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in deploy/.env}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
     volumes:
       - clickhouse-data:/var/lib/clickhouse
@@ -19,10 +26,11 @@ services:
 
   postgres:
     image: pgvector/pgvector:pg16
+    restart: unless-stopped
     environment:
       POSTGRES_DB: matrix
       POSTGRES_USER: matrix
-      POSTGRES_PASSWORD: matrix
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -31,25 +39,20 @@ services:
       timeout: 3s
       retries: 20
 
-  minio:
-    image: minio/minio
-    command: server /data --console-address :9001
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    volumes:
-      - minio-data:/data
+  # No S3/MinIO service: nothing uses S3 yet. The S3 artifact store (cycle 2) comes back with a
+  # pinned S3-compatible image.
 
   api:
     build: ../server
+    restart: unless-stopped
     command: ["sh", "-c", "alembic upgrade head && exec matrix-api"]
     environment: &server-env
-      MATRIX_DATABASE_URL: postgresql+psycopg://matrix:matrix@postgres:5432/matrix
+      MATRIX_DATABASE_URL: postgresql+psycopg://matrix:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}@postgres:5432/matrix
       MATRIX_SPAN_STORE: clickhouse
-      MATRIX_CLICKHOUSE_URL: http://clickhouse:8123
+      MATRIX_CLICKHOUSE_URL: http://default:${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in deploy/.env}@clickhouse:8123
       MATRIX_ADMIN_TOKEN: ${MATRIX_ADMIN_TOKEN:-}
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 5s
@@ -63,23 +66,33 @@ services:
 
   worker:
     build: ../server
+    restart: unless-stopped
     command: ["matrix-worker"]
-    environment: *server-env
+    environment:
+      <<: *server-env
+      # Judge for experiments and online evals. Empty provider = offline heuristic judge
+      # (tests/demo only; the worker logs a warning and scores are labelled "heuristic").
+      MATRIX_JUDGE_PROVIDER: ${MATRIX_JUDGE_PROVIDER:-}
+      MATRIX_JUDGE_MODEL: ${MATRIX_JUDGE_MODEL:-}
+      MATRIX_EMBEDDING_MODEL: ${MATRIX_EMBEDDING_MODEL:-}
+      MATRIX_OPENAI_BASE_URL: ${MATRIX_OPENAI_BASE_URL:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     depends_on:
       api:
         condition: service_healthy  # migrations run in the api container first
 
   web:
     build: ../apps/web
+    restart: unless-stopped
     environment:
       MATRIX_API_URL: http://api:8000
       MATRIX_API_KEY: ${MATRIX_API_KEY:-}
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     depends_on:
       - api
 
 volumes:
   clickhouse-data:
   postgres-data:
-  minio-data:

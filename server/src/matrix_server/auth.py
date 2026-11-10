@@ -444,7 +444,7 @@ def require(min_role: Role = Role.VIEWER, *, scope: str | None = None) -> Callab
         return _resolve(request, spec)
 
     dependency.rbac = spec  # type: ignore[attr-defined]
-    dependency.__name__ = f"require_{spec.min_role.label}" + (f"_{scope}" if scope else "")
+    dependency.__name__ = f"require_role_{spec.min_role.label}" + (f"_{scope}" if scope else "")
     return dependency
 
 

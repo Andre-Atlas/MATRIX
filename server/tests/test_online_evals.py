@@ -262,6 +262,11 @@ def test_worker_scores_and_calls_hooks(env, score_hook_calls):
     assert {t for (n, t) in scores if n == "faith"} == {AGENT_TRACE_ID}
     faith = scores[("faith", AGENT_TRACE_ID)]
     assert 0.0 <= faith.value <= 1.0 and faith.comment and len(faith.comment) <= 1000
+    # Default judge (no MATRIX_JUDGE_PROVIDER) is the heuristic one: marked as such on the score.
+    assert faith.source == "llm" and faith.label == "heuristic"
+    assert faith.comment.startswith("[heuristic judge] ")
+    # Non-judge metrics are not marked.
+    assert agent.label is None and not (agent.comment or "").startswith("[heuristic judge]")
     project_id = agent.project_id
     assert sorted(c[3] for c in score_hook_calls) == ["faith", "quality", "quality", "quality"]
     assert all(c[0] == project_id for c in score_hook_calls)
@@ -332,3 +337,36 @@ def test_build_deps_uses_env_and_model(monkeypatch):
     deps = online_handlers.build_deps({"provider": "openai", "name": "gpt-x"})
     assert isinstance(deps.judge, LLMJudge) and deps.judge.model == "gpt-x"
     assert isinstance(online_handlers.build_deps({"provider": "fake", "name": "f"}).judge, HeuristicJudge)
+
+
+def test_llm_judge_score_has_no_heuristic_mark(env, monkeypatch):
+    from matrix_server.evals import EvalDeps, HashingEmbedder, LLMJudge, get_provider
+
+    class StubJudge(LLMJudge):
+        def extract_statements(self, question, answer):
+            return [answer]
+
+        def verify(self, statement, contexts):
+            return True, "supported"
+
+    deps = EvalDeps(judge=StubJudge(get_provider("fake"), "judge-m"), embedder=HashingEmbedder())
+    monkeypatch.setattr(online_handlers, "build_deps", lambda model: deps)
+    app, client, auth = env
+    assert _create(client, auth, name="faith", metric="faithfulness", params={}).status_code == 201
+    _ingest(client, auth)
+    _drain(app)
+    faith = next(s for s in _scores(app) if s.name == "faith")
+    assert faith.source == "llm" and faith.label is None
+    assert not (faith.comment or "").startswith("[heuristic judge]")
+
+
+def test_default_online_judge_warns_once(monkeypatch, caplog):
+    from matrix_server.evals import runner as eval_runner
+
+    monkeypatch.delenv("MATRIX_JUDGE_PROVIDER", raising=False)
+    monkeypatch.setattr(eval_runner, "_heuristic_warned", False)
+    with caplog.at_level("WARNING"):
+        online_handlers.build_deps(None)
+        online_handlers.build_deps(None)
+        eval_runner.build_eval_deps()  # shared per-process flag
+    assert [r.getMessage() for r in caplog.records].count(eval_runner.HEURISTIC_JUDGE_WARNING) == 1

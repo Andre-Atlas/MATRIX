@@ -51,8 +51,16 @@ def run_worker() -> None:
 def _build_admin_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="matrix-admin", description="MATRIX administration")
     sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("create-user", help="create a user (password read from stdin or a prompt)")
+    p.add_argument("email")
+    p.add_argument("--name", default="")
     p = sub.add_parser("create-project", help="create a project and its first API key")
     p.add_argument("name")
+    p.add_argument("--owner-email", default=None, help="existing user who becomes the owner")
+    p = sub.add_parser("add-member", help="add an existing user to a project")
+    p.add_argument("project_id")
+    p.add_argument("email")
+    p.add_argument("--role", choices=["viewer", "member", "admin", "owner"], default="member")
     p = sub.add_parser("create-key", help="create a new API key for a project")
     p.add_argument("project_id")
     p = sub.add_parser("revoke-key", help="revoke an API key by its prefix")
@@ -60,10 +68,28 @@ def _build_admin_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _read_password() -> str:
+    """Never from argv (shell history, `ps`): a prompt on a terminal, else the first stdin line."""
+    import getpass
+
+    if sys.stdin.isatty():
+        password = getpass.getpass("Password: ")
+        if getpass.getpass("Repeat password: ") != password:
+            print("error: passwords do not match", file=sys.stderr)
+            sys.exit(1)
+        return password
+    return sys.stdin.readline().rstrip("\r\n")
+
+
+def _fail(message: str) -> None:
+    print(f"error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
 def admin(argv: list[str] | None = None) -> None:
-    from matrix_server import auth
+    from matrix_server import audit, auth, users
     from matrix_server.storage.db import init_db, make_engine, make_session_factory
-    from matrix_server.storage.models import Project
+    from matrix_server.storage.models import Membership, Project
 
     args = _build_admin_parser().parse_args(argv)
     database_url = os.environ.get("MATRIX_DATABASE_URL", "sqlite:///./matrix.db")
@@ -71,16 +97,49 @@ def admin(argv: list[str] | None = None) -> None:
     init_db(engine)
     session = make_session_factory(engine)()
     try:
-        if args.command == "create-project":
+        if args.command == "create-user":
             try:
-                project, key = auth.create_project(session, args.name)
+                user = users.create_user(session, args.email, args.name, _read_password())
+            except users.UserError as exc:
+                _fail(str(exc))
+            audit.record(session, action="user.create", target=user.id, detail={"via": "cli"})
+            session.commit()
+            print(f"user_id: {user.id}")
+        elif args.command == "create-project":
+            owner_id = None
+            if args.owner_email:
+                owner = users.get_user_by_email(session, args.owner_email)
+                if owner is None:
+                    _fail("owner user not found")
+                owner_id = owner.id
+            try:
+                project, key = auth.create_project(session, args.name, owner_user_id=owner_id)
             except auth.ProjectExistsError:
-                print(f"error: project {args.name!r} already exists", file=sys.stderr)
-                sys.exit(1)
+                _fail(f"project {args.name!r} already exists")
+            audit.record(
+                session, action="project.create", project_id=project.id, target=project.id,
+                detail={"name": project.name, "owner": owner_id, "via": "cli"},
+            )
             session.commit()
             print(f"project_id: {project.id}")
             print(f"api_key: {key}")
             print("Store this key now; it will not be shown again.", file=sys.stderr)
+        elif args.command == "add-member":
+            if session.get(Project, args.project_id) is None:
+                _fail("project not found")
+            user = users.get_user_by_email(session, args.email)
+            if user is None:
+                _fail("user not found")
+            exists = session.query(Membership).filter_by(user_id=user.id, project_id=args.project_id).first()
+            if exists is not None:
+                _fail("user is already a member")
+            session.add(Membership(user_id=user.id, project_id=args.project_id, role=args.role))
+            audit.record(
+                session, action="member.add", project_id=args.project_id, target=user.id,
+                detail={"role": args.role, "via": "cli"},
+            )
+            session.commit()
+            print(f"member: {user.id} {args.role}")
         elif args.command == "create-key":
             if session.get(Project, args.project_id) is None:
                 print("error: project not found", file=sys.stderr)

@@ -2,6 +2,13 @@
 
 Servidor da MATRIX (FastAPI + SQLAlchemy). Comandos: `matrix-api`, `matrix-worker`, `matrix-admin`.
 
+> **⚠️ A web ainda não tem login.** Ela usa uma única `MATRIX_API_KEY`, e quem alcança a porta da
+> web (3000) tem leitura e escrita completas no projeto dessa chave. O `deploy/compose.yaml` publica
+> as portas só em `127.0.0.1` por isso. Até o login do G0 entrar, acesse por túnel SSH ou por um
+> proxy reverso **com autenticação** e TLS; não exponha a web fora de rede privada. Passo a passo de
+> bootstrap (`matrix-admin create-project`, `MATRIX_API_KEY` da web) e a tabela completa das
+> variáveis `MATRIX_*`: [README da raiz, seção Execução](../README.md#execução).
+
 ## Banco de dados
 
 - Os metadados (projetos, chaves, prompts, datasets, experimentos, anotações, regras, alertas e a
@@ -46,7 +53,14 @@ com lease vencido são retomados. A entrega é pelo menos uma vez: handlers deve
 (handler em `workers/handlers.py`, lógica em `evals/runner.py`). O worker roda cada item × variante:
 renderiza o prompt (`{{var}}` vem de `item.input`; variável ausente vira texto vazio e fica anotada em
 `error`; template sem variáveis recebe o input do item como mensagem do usuário), chama o provider e
-avalia as métricas. Erro de provider fica na célula (`error`, métricas n/a) e não derruba o experimento.
+avalia as métricas. Erro de provider fica na célula (`error`, métricas n/a) e não derruba o experimento,
+mas é contado: `summary._meta` traz `cells_total`, `cells_failed`, `partial` (alguma célula falhou)
+e `judge` (`heuristic` ou `llm`). Se **todas** as células falharem, o experimento termina `failed`
+com `error` = `all N cells failed: <primeiro motivo>` (o job termina com sucesso, sem novas
+tentativas). Nas regressões, uma célula com erro cuja baseline tinha resultado vira regressão com
+`errored: true`. Métricas de juiz (`faithfulness`, `answer_relevancy`, `context_precision`,
+`g_eval`) gravam `details.judge` em cada célula; nas avaliações online, o score do juiz heurístico
+sai com `label: "heuristic"` e o comentário prefixado com `[heuristic judge]`.
 Resultados são gravados com upsert por (experimento, item, variante), então um job repetido é
 idempotente; um experimento `done` é ignorado. Erros sistêmicos ficam no experimento (mensagem
 sanitizada) e o job é reagendado; na última tentativa o status vira `failed`. As regressões contra a
@@ -61,7 +75,7 @@ Variáveis de ambiente (chaves de API só por ambiente, nunca persistidas):
 
 | Variável | Padrão | Efeito |
 |---|---|---|
-| `MATRIX_JUDGE_PROVIDER` | `fake` | `fake`: juiz heurístico + embedder por hashing, offline. Outro valor (`openai`, `anthropic`): `LLMJudge` nesse provider |
+| `MATRIX_JUDGE_PROVIDER` | `fake` | `fake`: juiz heurístico + embedder por hashing, offline, **só para teste/demo**; sem a variável o worker loga um aviso (uma vez por processo). Outro valor (`openai`, `anthropic`): `LLMJudge` nesse provider |
 | `MATRIX_JUDGE_MODEL` | — | Obrigatória quando o provider do juiz não é `fake` |
 | `MATRIX_EMBEDDING_MODEL` | `text-embedding-3-small` | Embedder `OpenAIEmbedder` quando o juiz é `openai` (com `anthropic`, usa o embedder por hashing) |
 | `MATRIX_OPENAI_BASE_URL` | API da OpenAI | URL compatível (vLLM, Ollama) para o provider `openai` em variantes, juiz e embedder, tanto nos experimentos quanto nas avaliações online; definida pelo operador, nunca pela API |
