@@ -22,6 +22,7 @@ from .prompts import Prompt
 DEFAULT_ENDPOINT = "http://localhost:8000"
 
 log = logging.getLogger("matrix_sdk")
+_default_client: MatrixClient | None = None  # set by init(set_global=True); used by start_run()
 _clock = time.monotonic  # monkeypatched in tests
 
 
@@ -177,6 +178,13 @@ class MatrixClient:
             body["metadata"] = metadata
         return self._request("POST", f"/api/v1/datasets/{_seg(dataset_id)}/items", json=body)
 
+    # -- training runs
+    def start_run(self, *args: Any, **kwargs: Any):
+        """Same as `matrix_sdk.start_run(...)`, bound to this client."""
+        from .tracking import start_run
+
+        return start_run(*args, client=self, **kwargs)
+
     @staticmethod
     def current_trace_id() -> str | None:
         return tracing.current_trace_id()
@@ -215,6 +223,10 @@ def init(
     if set_global and owns:
         trace.set_tracer_provider(provider)
     tracing._set_provider(provider)  # helpers and instrumentations share one provider
-    return MatrixClient(
+    client = MatrixClient(
         key, base, project_name, tracer_provider=provider, owns_provider=owns, span_processors=processors
     )
+    if set_global:
+        global _default_client
+        _default_client = client
+    return client
