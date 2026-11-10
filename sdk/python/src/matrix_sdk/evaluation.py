@@ -536,6 +536,6 @@ def evaluate_and_log(run: Run | None, model: Any, X_test: Any, y_test: Any, task
                     use_shap = False
             out["importance"] = log_feature_importance(r, model, X_test, y_test,
                                                        method="shap" if use_shap else "permutation")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - importance is optional, never break the evaluation
             warnings.warn(f"feature importance skipped: {exc}", UserWarning, stacklevel=2)
     return out
