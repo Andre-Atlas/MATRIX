@@ -15,6 +15,7 @@ from otlp_payloads import (
     export_request,
     full_request,
 )
+from rbac_helpers import owner_project
 from sqlalchemy import select, update
 
 from matrix_server import online_evals
@@ -57,9 +58,8 @@ def test_sampling_edges_and_stability():
 
 
 def _project(client, name):
-    resp = client.post("/api/v1/admin/projects", json={"name": name}, headers=ADMIN)
-    assert resp.status_code == 201
-    return {"Authorization": f"Bearer {resp.json()['api_key']}"}
+    # Owner session: rules, online evals and the production label are admin-only (G0 RBAC).
+    return owner_project(client, name, ADMIN)
 
 
 @pytest.fixture(params=["sqlite", "postgres"])

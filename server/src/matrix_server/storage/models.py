@@ -16,12 +16,16 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from matrix_server.storage.db import Base, new_id, utcnow
 
 # --- Projects and API keys -------------------------------------------------
+
+API_KEY_SCOPES = ("ingest", "read", "write")
+_ALL_SCOPES_SQL = text("'[\"ingest\", \"read\", \"write\"]'")
 
 
 class Project(Base):
@@ -46,6 +50,14 @@ class ApiKey(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # G0 (ADR-006): scopes are a subset of API_KEY_SCOPES; keys from before G0 get all three.
+    name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    scopes: Mapped[list[str]] = mapped_column(
+        JSON, nullable=False, default=lambda: list(API_KEY_SCOPES), server_default=_ALL_SCOPES_SQL
+    )
+    created_by: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
 
     project: Mapped[Project] = relationship(back_populates="api_keys")
 
@@ -343,5 +355,75 @@ class AuditLog(Base):
     detail: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
 
+# --- Users, memberships, web sessions (G0, ADR-006) ---------------------------
+
+
+class User(Base):
+    """Person who logs in to the web UI. `email` is stored lower-cased and unique."""
+
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    email: Mapped[str] = mapped_column(String(320), unique=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False, default="")
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    password_changed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class Membership(Base):
+    """Role of a user in a project: viewer | member | admin | owner (see `auth.Role`)."""
+
+    __tablename__ = "memberships"
+    __table_args__ = (UniqueConstraint("user_id", "project_id", name="uq_memberships_user_project"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    project_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class WebSession(Base):
+    """Opaque server-side session. `id` is the SHA-256 (hex) of the `mxs_` token; the token itself
+    is never stored. Valid while not revoked, before `expires_at` (absolute) and while
+    `last_seen_at` is within the idle TTL."""
+
+    __tablename__ = "web_sessions"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class LoginAttempt(Base):
+    """Failed-login throttle per (e-mail, IP). `key` is a SHA-256 of both, so the table holds no
+    e-mail and unknown e-mails are throttled exactly like known ones. `lock_count` escalates the
+    lock duration and resets on a successful login."""
+
+    __tablename__ = "login_attempts"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lock_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
 # --- Model modules registered here (one import per module, appended by each task) ------------
 # Keeps Base.metadata complete for Alembic and create_all without every task editing this file.
+import matrix_server.runs.models  # noqa: E402, F401
+import matrix_server.artifacts.models
+import matrix_server.egress.models  # noqa: F401

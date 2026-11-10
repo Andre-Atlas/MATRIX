@@ -12,13 +12,22 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from matrix_server import prompts as helpers
-from matrix_server.auth import current_project_id
+from matrix_server.auth import Principal, Role, ensure_role, project_of, require
 from matrix_server.domain.spans import UtcDatetime
 from matrix_server.storage.db import as_utc, get_db, utcnow
 from matrix_server.storage.models import PromptLabel, PromptVersion
 
 DbSession = Annotated[Session, Depends(get_db)]
-ProjectId = Annotated[str, Depends(current_project_id)]
+ProjectId = Annotated[str, Depends(project_of(Role.VIEWER))]  # reads
+Member = Annotated[Principal, Depends(require(Role.MEMBER))]
+
+# Moving this label changes what production serves: admin only (contract G0 section 1).
+PRODUCTION_LABEL = "production"
+
+
+def _check_label_rights(principal: Principal, labels: list[str]) -> None:
+    if PRODUCTION_LABEL in labels:
+        ensure_role(principal, Role.ADMIN)
 
 MAX_CREATE_ATTEMPTS = 3
 
@@ -165,7 +174,9 @@ def list_prompts(db: DbSession, project_id: ProjectId) -> PromptList:
 
 
 @router.post("/prompts", response_model=PromptVersionOut, status_code=201)
-def create_prompt(body: PromptCreate, db: DbSession, project_id: ProjectId) -> PromptVersionOut:
+def create_prompt(body: PromptCreate, db: DbSession, principal: Member) -> PromptVersionOut:
+    _check_label_rights(principal, body.labels)
+    project_id = principal.project_id
     for attempt in range(MAX_CREATE_ATTEMPTS):
         try:
             with db.begin_nested():  # savepoint: a unique violation only discards this attempt
@@ -224,7 +235,9 @@ def list_versions(name: str, db: DbSession, project_id: ProjectId) -> VersionLis
 
 
 @router.post("/prompts/{name:path}/labels", response_model=PromptVersionOut)
-def move_label(name: str, body: LabelMove, db: DbSession, project_id: ProjectId) -> PromptVersionOut:
+def move_label(name: str, body: LabelMove, db: DbSession, principal: Member) -> PromptVersionOut:
+    _check_label_rights(principal, [body.label])
+    project_id = principal.project_id
     row = _get_version(db, project_id, name, body.version)
     if row is None:
         raise _not_found("prompt version")

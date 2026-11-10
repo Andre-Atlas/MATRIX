@@ -17,7 +17,7 @@ from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session
 
 from matrix_server.api import query
-from matrix_server.auth import current_project_id
+from matrix_server.auth import Role, project_of
 from matrix_server.rules import item_from_trace, root_of_trace
 from matrix_server.storage.annotations import complete_annotation, open_annotation
 from matrix_server.storage.db import as_utc, utcnow
@@ -25,7 +25,8 @@ from matrix_server.storage.models import Alert, Annotation, Dataset, DatasetItem
 
 logger = logging.getLogger(__name__)
 
-ProjectId = Annotated[str, Depends(current_project_id)]
+ProjectId = Annotated[str, Depends(project_of(Role.VIEWER))]  # reads
+MemberProjectId = Annotated[str, Depends(project_of(Role.MEMBER))]  # writes
 router = APIRouter(prefix="/api/v1", tags=["annotations"])
 
 _EXPORT_BATCH = 500
@@ -146,7 +147,7 @@ def list_annotations(
 @router.post("/annotations")
 def create_annotation(
     request: Request,
-    project_id: ProjectId,
+    project_id: MemberProjectId,
     payload: Annotated[dict[str, Any], Body()],
 ) -> Any:
     body = _parse(AnnotationCreate, payload)
@@ -216,7 +217,7 @@ def _lock_pending(db: Session, project_id: str, annotation_id: str) -> Annotatio
 def complete(
     annotation_id: str,
     request: Request,
-    project_id: ProjectId,
+    project_id: MemberProjectId,
     payload: Annotated[dict[str, Any], Body()],
 ) -> dict[str, Any]:
     body = _parse(AnnotationComplete, payload)

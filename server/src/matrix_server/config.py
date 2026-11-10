@@ -21,6 +21,32 @@ class Settings(BaseSettings):
     # into each span): max_normalized_factor x max_body_bytes, else 413.
     max_normalized_factor: int = 4
 
+    # Training runs (contract G1): caps on accepted metric point writes per run and per key.
+    max_points_per_run: int = 50_000_000
+    max_points_per_key: int = 10_000_000
+
+    # Users and web sessions (ADR-006, contract G0 section 1).
+    session_idle_ttl_seconds: int = 7 * 24 * 3600
+    session_absolute_ttl_seconds: int = 30 * 24 * 3600
+    # Whether any logged-in user may create projects (POST /api/v1/projects).
+    allow_project_creation: bool = True
+
+    # Artifact store (ADR-007, contract G0 section 2). Raw upload routes are exempt from the JSON
+    # body limit and bounded by max_artifact_bytes instead (limits.py).
+    artifact_backend: Literal["local", "s3"] = "local"
+    artifact_local_dir: str = "./artifacts"
+    s3_endpoint: str | None = None
+    s3_public_endpoint: str | None = None
+    s3_bucket: str = "matrix-artifacts"
+    s3_region: str = "us-east-1"
+    s3_access_key: str | None = None
+    s3_secret_key: str | None = None
+    s3_auto_create_bucket: bool = False
+    max_artifact_bytes: int = 5 * 1024**3
+    project_quota_bytes: int = 50 * 1024**3
+    verify_hash_max_bytes: int = 256 * 1024**2
+    artifact_url_ttl_seconds: int = 3600
+
 
 @lru_cache
 def get_settings() -> Settings:

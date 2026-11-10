@@ -15,13 +15,14 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from matrix_server.auth import current_project_id
+from matrix_server.auth import Role, project_of
 from matrix_server.domain.spans import Span, SpanKind
 from matrix_server.storage.db import as_utc, get_db
 from matrix_server.storage.models import Dataset, DatasetItem
 
 DbSession = Annotated[Session, Depends(get_db)]
-ProjectId = Annotated[str, Depends(current_project_id)]
+ProjectId = Annotated[str, Depends(project_of(Role.VIEWER))]  # reads
+MemberProjectId = Annotated[str, Depends(project_of(Role.MEMBER))]  # writes
 
 router = APIRouter(prefix="/api/v1", tags=["datasets"])
 
@@ -105,7 +106,7 @@ def get_dataset_or_404(db: Session, project_id: str, dataset_id: str) -> Dataset
 
 @router.post("/datasets", status_code=201)
 def create_dataset(
-    db: DbSession, project_id: ProjectId, payload: Annotated[dict[str, Any], Body()]
+    db: DbSession, project_id: MemberProjectId, payload: Annotated[dict[str, Any], Body()]
 ) -> dict[str, Any]:
     body = parse_body(DatasetCreate, payload)
     name = body.name.strip()
@@ -192,7 +193,7 @@ def get_dataset(
 
 @router.post("/datasets/{dataset_id}/items", status_code=201)
 def add_item(
-    dataset_id: str, db: DbSession, project_id: ProjectId, payload: Annotated[dict[str, Any], Body()]
+    dataset_id: str, db: DbSession, project_id: MemberProjectId, payload: Annotated[dict[str, Any], Body()]
 ) -> dict[str, Any]:
     ds = get_dataset_or_404(db, project_id, dataset_id)
     body = parse_body(ItemCreate, payload)
@@ -267,7 +268,7 @@ def add_item_from_span(
     dataset_id: str,
     request: Request,
     db: DbSession,
-    project_id: ProjectId,
+    project_id: MemberProjectId,
     payload: Annotated[dict[str, Any], Body()],
 ) -> dict[str, Any]:
     ds = get_dataset_or_404(db, project_id, dataset_id)
@@ -298,7 +299,7 @@ def add_item_from_span(
 
 
 @router.delete("/datasets/{dataset_id}/items/{item_id}", status_code=204)
-def delete_item(dataset_id: str, item_id: str, db: DbSession, project_id: ProjectId) -> Response:
+def delete_item(dataset_id: str, item_id: str, db: DbSession, project_id: MemberProjectId) -> Response:
     ds = get_dataset_or_404(db, project_id, dataset_id)
     item = db.scalars(
         select(DatasetItem).where(

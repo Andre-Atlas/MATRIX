@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from matrix_server.evals.runner import ExperimentConfigError, run_experiment
+from matrix_server.projects import PURGE_SPANS_JOB
 from matrix_server.storage import jobs
 from matrix_server.storage.db import utcnow
 from matrix_server.storage.models import Experiment, Job
@@ -102,3 +103,11 @@ def settle_failed_experiment(session_factory: sessionmaker[Session], job: Job) -
         elif not exp.error:
             exp.error = "internal error: job failed"
         exp.finished_at = utcnow()
+
+
+@register(PURGE_SPANS_JOB)
+def purge_project_spans(session: Session, job: Job) -> None:
+    """Spans of a deleted project (`DELETE /api/v1/projects/{id}`); relational rows are already gone."""
+    from matrix_server.workers.online_handlers import get_span_store
+
+    get_span_store().delete_project(job.project_id)

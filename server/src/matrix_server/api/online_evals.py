@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from matrix_server.auth import current_project_id
+from matrix_server.auth import Role, project_of
 from matrix_server.domain.spans import SpanKind
 from matrix_server.evals import build_metric, get_provider
 from matrix_server.online_evals import invalidate_cache
@@ -22,7 +22,8 @@ from matrix_server.storage.db import as_utc, get_db
 from matrix_server.storage.models import OnlineEval
 
 DbSession = Annotated[Session, Depends(get_db)]
-ProjectId = Annotated[str, Depends(current_project_id)]
+ProjectId = Annotated[str, Depends(project_of(Role.VIEWER))]  # reads
+AdminProjectId = Annotated[str, Depends(project_of(Role.ADMIN))]  # configuration (sessions only)
 
 router = APIRouter(prefix="/api/v1", tags=["online-evals"])
 
@@ -93,7 +94,7 @@ def _out(ev: OnlineEval) -> dict[str, Any]:
 
 @router.post("/online-evals", status_code=201)
 def create_online_eval(
-    db: DbSession, project_id: ProjectId, payload: Annotated[Any, Body()] = None
+    db: DbSession, project_id: AdminProjectId, payload: Annotated[Any, Body()] = None
 ) -> dict[str, Any]:
     body = _parse(payload)
     duplicate = db.scalars(
@@ -130,7 +131,7 @@ def list_online_evals(db: DbSession, project_id: ProjectId) -> dict[str, Any]:
 
 
 @router.delete("/online-evals/{online_eval_id}", status_code=204)
-def delete_online_eval(online_eval_id: str, db: DbSession, project_id: ProjectId) -> Response:
+def delete_online_eval(online_eval_id: str, db: DbSession, project_id: AdminProjectId) -> Response:
     ev = db.scalars(
         select(OnlineEval).where(OnlineEval.id == online_eval_id, OnlineEval.project_id == project_id)
     ).first()

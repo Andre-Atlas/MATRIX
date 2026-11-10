@@ -9,11 +9,16 @@ undeclared body is counted as it streams and refused once it crosses the limit. 
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from starlette.exceptions import HTTPException
 
 JSON_API_PREFIX = "/api/v1/"
+# Raw artifact uploads (contract G0 section 2): streamed, so exempt from the JSON limit and bounded by
+# `raw_upload_limit` (settings.max_artifact_bytes); the route also enforces it while reading.
+RAW_UPLOAD_ROUTES = (("POST", re.compile(r"^/api/v1/artifacts/?$")),
+                     ("PUT", re.compile(r"^/api/v1/artifacts/[A-Za-z0-9_-]{1,64}/content$")))
 
 
 class BodyTooLarge(HTTPException):
@@ -25,12 +30,19 @@ class BodyTooLarge(HTTPException):
 
 
 class BodyLimitMiddleware:
-    def __init__(self, app: Any, max_body_bytes: int, max_json_body_bytes: int) -> None:
+    def __init__(
+        self, app: Any, max_body_bytes: int, max_json_body_bytes: int, raw_upload_limit: int | None = None
+    ) -> None:
         self.app = app
         self.max_body_bytes = max_body_bytes
         self.max_json_body_bytes = max_json_body_bytes
+        self.raw_upload_limit = raw_upload_limit
 
-    def _limit(self, path: str) -> int:
+    def _limit(self, path: str, method: str = "") -> int:
+        if self.raw_upload_limit is not None and any(
+            method == m and rx.match(path) for m, rx in RAW_UPLOAD_ROUTES
+        ):
+            return self.raw_upload_limit
         if path.startswith(JSON_API_PREFIX) or path == JSON_API_PREFIX.rstrip("/"):
             return min(self.max_json_body_bytes, self.max_body_bytes)
         return self.max_body_bytes
@@ -39,7 +51,7 @@ class BodyLimitMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        limit = self._limit(scope.get("path", ""))
+        limit = self._limit(scope.get("path", ""), scope.get("method", ""))
         for name, value in scope.get("headers", []):
             if name == b"content-length":
                 try:

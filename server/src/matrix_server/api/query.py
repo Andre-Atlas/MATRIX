@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from matrix_server.auth import current_project_id
+from matrix_server.auth import Role, project_of
 from matrix_server.domain.spans import SessionSummary, Span, TraceSummary, UtcDatetime
 from matrix_server.storage.db import as_utc
 from matrix_server.storage.models import Score
@@ -137,7 +137,7 @@ def _to_out(score: Score) -> ScoreOut:
 @router.get("/traces", response_model=TracePage)
 def list_traces(
     request: Request,
-    project_id: str = Depends(current_project_id),
+    project_id: str = Depends(project_of(Role.VIEWER)),
     session_id: str | None = None,
     user_id: str | None = None,
     name: str | None = None,
@@ -168,7 +168,7 @@ def list_traces(
 
 
 @router.get("/traces/{trace_id}", response_model=TraceDetail)
-def get_trace(request: Request, trace_id: str, project_id: str = Depends(current_project_id)) -> TraceDetail:
+def get_trace(request: Request, trace_id: str, project_id: str = Depends(project_of(Role.VIEWER))) -> TraceDetail:
     found = _span_store(request).get_trace(project_id, trace_id)
     if found is None:
         raise HTTPException(status_code=404, detail="trace not found")
@@ -180,7 +180,7 @@ def get_trace(request: Request, trace_id: str, project_id: str = Depends(current
 @router.get("/sessions", response_model=SessionPage)
 def list_sessions(
     request: Request,
-    project_id: str = Depends(current_project_id),
+    project_id: str = Depends(project_of(Role.VIEWER)),
     limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = 50,
     cursor: str | None = None,
 ) -> SessionPage:
@@ -195,7 +195,7 @@ def list_sessions(
 def get_session(
     request: Request,
     session_id: str,
-    project_id: str = Depends(current_project_id),
+    project_id: str = Depends(project_of(Role.VIEWER)),
     limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = 50,
     cursor: str | None = None,
 ) -> SessionDetail:
@@ -212,7 +212,7 @@ def get_session(
 
 @router.get("/stats/overview")
 def stats_overview(
-    request: Request, project_id: str = Depends(current_project_id), since: str | None = None
+    request: Request, project_id: str = Depends(project_of(Role.VIEWER)), since: str | None = None
 ) -> dict[str, Any]:
     return _span_store(request).overview(project_id, parse_since(since))
 
@@ -240,7 +240,7 @@ def run_score_hooks(session: Session, project_id: str, score: Score) -> None:
 def create_score(
     request: Request,
     payload: Annotated[dict[str, Any], Body()],
-    project_id: str = Depends(current_project_id),
+    project_id: str = Depends(project_of(Role.MEMBER)),
 ) -> ScoreOut:
     # Validated by hand: FastAPI's 422 body would echo a NaN/Infinity input and fail to serialize.
     try:
@@ -272,7 +272,7 @@ def create_score(
 
 @router.get("/traces/{trace_id}/scores", response_model=list[ScoreOut])
 def list_scores(
-    request: Request, trace_id: str, project_id: str = Depends(current_project_id)
+    request: Request, trace_id: str, project_id: str = Depends(project_of(Role.VIEWER))
 ) -> list[ScoreOut]:
     session: Session = request.app.state.session_factory()
     try:
