@@ -34,6 +34,9 @@ services:
   minio:
     image: minio/minio
     command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
     ports:
       - "9000:9000"
       - "9001:9001"
@@ -48,6 +51,11 @@ services:
       MATRIX_SPAN_STORE: clickhouse
       MATRIX_CLICKHOUSE_URL: http://clickhouse:8123
       MATRIX_ADMIN_TOKEN: ${MATRIX_ADMIN_TOKEN:-}
+      MATRIX_ARTIFACT_STORE: s3
+      MATRIX_S3_ENDPOINT: http://minio:9000
+      MATRIX_S3_BUCKET: matrix-artifacts
+      MATRIX_S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MATRIX_S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
     ports:
       - "8000:8000"
     healthcheck:
@@ -60,6 +68,8 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      minio:
+        condition: service_started
 
   worker:
     build: ../server

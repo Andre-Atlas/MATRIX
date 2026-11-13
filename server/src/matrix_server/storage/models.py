@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     DateTime,
     Float,
@@ -384,4 +385,208 @@ class SafetyScan(Base):
     categories_summary: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     findings: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+# --- MLOps Studio (Training, Sweeps, Artifacts, Lineage & Model Registry) ----
+
+
+class MLOpsSweep(Base):
+    """Hyperparameter sweep configuration and status.
+
+    `best_run_id` intentionally has no FK to `mlops_training_runs` to avoid a circular FK
+    with `TrainingRun.sweep_id` and keep Alembic downgrades cleanly reversible.
+    """
+
+    __tablename__ = "mlops_sweeps"
+    __table_args__ = (Index("ix_mlops_sweeps_project_status", "project_id", "status"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    method: Mapped[str] = mapped_column(String(32), nullable=False, default="random")
+    metric_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    metric_goal: Mapped[str] = mapped_column(String(16), nullable=False, default="minimize")
+    search_space: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    early_stopping: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    max_trials: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
+    best_run_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    best_metric_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class TrainingRun(Base):
+    """Training / fine-tuning / classic ML run metadata."""
+
+    __tablename__ = "mlops_training_runs"
+    __table_args__ = (
+        Index("ix_mlops_training_runs_project_status", "project_id", "status"),
+        Index("ix_mlops_training_runs_project_created", "project_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    run_type: Mapped[str] = mapped_column(String(32), nullable=False, default="sft")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
+    base_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    dataset_id: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("datasets.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    sweep_id: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("mlops_sweeps.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    parent_run_id: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("mlops_training_runs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    hyperparams: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    summary_metrics: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    hardware_info: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    classic_eval: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    tags: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    total_steps: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class Artifact(Base):
+    """Versioned binary artifact (checkpoint, LoRA adapter, dataset, model) backed by S3/LocalFS/external."""
+
+    __tablename__ = "mlops_artifacts"
+    __table_args__ = (
+        UniqueConstraint("project_id", "name", "version", name="uq_mlops_artifacts_name_version"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    run_id: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("mlops_training_runs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, default="checkpoint")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    storage_backend: Mapped[str] = mapped_column(String(16), nullable=False, default="local")
+    storage_uri: Mapped[str] = mapped_column(String(1000), nullable=False)
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    content_type: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending_upload")
+    metadata_: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    committed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ArtifactLineage(Base):
+    """Directed acyclic graph edge connecting datasets, runs, artifacts, model versions, and evals."""
+
+    __tablename__ = "mlops_artifact_lineage"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "source_type",
+            "source_id",
+            "target_type",
+            "target_id",
+            "relation",
+            name="uq_mlops_lineage_edge",
+        ),
+        Index("ix_mlops_lineage_source", "project_id", "source_type", "source_id"),
+        Index("ix_mlops_lineage_target", "project_id", "target_type", "target_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    target_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    relation: Mapped[str] = mapped_column(String(32), nullable=False)
+    metadata_: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class RegisteredModel(Base):
+    """Logical model entry in the Model & LoRA Registry."""
+
+    __tablename__ = "mlops_registered_models"
+    __table_args__ = (UniqueConstraint("project_id", "name", name="uq_mlops_registered_models_name"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    model_type: Mapped[str] = mapped_column(String(32), nullable=False, default="llm")
+    base_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    tags: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    versions: Mapped[list[ModelVersion]] = relationship(
+        back_populates="model", cascade="all, delete-orphan", passive_deletes=True
+    )
+    aliases: Mapped[list[ModelAlias]] = relationship(
+        back_populates="model", cascade="all, delete-orphan", passive_deletes=True
+    )
+
+
+class ModelVersion(Base):
+    """Immutable registered version of a model or LoRA adapter."""
+
+    __tablename__ = "mlops_model_versions"
+    __table_args__ = (UniqueConstraint("model_id", "version", name="uq_mlops_model_versions_model_version"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    model_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("mlops_registered_models.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    artifact_id: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("mlops_artifacts.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    run_id: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("mlops_training_runs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    eval_experiment_id: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("experiments.id", ondelete="SET NULL"), nullable=True
+    )
+    safety_scan_id: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("safety_scans.id", ondelete="SET NULL"), nullable=True
+    )
+    stage: Mapped[str] = mapped_column(String(16), nullable=False, default="none")
+    lora_config: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    signature: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    metrics_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    model_card: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    model: Mapped[RegisteredModel] = relationship(back_populates="versions")
+
+
+class ModelAlias(Base):
+    """Mutable pointer `alias -> version` for a registered model (e.g. champion, challenger)."""
+
+    __tablename__ = "mlops_model_aliases"
+    __table_args__ = (UniqueConstraint("model_id", "alias", name="uq_mlops_model_aliases_model_alias"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    model_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("mlops_registered_models.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    alias: Mapped[str] = mapped_column(String(100), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    model: Mapped[RegisteredModel] = relationship(back_populates="aliases")
+
 
