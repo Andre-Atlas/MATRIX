@@ -1,4 +1,5 @@
 from .client import MatrixClient, MatrixError, init
+from .mlops import MatrixTrainerCallback, MLOpsClient, SweepExhausted, TrainingRun
 from .prompts import Prompt
 from .tracing import (
     SpanHelper,
@@ -14,6 +15,7 @@ from .tracing import (
 __version__ = "0.1.0"
 
 __all__ = [
-    "MatrixClient", "MatrixError", "Prompt", "SpanHelper", "current_trace_id", "init", "session",
+    "MLOpsClient", "MatrixClient", "MatrixError", "MatrixTrainerCallback", "Prompt",
+    "SpanHelper", "SweepExhausted", "TrainingRun", "current_trace_id", "init", "session",
     "trace_agent", "trace_chain", "trace_llm", "trace_retriever", "trace_tool",
 ]

@@ -6,7 +6,7 @@ import logging
 import os
 import threading
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
 import httpx
@@ -18,6 +18,9 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcess
 
 from . import tracing
 from .prompts import Prompt
+
+if TYPE_CHECKING:
+    from .mlops import MLOpsClient, TrainingRun
 
 DEFAULT_ENDPOINT = "http://localhost:8000"
 
@@ -72,6 +75,7 @@ class MatrixClient:
         self._refreshing: set[tuple] = set()
         self._threads: list[threading.Thread] = []
         self._lock = threading.Lock()
+        self._mlops: MLOpsClient | None = None
 
     # -- lifecycle
     def shutdown(self) -> None:
@@ -184,6 +188,23 @@ class MatrixClient:
         if metadata is not None:
             body["metadata"] = metadata
         return self._request("POST", f"/api/v1/datasets/{_seg(dataset_id)}/items", json=body)
+
+    # -- mlops
+    @property
+    def mlops(self) -> MLOpsClient:
+        if self._mlops is None:
+            with self._lock:
+                if self._mlops is None:
+                    from .mlops import MLOpsClient
+
+                    self._mlops = MLOpsClient(self)
+        return self._mlops
+
+    def start_run(self, name: str, **kwargs: Any) -> TrainingRun:
+        return self.mlops.start_run(name, **kwargs)
+
+    def register_model(self, name: str, **kwargs: Any) -> dict[str, Any]:
+        return self.mlops.register_model(name, **kwargs)
 
     @staticmethod
     def current_trace_id() -> str | None:
