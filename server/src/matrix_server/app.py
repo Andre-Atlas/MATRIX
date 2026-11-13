@@ -8,6 +8,7 @@ from matrix_server.api import (
     experiments,
     gateway,
     ingest,
+    mlops,
     online_evals,
     prompts,
     query,
@@ -19,6 +20,8 @@ from matrix_server.config import Settings, get_settings
 from matrix_server.gateway.router import GatewayRouter
 from matrix_server.hooks import install_api_hooks
 from matrix_server.limits import BodyLimitMiddleware
+from matrix_server.mlops.artifact_store import build_artifact_store
+from matrix_server.mlops.metrics_store import build_training_metric_store
 from matrix_server.storage.db import init_db, make_engine, make_session_factory
 from matrix_server.storage.spans import build_span_store
 
@@ -31,6 +34,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         BodyLimitMiddleware,
         max_body_bytes=settings.max_body_bytes,
         max_json_body_bytes=settings.max_json_body_bytes,
+        max_artifact_bytes=settings.max_artifact_bytes,
     )
 
     engine = make_engine(settings.database_url)
@@ -38,6 +42,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.db_engine = engine
     app.state.session_factory = make_session_factory(engine)
     app.state.span_store = build_span_store(settings)
+    app.state.training_metric_store = build_training_metric_store(settings)
+    app.state.artifact_store = build_artifact_store(settings)
     app.state.gateway_router = GatewayRouter()
 
     install_api_hooks(app.state.session_factory, app.state.span_store)
@@ -60,6 +66,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         online_evals,
         vectors,
         gateway,
+        mlops,
     ):
         app.include_router(module.router)
     return app

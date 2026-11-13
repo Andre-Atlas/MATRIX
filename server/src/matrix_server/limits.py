@@ -14,6 +14,7 @@ from typing import Any
 from starlette.exceptions import HTTPException
 
 JSON_API_PREFIX = "/api/v1/"
+LOCAL_ARTIFACT_UPLOAD_PREFIX = "/api/v1/mlops/artifacts/local/"
 
 
 class BodyTooLarge(HTTPException):
@@ -25,12 +26,23 @@ class BodyTooLarge(HTTPException):
 
 
 class BodyLimitMiddleware:
-    def __init__(self, app: Any, max_body_bytes: int, max_json_body_bytes: int) -> None:
+    def __init__(
+        self,
+        app: Any,
+        max_body_bytes: int,
+        max_json_body_bytes: int,
+        max_artifact_bytes: int | None = None,
+    ) -> None:
         self.app = app
         self.max_body_bytes = max_body_bytes
         self.max_json_body_bytes = max_json_body_bytes
+        self.max_artifact_bytes = max_artifact_bytes
 
-    def _limit(self, path: str) -> int:
+    def _limit(self, path: str, method: str = "") -> int:
+        if method == "PUT" and path.startswith(LOCAL_ARTIFACT_UPLOAD_PREFIX):
+            if self.max_artifact_bytes is not None:
+                return self.max_artifact_bytes
+            return self.max_body_bytes
         if path.startswith(JSON_API_PREFIX) or path == JSON_API_PREFIX.rstrip("/"):
             return min(self.max_json_body_bytes, self.max_body_bytes)
         return self.max_body_bytes
@@ -39,7 +51,7 @@ class BodyLimitMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        limit = self._limit(scope.get("path", ""))
+        limit = self._limit(scope.get("path", ""), scope.get("method", ""))
         for name, value in scope.get("headers", []):
             if name == b"content-length":
                 try:
