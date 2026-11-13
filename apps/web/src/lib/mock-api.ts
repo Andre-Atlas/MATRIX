@@ -14,6 +14,7 @@ import {
   mockVectorProjection,
 } from "./mock-data";
 import { evalExportJsonl, evalGet, evalSend } from "./mock-evals";
+import { mlopsGet, mlopsSend } from "./mock-mlops";
 import { dpoExportJsonl, opsGet, opsSend } from "./mock-ops";
 import type {
   CreateSafetyScanRequest,
@@ -216,6 +217,9 @@ export async function mockGet<T>(path: string, params: Params = {}): Promise<T> 
   const opsResult = opsGet(p, params);
   if (opsResult !== undefined) return opsResult as T;
 
+  const mlopsResult = mlopsGet(p, params);
+  if (mlopsResult !== undefined) return mlopsResult as T;
+
   throw new ApiError(404, `mock: no handler for GET ${path}`);
 }
 
@@ -250,7 +254,7 @@ export async function mockSend<T>(method: string, path: string, body?: unknown):
     return createMockSafetyScan(body as CreateSafetyScanRequest) as T;
   }
 
-  const out = evalSend(m, p, body) ?? opsSend(m, p, body);
+  const out = evalSend(m, p, body) ?? opsSend(m, p, body) ?? mlopsSend(m, p, body);
   if (out === undefined) throw new ApiError(404, `mock: no handler for ${method} ${path}`);
   return out as T;
 }

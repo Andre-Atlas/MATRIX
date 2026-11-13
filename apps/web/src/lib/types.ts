@@ -783,3 +783,445 @@ export type GatewayRulesResponse = {
   total: number;
 };
 
+// ── MLOps Studio: Training Runs, Sweeps, Artifacts, Lineage & Model Registry ──
+
+export type TrainingRunType =
+  | "sft"
+  | "lora"
+  | "qlora"
+  | "dpo"
+  | "grpo"
+  | "ppo"
+  | "classic_ml"
+  | (string & {});
+
+export type TrainingRunStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "stopped"
+  | "stopped_early"
+  | "killed";
+
+export type HardwareInfo = {
+  gpu_name?: string;
+  gpu_count?: number;
+  gpu_memory_gb?: number;
+  cuda_version?: string;
+  cpu_count?: number;
+  ram_gb?: number;
+  [key: string]: unknown;
+};
+
+export type RocPoint = {
+  fpr: number;
+  tpr: number;
+  threshold?: number;
+};
+
+export type ConfusionMatrixData = {
+  labels: string[];
+  matrix: number[][];
+};
+
+export type FeatureImportanceItem = {
+  feature: string;
+  importance: number;
+  direction?: "positive" | "negative";
+};
+
+export type ClassicMlEval = {
+  roc_auc?: number | null;
+  pr_auc?: number | null;
+  accuracy?: number | null;
+  f1?: number | null;
+  precision?: number | null;
+  recall?: number | null;
+  log_loss?: number | null;
+  roc_curve?: RocPoint[];
+  confusion_matrix?: ConfusionMatrixData;
+  feature_importance?: FeatureImportanceItem[];
+  [key: string]: unknown;
+};
+
+export type ArtifactRecord = {
+  id: string;
+  project_id?: string;
+  run_id: string | null;
+  name: string;
+  kind: string;
+  version: number;
+  storage_backend: string;
+  storage_uri: string;
+  sha256: string;
+  size_bytes: number;
+  content_type: string;
+  status: "pending_upload" | "committed" | (string & {});
+  metadata: Record<string, unknown>;
+  created_at: string;
+  committed_at: string | null;
+  deduplicated?: boolean;
+  upload_url?: string | null;
+};
+
+export type TrainingRun = {
+  id: string;
+  project_id?: string;
+  name: string;
+  run_type: TrainingRunType;
+  status: TrainingRunStatus;
+  base_model: string | null;
+  dataset_id: string | null;
+  sweep_id: string | null;
+  parent_run_id: string | null;
+  hyperparams: Record<string, unknown>;
+  summary_metrics: Record<string, number>;
+  latest_metrics: Record<string, number>;
+  hardware_info: HardwareInfo | null;
+  classic_eval: ClassicMlEval | null;
+  tags: string[];
+  total_steps: number | null;
+  error: string | null;
+  last_heartbeat_at: string | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  artifacts?: ArtifactRecord[];
+};
+
+export type TrainingMetricPoint = {
+  step: number;
+  value: number;
+  min?: number;
+  max?: number;
+  epoch?: number | null;
+  recorded_at?: string | null;
+};
+
+export type TrainingMetricSeries = {
+  run_id: string;
+  series: Record<string, TrainingMetricPoint[]>;
+};
+
+export type SweepMethod = "grid" | "random" | "bayes";
+export type SweepGoal = "minimize" | "maximize";
+export type SweepStatus = "running" | "completed" | "cancelled" | "stopped";
+
+export type SearchSpaceParam =
+  | {
+      type: "float" | "int";
+      min: number;
+      max: number;
+      step?: number;
+      log?: boolean;
+    }
+  | {
+      type: "categorical";
+      values: (string | number | boolean)[];
+    };
+
+export type EarlyStoppingConfig = {
+  strategy: "none" | "median" | "asha";
+  min_step?: number;
+  reduction_factor?: number;
+  min_resource?: number;
+  max_resource?: number;
+  [key: string]: unknown;
+};
+
+export type MLOpsSweep = {
+  id: string;
+  project_id?: string;
+  name: string;
+  description: string | null;
+  method: SweepMethod;
+  metric_name: string;
+  metric_goal: SweepGoal;
+  search_space: Record<string, SearchSpaceParam>;
+  early_stopping: EarlyStoppingConfig | null;
+  max_trials: number | null;
+  status: SweepStatus;
+  best_run_id: string | null;
+  best_metric_value: number | null;
+  created_at: string;
+  stopped_at: string | null;
+};
+
+export type SweepTrial = {
+  run_id: string;
+  run_name: string | null;
+  status: TrainingRunStatus | (string & {});
+  params: Record<string, unknown>;
+  metric_value: number | null;
+};
+
+export type ParallelAxis = {
+  name: string;
+  type: "categorical" | "int" | "float";
+  values?: (string | number | boolean)[];
+  min?: number;
+  max?: number;
+  log?: boolean;
+  goal?: SweepGoal;
+};
+
+export type ParamImportanceItem = {
+  name: string;
+  importance: number;
+  method: string;
+};
+
+export type SweepAnalysis = {
+  metric_name: string;
+  metric_goal: SweepGoal;
+  importance: ParamImportanceItem[];
+  parallel_coordinates: {
+    axes: ParallelAxis[];
+    trials: SweepTrial[];
+  };
+};
+
+export type SweepDetail = MLOpsSweep & {
+  trials: TrainingRun[];
+  analysis: SweepAnalysis;
+};
+
+export type LineageNodeType =
+  | "dataset"
+  | "run"
+  | "artifact"
+  | "model_version"
+  | "experiment"
+  | "safety_scan";
+
+export type LineageNode = {
+  id: string;
+  node_type: LineageNodeType | (string & {});
+  entity_id: string;
+  label: string;
+  metadata: Record<string, unknown>;
+};
+
+export type LineageEdge = {
+  id: string;
+  source: string;
+  target: string;
+  source_type: string;
+  source_id: string;
+  target_type: string;
+  target_id: string;
+  relation: string;
+  metadata: Record<string, unknown>;
+};
+
+export type LineageGraph = {
+  run_id?: string;
+  model_id?: string;
+  nodes: LineageNode[];
+  edges: LineageEdge[];
+};
+
+export type ModelStage = "none" | "staging" | "production" | "archived";
+export type ModelType = "llm" | "lora" | "classifier" | "regressor" | "embedding" | (string & {});
+
+export type ModelAlias = {
+  model_id: string;
+  alias: string;
+  version: number;
+};
+
+export type LoraConfig = {
+  r?: number;
+  lora_alpha?: number;
+  lora_dropout?: number;
+  target_modules?: string[];
+  bias?: string;
+  task_type?: string;
+  [key: string]: unknown;
+};
+
+export type ModelSignatureField = {
+  name: string;
+  dtype: string;
+  shape?: number[];
+};
+
+export type ModelSignature = {
+  inputs?: ModelSignatureField[];
+  outputs?: ModelSignatureField[];
+  [key: string]: unknown;
+};
+
+export type ModelVersion = {
+  id: string;
+  project_id?: string;
+  model_id: string;
+  version: number;
+  artifact_id: string | null;
+  run_id: string | null;
+  eval_experiment_id: string | null;
+  safety_scan_id: string | null;
+  stage: ModelStage;
+  lora_config: LoraConfig | null;
+  signature: ModelSignature | null;
+  metrics_snapshot: Record<string, number>;
+  model_card: string | null;
+  created_by: string | null;
+  created_at: string;
+};
+
+export type RegisteredModel = {
+  id: string;
+  project_id?: string;
+  name: string;
+  description: string | null;
+  model_type: ModelType;
+  base_model: string | null;
+  tags: string[];
+  created_at: string;
+  updated_at: string;
+  latest_version?: number | null;
+  aliases?: Record<string, number>;
+  stages?: Record<string, number[]>;
+  latest_metrics?: Record<string, number>;
+};
+
+export type RegisteredModelDetail = RegisteredModel & {
+  versions: ModelVersion[];
+  aliases: Record<string, number>;
+};
+
+// MLOps API requests & responses
+
+export type CreateTrainingRunRequest = {
+  name: string;
+  run_type?: TrainingRunType;
+  status?: TrainingRunStatus;
+  base_model?: string | null;
+  dataset_id?: string | null;
+  sweep_id?: string | null;
+  parent_run_id?: string | null;
+  hyperparams?: Record<string, unknown>;
+  hardware_info?: HardwareInfo | null;
+  classic_eval?: ClassicMlEval | null;
+  tags?: string[];
+};
+
+export type UpdateTrainingRunRequest = {
+  status?: TrainingRunStatus;
+  total_steps?: number;
+  hardware_info?: HardwareInfo | null;
+  classic_eval?: ClassicMlEval | null;
+  summary_metrics?: Record<string, number>;
+  error?: string | null;
+  finished_at?: string | null;
+};
+
+export type MetricPointInput = {
+  category?: string;
+  metric_name: string;
+  step: number;
+  epoch?: number | null;
+  value: number;
+  recorded_at?: string | null;
+};
+
+export type IngestMetricsRequest = {
+  points: MetricPointInput[];
+};
+
+export type IngestMetricsResponse = {
+  accepted: number;
+  should_stop: boolean;
+  stop_reason: string | null;
+};
+
+export type CreateSweepRequest = {
+  name: string;
+  description?: string | null;
+  method?: SweepMethod;
+  metric_name: string;
+  metric_goal?: SweepGoal;
+  search_space: Record<string, SearchSpaceParam>;
+  early_stopping?: EarlyStoppingConfig | null;
+  max_trials?: number | null;
+};
+
+export type SuggestNextTrialRequest = {
+  name?: string | null;
+  run_type?: TrainingRunType;
+  base_model?: string | null;
+  dataset_id?: string | null;
+  tags?: string[];
+};
+
+export type SuggestNextTrialResponse = {
+  sweep_id: string;
+  trial_index: number;
+  hyperparams: Record<string, unknown>;
+  run: TrainingRun;
+};
+
+export type PresignArtifactUploadRequest = {
+  name: string;
+  kind?: string;
+  sha256: string;
+  size_bytes: number;
+  content_type?: string;
+  run_id?: string | null;
+  external_uri?: string | null;
+  metadata?: Record<string, unknown>;
+};
+
+export type ArtifactDownloadUrlResponse = {
+  artifact_id: string;
+  download_url: string;
+  storage_backend: string;
+  sha256: string;
+  size_bytes: number;
+};
+
+export type CreateModelRequest = {
+  name: string;
+  description?: string | null;
+  model_type?: ModelType;
+  base_model?: string | null;
+  tags?: string[];
+};
+
+export type CreateModelVersionRequest = {
+  artifact_id?: string | null;
+  run_id?: string | null;
+  eval_experiment_id?: string | null;
+  safety_scan_id?: string | null;
+  stage?: ModelStage;
+  lora_config?: LoraConfig | null;
+  signature?: ModelSignature | null;
+  metrics_snapshot?: Record<string, number>;
+  model_card?: string | null;
+};
+
+export type UpdateModelStageRequest = {
+  stage: ModelStage;
+};
+
+export type SetModelAliasRequest = {
+  alias: string;
+  version: number;
+};
+
+export type EvaluateModelVersionRequest = {
+  dataset_id?: string | null;
+  name?: string | null;
+  metrics?: Record<string, unknown>[];
+};
+
+export type EvaluateModelVersionResponse = {
+  status: string;
+  job_id: string;
+  model_id: string;
+  version: number;
+};
+

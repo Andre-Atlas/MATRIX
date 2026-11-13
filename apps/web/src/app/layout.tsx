@@ -12,6 +12,8 @@ const NAV = [
   { href: "/prompts", label: "Prompts" },
   { href: "/datasets", label: "Datasets" },
   { href: "/experiments", label: "Experiments" },
+  { href: "/training", label: "Training" },
+  { href: "/models", label: "Models" },
   { href: "/vectors", label: "Vector Space" },
   { href: "/safety", label: "Safety & OWASP" },
   { href: "/gateway", label: "AI Gateway" },
