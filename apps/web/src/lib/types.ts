@@ -45,7 +45,52 @@ export type Document = {
   metadata: Record<string, unknown>;
 };
 
-export type Media = { kind: "image" | "audio" | "file"; url: string; mime: string | null };
+export type BoundingBox = {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  label?: string;
+  score?: number;
+};
+
+export type TextDiffHunk = {
+  old_start?: number;
+  old_lines?: number;
+  new_start?: number;
+  new_lines?: number;
+  lines?: string[];
+};
+
+export type TextDiffPayload = {
+  before?: string;
+  after?: string;
+  hunks?: TextDiffHunk[] | string[];
+};
+
+export type MediaKind =
+  | "image"
+  | "audio"
+  | "file"
+  | "pdf"
+  | "bbox"
+  | "mask"
+  | "text_diff";
+
+export type Media = {
+  kind: MediaKind;
+  url: string;
+  mime: string | null;
+  artifact_id?: string | null;
+  sha256?: string | null;
+  width?: number;
+  height?: number;
+  page?: number;
+  duration_ms?: number;
+  boxes?: BoundingBox[];
+  mask_uri?: string;
+  diff?: TextDiffPayload;
+};
 
 export type Span = {
   span_id: string;
@@ -151,6 +196,7 @@ export type DatasetItem = {
   metadata: Record<string, unknown>;
   source_trace_id: string | null;
   source_span_id: string | null;
+  media?: Media[];
   created_at: string;
 };
 
@@ -162,6 +208,7 @@ export type CreateDatasetItemRequest = {
   expected_output?: string | null;
   context?: string[];
   metadata?: Record<string, unknown>;
+  media?: Media[];
 };
 export type DatasetItemFromSpanRequest = { trace_id: string; span_id?: string };
 
@@ -1224,4 +1271,250 @@ export type EvaluateModelVersionResponse = {
   model_id: string;
   version: number;
 };
+
+// ── SOTA Completion (Benchmarks, Inspect AI Sandboxes, Zero-Copy Versioning) ─
+
+export type BenchmarkSuite = "lm_eval" | "vlmevalkit";
+
+export type BenchmarkEvalMode = "loglikelihood" | "generate_until" | "multimodal";
+
+export type BenchmarkTaskResult = {
+  id: string;
+  project_id: string;
+  benchmark_run_id: string;
+  task_name: string;
+  modality: "text" | "multimodal" | string;
+  eval_mode: BenchmarkEvalMode | string;
+  num_fewshot: number;
+  sample_count: number;
+  primary_metric: string;
+  primary_score: number;
+  metrics: Record<string, number>;
+  latency_ms_p50: number | null;
+  latency_ms_p95: number | null;
+  created_at: string;
+};
+
+export type BenchmarkRun = {
+  id: string;
+  project_id: string;
+  name: string;
+  suite: BenchmarkSuite;
+  tasks: string[];
+  runner_backend: "vllm" | "http" | "local_sim" | string;
+  runner_config: Record<string, unknown>;
+  eval_mode: BenchmarkEvalMode;
+  num_fewshot: number;
+  target_model: string;
+  model_version_id: string | null;
+  dataset_id: string | null;
+  dataset_commit_id: string | null;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  summary_metrics: Record<string, unknown>;
+  job_id: string | null;
+  error: string | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  task_results?: BenchmarkTaskResult[];
+};
+
+export type BenchmarkCatalogTask = {
+  name: string;
+  suite: BenchmarkSuite;
+  modality: "text" | "multimodal" | string;
+  eval_modes: BenchmarkEvalMode[];
+  primary_metric: string;
+  metrics: string[];
+  default_num_fewshot: number;
+  sample_count: number;
+  description: string;
+};
+
+export type BenchmarkCatalogResponse = {
+  tasks: BenchmarkCatalogTask[];
+};
+
+export type CreateBenchmarkRunRequest = {
+  name: string;
+  suite: BenchmarkSuite;
+  tasks: string[];
+  runner_backend?: string;
+  runner_config?: Record<string, unknown>;
+  eval_mode?: BenchmarkEvalMode;
+  num_fewshot?: number;
+  target_model: string;
+  model_version_id?: string | null;
+  dataset_id?: string | null;
+  dataset_commit_id?: string | null;
+  sync_exec?: boolean;
+};
+
+// ── Inspect AI Sandboxes ──────────────────────────────────────────────────
+
+export type SandboxStepKind =
+  | "bash"
+  | "python"
+  | "file_edit"
+  | "tool_call"
+  | "scorer";
+
+export type SandboxStep = {
+  step: number;
+  kind?: SandboxStepKind;
+  tool_name?: string;
+  thought?: string;
+  tool_args?: Record<string, unknown>;
+  stdout?: string;
+  stderr?: string;
+  exit_code?: number;
+  duration_ms?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  diff?: TextDiffPayload;
+  files?: Record<string, string>;
+};
+
+export type SandboxTaskTranscript = {
+  id: string;
+  project_id?: string;
+  sandbox_run_id: string;
+  task_key: string;
+  status: "passed" | "failed" | "error" | "timeout";
+  score: number;
+  scorer_details?: Record<string, unknown>;
+  steps?: SandboxStep[];
+  verified_artifacts?: Array<{ path: string; sha256?: string; size_bytes?: number }>;
+  duration_ms: number;
+  input_tokens: number;
+  output_tokens: number;
+  error?: string | null;
+  created_at: string;
+};
+
+export type SandboxRun = {
+  id: string;
+  project_id: string;
+  name: string;
+  runner_backend: "docker" | "local_sandbox" | string;
+  dataset_id: string | null;
+  dataset_commit_id: string | null;
+  solver_config: Record<string, unknown>;
+  scorer_config: Record<string, unknown>;
+  sandbox_policy: Record<string, unknown>;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  pass_rate: number | null;
+  total_tasks: number;
+  passed_tasks: number;
+  total_tokens: number;
+  total_cost_usd: number;
+  job_id: string | null;
+  error: string | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  transcripts?: SandboxTaskTranscript[];
+};
+
+export type CreateSandboxRunRequest = {
+  name: string;
+  runner_backend?: "docker" | "k8s" | "local_sandbox" | string;
+  dataset_id?: string | null;
+  dataset_commit_id?: string | null;
+  solver_config?: Record<string, unknown>;
+  scorer_config?: Record<string, unknown>;
+  sandbox_policy?: Record<string, unknown>;
+  sync_exec?: boolean;
+};
+
+// ── Zero-Copy Dataset Versioning ──────────────────────────────────────────
+
+export type DatasetBranch = {
+  id: string;
+  project_id: string;
+  dataset_id: string;
+  name: string;
+  head_commit_id: string | null;
+  is_default: boolean;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type DatasetCommit = {
+  id: string;
+  project_id: string;
+  dataset_id: string;
+  parent_commit_id: string | null;
+  second_parent_commit_id: string | null;
+  tree_hash: string;
+  message: string;
+  author: string | null;
+  item_count: number;
+  stats: Record<string, number> | { added: number; removed: number; modified: number };
+  created_at: string;
+};
+
+export type DatasetCommitItem = {
+  id: string;
+  commit_id: string;
+  item_key: string;
+  content_hash: string;
+  input: Record<string, unknown>;
+  expected_output: string | null;
+  context: string[];
+  media: Media[];
+  metadata: Record<string, unknown>;
+  artifact_refs: string[];
+  created_at: string;
+};
+
+export type DatasetDiffResult = {
+  dataset_id: string;
+  base_commit_id: string;
+  head_commit_id: string;
+  added: string[];
+  removed: string[];
+  modified: string[];
+  stats: {
+    added: number;
+    removed: number;
+    modified: number;
+  };
+  items?: {
+    added?: DatasetCommitItem[];
+    removed?: DatasetCommitItem[];
+    modified?: Array<{ before: DatasetCommitItem; after: DatasetCommitItem }>;
+  };
+};
+
+export type CreateDatasetBranchRequest = {
+  name: string;
+  from_branch?: string | null;
+  from_commit_id?: string | null;
+};
+
+export type CreateDatasetCommitRequest = {
+  branch?: string;
+  message: string;
+  changes?: Record<string, unknown> | Array<Record<string, unknown>> | null;
+  snapshot_from_working_tree?: boolean;
+  author?: string | null;
+};
+
+export type MergeBranchesRequest = {
+  source_branch: string;
+  target_branch?: string;
+  conflict_strategy?: "fail" | "ours" | "theirs";
+  message?: string | null;
+  author?: string | null;
+};
+
+export type RevertBranchRequest = {
+  branch: string;
+  target_commit_id: string;
+  message?: string | null;
+  author?: string | null;
+};
+
 

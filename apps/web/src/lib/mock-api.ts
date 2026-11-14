@@ -16,6 +16,7 @@ import {
 import { evalExportJsonl, evalGet, evalSend } from "./mock-evals";
 import { mlopsGet, mlopsSend } from "./mock-mlops";
 import { dpoExportJsonl, opsGet, opsSend } from "./mock-ops";
+import { sotaGet, sotaSend } from "./sota-mocks";
 import type {
   CreateSafetyScanRequest,
   GatewayLogsResponse,
@@ -211,6 +212,9 @@ export async function mockGet<T>(path: string, params: Params = {}): Promise<T> 
     } as T;
   }
 
+  const sotaResult = sotaGet(p, params);
+  if (sotaResult !== undefined) return sotaResult as T;
+
   const evalResult = evalGet(p);
   if (evalResult !== undefined) return evalResult as T;
 
@@ -254,7 +258,8 @@ export async function mockSend<T>(method: string, path: string, body?: unknown):
     return createMockSafetyScan(body as CreateSafetyScanRequest) as T;
   }
 
-  const out = evalSend(m, p, body) ?? opsSend(m, p, body) ?? mlopsSend(m, p, body);
+  const out =
+    sotaSend(m, p, body) ?? evalSend(m, p, body) ?? opsSend(m, p, body) ?? mlopsSend(m, p, body);
   if (out === undefined) throw new ApiError(404, `mock: no handler for ${method} ${path}`);
   return out as T;
 }

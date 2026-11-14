@@ -1,4 +1,11 @@
-import type { LineageNodeType, ModelStage, ModelType, TrainingRunStatus, TrainingRunType } from "./types";
+import type {
+  LineageNodeType,
+  ModelStage,
+  ModelType,
+  SandboxStepKind,
+  TrainingRunStatus,
+  TrainingRunType,
+} from "./types";
 
 export const VARIANT_COLORS = [
   "#38bdf8",
@@ -229,3 +236,95 @@ export function getTaskTypeStyle(taskType: string | null | undefined): TaskTypeS
     }
   );
 }
+
+// ── SOTA Sandbox Step Styles ──────────────────────────────────────────────
+
+export type SandboxStepStyle = {
+  label: string;
+  badge: string;
+};
+
+export const SANDBOX_STEP_STYLE: Record<SandboxStepKind, SandboxStepStyle> = {
+  bash: {
+    label: "Bash",
+    badge: "border-amber-800/70 bg-amber-950/40 text-amber-300",
+  },
+  python: {
+    label: "Python",
+    badge: "border-sky-800/70 bg-sky-950/40 text-sky-300",
+  },
+  file_edit: {
+    label: "File Edit",
+    badge: "border-cyan-800/70 bg-cyan-950/40 text-cyan-300",
+  },
+  tool_call: {
+    label: "Tool Call",
+    badge: "border-orange-800/70 bg-orange-950/40 text-orange-300",
+  },
+  scorer: {
+    label: "Scorer",
+    badge: "border-violet-800/70 bg-violet-950/40 text-violet-300",
+  },
+};
+
+export function getSandboxStepStyle(kind: string | null | undefined): SandboxStepStyle {
+  if (kind && kind in SANDBOX_STEP_STYLE) {
+    return SANDBOX_STEP_STYLE[kind as SandboxStepKind];
+  }
+  return {
+    label: kind || "Step",
+    badge: "border-zinc-700/80 bg-zinc-900 text-zinc-300",
+  };
+}
+
+// ── SOTA Branch Diff Styles ───────────────────────────────────────────────
+
+export type BranchDiffChangeType = "added" | "removed" | "modified";
+
+export type BranchDiffStyle = {
+  label: string;
+  prefix: string;
+  badge: string;
+  rowClass: string;
+};
+
+export const BRANCH_DIFF_STYLE: Record<BranchDiffChangeType, BranchDiffStyle> = {
+  added: {
+    label: "Added",
+    prefix: "+",
+    badge: "border-emerald-800/60 bg-emerald-950/40 text-emerald-300",
+    rowClass: "bg-emerald-950/30 text-emerald-200",
+  },
+  removed: {
+    label: "Removed",
+    prefix: "-",
+    badge: "border-red-800/70 bg-red-950/50 text-red-300",
+    rowClass: "bg-red-950/30 text-red-200",
+  },
+  modified: {
+    label: "Modified",
+    prefix: "~",
+    badge: "border-amber-800/70 bg-amber-950/40 text-amber-300",
+    rowClass: "bg-amber-950/30 text-amber-200",
+  },
+};
+
+export function getBranchDiffStyle(changeType: string | null | undefined): BranchDiffStyle {
+  if (changeType && changeType in BRANCH_DIFF_STYLE) {
+    return BRANCH_DIFF_STYLE[changeType as BranchDiffChangeType];
+  }
+  return {
+    label: changeType || "Unknown",
+    prefix: "",
+    badge: "border-zinc-700/80 bg-zinc-900 text-zinc-300",
+    rowClass: "bg-zinc-900/30 text-zinc-300",
+  };
+}
+
+export function scoreTone(v: number): string {
+  if (v < 0.5) return "text-red-300";
+  if (v < 0.8) return "text-amber-300";
+  return "text-emerald-300";
+}
+
+

@@ -1,7 +1,11 @@
+"use client";
+
+import React, { useState } from "react";
 import { formatClock, formatCost, formatDuration, formatPayload, formatTokens, formatValue } from "@/lib/format";
 import type { Document, Media, Message, Span } from "@/lib/types";
 import { KindBadge, Mono, StatusBadge } from "@/components/ui";
 import { AddToDataset } from "@/components/evals/add-to-dataset";
+import { MediaLightboxModal } from "../multimodal/media-lightbox-modal";
 import { AttributesTable } from "./attributes-table";
 
 const LONG_CHARS = 1200;
@@ -12,7 +16,7 @@ function Section({ title, count, children }: { title: string; count?: number; ch
     <section className="border-t border-zinc-800 px-4 py-3">
       <h3 className="mb-2 flex items-center gap-2 text-[11px] font-medium uppercase tracking-wider text-zinc-400">
         {title}
-        {count !== undefined && <span className="font-mono text-zinc-600">{count}</span>}
+        {count !== undefined && <span className="font-mono text-zinc-400">{count}</span>}
       </h3>
       {children}
     </section>
@@ -91,7 +95,7 @@ function Documents({ docs }: { docs: Document[] }) {
       {docs.map((d, i) => (
         <li key={d.id ?? i} className="rounded border border-zinc-800 bg-zinc-900/40 p-2">
           <div className="mb-1 flex items-center gap-2 text-xs">
-            <Mono className="text-zinc-500">#{i + 1}</Mono>
+            <Mono className="text-zinc-400">#{i + 1}</Mono>
             <span className="min-w-0 flex-1 truncate font-mono text-zinc-300" title={d.id ?? undefined}>
               {d.id ?? "(no id)"}
             </span>
@@ -104,7 +108,7 @@ function Documents({ docs }: { docs: Document[] }) {
             <dl className="mt-1.5 flex flex-wrap gap-1">
               {Object.entries(d.metadata).map(([k, v]) => (
                 <div key={k} className="flex rounded bg-zinc-800/80 px-1.5 text-[10px] leading-5">
-                  <dt className="text-zinc-500">{k}</dt>
+                  <dt className="text-zinc-400">{k}</dt>
                   <dd className="ml-1 font-mono text-zinc-300">{formatValue(v)}</dd>
                 </div>
               ))}
@@ -117,47 +121,160 @@ function Documents({ docs }: { docs: Document[] }) {
 }
 
 function MediaList({ media, spanName }: { media: Media[]; spanName: string }) {
+  const [lightboxMedia, setLightboxMedia] = useState<Media | null>(null);
+
   return (
-    <ul className="flex flex-wrap gap-2">
-      {media.map((m, i) => (
-        <li key={i} className="max-w-full">
-          {m.kind === "image" ? (
-            <figure>
-              {/* Plain <img>: media URLs are arbitrary (signed URLs, data URIs). */}
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src={m.url}
-                alt={`Image ${i + 1} attached to ${spanName}${m.mime ? ` (${m.mime})` : ""}`}
-                loading="lazy"
-                decoding="async"
-                className="max-h-64 max-w-full rounded border border-zinc-800 bg-zinc-900"
-              />
-              <figcaption className="mt-0.5 font-mono text-[10px] text-zinc-500">{m.mime ?? "image"}</figcaption>
-            </figure>
-          ) : m.kind === "audio" ? (
-            <audio controls preload="none" src={m.url} className="max-w-full">
-              <a href={m.url}>Download audio</a>
-            </audio>
-          ) : (
-            <a
-              href={m.url}
-              target="_blank"
-              rel="noreferrer noopener"
-              className="font-mono text-xs text-emerald-300 hover:underline"
-            >
-              {m.mime ?? "file"} ↗
-            </a>
-          )}
-        </li>
-      ))}
-    </ul>
+    <>
+      <ul className="flex flex-wrap gap-3">
+        {media.map((m, i) => {
+          if (m.kind === "image" || m.kind === "bbox") {
+            const hasBoxes = Array.isArray(m.boxes) && m.boxes.length > 0;
+            const w = m.width || 1024;
+            const h = m.height || 768;
+            return (
+              <li key={i} className="max-w-full">
+                <button
+                  type="button"
+                  onClick={() => setLightboxMedia(m)}
+                  className="group relative block overflow-hidden rounded-lg border border-zinc-800 bg-zinc-950 p-1 hover:border-emerald-500/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 text-left"
+                >
+                  <div className="relative inline-block max-h-64 max-w-full overflow-hidden rounded">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={m.url}
+                      alt={`Image ${i + 1} attached to ${spanName}${m.mime ? ` (${m.mime})` : ""}`}
+                      loading="lazy"
+                      decoding="async"
+                      className="max-h-64 max-w-full object-contain rounded bg-zinc-900"
+                    />
+                    {hasBoxes && (
+                      <svg
+                        role="img"
+                        aria-label="Bounding box overlay"
+                        viewBox={`0 0 ${w} ${h}`}
+                        className="absolute inset-0 h-full w-full pointer-events-none"
+                      >
+                        {m.boxes!.map((box, bIdx) => (
+                          <rect
+                            key={bIdx}
+                            x={box.x}
+                            y={box.y}
+                            width={box.w}
+                            height={box.h}
+                            fill="#38bdf8"
+                            fillOpacity="0.25"
+                            stroke="#38bdf8"
+                            strokeWidth="2"
+                          />
+                        ))}
+                      </svg>
+                    )}
+                  </div>
+                  <div className="mt-1 flex items-center justify-between px-1 text-[11px] font-mono text-zinc-400">
+                    <span>{m.mime ?? "image"}</span>
+                    {hasBoxes && (
+                      <span className="rounded bg-sky-950/80 border border-sky-800/80 px-1 text-sky-300">
+                        {m.boxes!.length} boxes
+                      </span>
+                    )}
+                  </div>
+                </button>
+              </li>
+            );
+          }
+
+          if (m.kind === "audio") {
+            return (
+              <li key={i} className="w-full max-w-md">
+                <div className="rounded-lg border border-zinc-800 bg-zinc-950 p-2.5">
+                  <div className="mb-1 flex items-center justify-between text-xs">
+                    <span className="font-medium text-emerald-300">♫ Audio Stream</span>
+                    <button
+                      type="button"
+                      onClick={() => setLightboxMedia(m)}
+                      className="text-xs text-zinc-400 hover:text-zinc-200 underline"
+                    >
+                      Waveform inspect ↗
+                    </button>
+                  </div>
+                  <audio controls preload="metadata" src={m.url} className="h-9 w-full rounded">
+                    <a href={m.url} className="text-xs text-emerald-400">Download audio</a>
+                  </audio>
+                </div>
+              </li>
+            );
+          }
+
+          if (m.kind === "pdf") {
+            return (
+              <li key={i} className="max-w-xs">
+                <button
+                  type="button"
+                  onClick={() => setLightboxMedia(m)}
+                  className="flex items-center gap-2.5 rounded-lg border border-zinc-800 bg-zinc-950 p-3 text-left hover:border-emerald-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
+                >
+                  <span className="text-2xl">📄</span>
+                  <div>
+                    <div className="font-mono text-xs font-semibold text-zinc-100">
+                      PDF Document {m.page ? `· Page ${m.page}` : ""}
+                    </div>
+                    <div className="text-[11px] text-zinc-400">Click to view visual page & ColPali attention</div>
+                  </div>
+                </button>
+              </li>
+            );
+          }
+
+          if (m.kind === "text_diff") {
+            return (
+              <li key={i} className="w-full max-w-lg">
+                <button
+                  type="button"
+                  onClick={() => setLightboxMedia(m)}
+                  className="w-full rounded-lg border border-zinc-800 bg-zinc-950 p-3 text-left hover:border-emerald-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
+                >
+                  <div className="flex items-center justify-between font-mono text-xs">
+                    <span className="font-semibold text-amber-300">~ Text Diff Payload</span>
+                    <span className="text-[11px] text-zinc-400">Click for side-by-side view ↗</span>
+                  </div>
+                  <pre className="mt-1 line-clamp-2 font-mono text-[11px] text-zinc-400">
+                    {m.diff?.before || "diff payload..."}
+                  </pre>
+                </button>
+              </li>
+            );
+          }
+
+          return (
+            <li key={i}>
+              <a
+                href={m.url}
+                target="_blank"
+                rel="noreferrer noopener"
+                className="inline-flex items-center gap-1 rounded border border-zinc-800 bg-zinc-900 px-2.5 py-1 font-mono text-xs text-emerald-300 hover:underline"
+              >
+                <span>📎</span>
+                <span>{m.mime ?? "file"} ↗</span>
+              </a>
+            </li>
+          );
+        })}
+      </ul>
+
+      <MediaLightboxModal
+        isOpen={lightboxMedia !== null}
+        media={lightboxMedia}
+        title={`${spanName} — Multimodal Media`}
+        onClose={() => setLightboxMedia(null)}
+      />
+    </>
   );
 }
 
 function Stat({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="min-w-0">
-      <dt className="text-[10px] uppercase tracking-wider text-zinc-500">{label}</dt>
+      <dt className="text-[10px] uppercase tracking-wider text-zinc-400">{label}</dt>
       <dd className="truncate font-mono text-xs tabular-nums text-zinc-200">{children}</dd>
     </div>
   );
@@ -180,7 +297,7 @@ export function SpanPanel({ span, traceStart, readOnly = false }: { span: Span; 
             <StatusBadge status={span.status} />
           </div>
           <h2 className="mt-1.5 break-words font-semibold text-zinc-50">{span.name}</h2>
-          <Mono className="text-[11px] text-zinc-500">{span.span_id}</Mono>
+          <Mono className="text-[11px] text-zinc-400">{span.span_id}</Mono>
         </div>
         <div className="shrink-0">
           {!readOnly && <AddToDataset traceId={span.trace_id} spanId={span.span_id} />}
@@ -251,7 +368,7 @@ export function SpanPanel({ span, traceStart, readOnly = false }: { span: Span; 
       {span.tool && (
         <Section title="Tool">
           <p className="font-mono text-xs text-orange-300">{span.tool.name}</p>
-          {span.tool.description && <p className="mt-0.5 text-xs text-zinc-400">{span.tool.description}</p>}
+          {span.tool.description && <p className="mt-0.5 text-xs text-zinc-300">{span.tool.description}</p>}
           {span.tool.parameters && (
             <div className="mt-2">
               <Payload text={span.tool.parameters} mime="application/json" label="parameters" />
@@ -273,14 +390,14 @@ export function SpanPanel({ span, traceStart, readOnly = false }: { span: Span; 
             {span.events.map((e, i) => (
               <li key={i} className="text-xs">
                 <div className="flex items-center gap-2">
-                  <Mono className="text-zinc-500">{formatClock(e.time)}</Mono>
+                  <Mono className="text-zinc-400">{formatClock(e.time)}</Mono>
                   <span className={e.name === "exception" ? "font-medium text-red-300" : "text-zinc-200"}>{e.name}</span>
                 </div>
                 {Object.keys(e.attributes).length > 0 && (
                   <dl className="mt-1 space-y-1 rounded border border-zinc-800 bg-zinc-950 p-2">
                     {Object.entries(e.attributes).map(([k, v]) => (
                       <div key={k}>
-                        <dt className="font-mono text-[10px] text-zinc-500">{k}</dt>
+                        <dt className="font-mono text-[10px] text-zinc-400">{k}</dt>
                         <dd className="whitespace-pre-wrap break-words font-mono text-[11px] text-zinc-200">
                           {formatValue(v)}
                         </dd>
