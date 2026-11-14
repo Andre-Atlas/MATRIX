@@ -7,10 +7,12 @@ import logging
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from matrix_server.benchmarks.runner import run_benchmark_job
 from matrix_server.evals.runner import ExperimentConfigError, run_experiment
+from matrix_server.sandboxes.runner import run_sandbox_job
 from matrix_server.storage import jobs
 from matrix_server.storage.db import utcnow
-from matrix_server.storage.models import Experiment, Job
+from matrix_server.storage.models import BenchmarkRun, Experiment, Job, SandboxRun
 from matrix_server.workers.context import JobLost
 from matrix_server.workers.runner import on_final_failure, register
 
@@ -102,3 +104,68 @@ def settle_failed_experiment(session_factory: sessionmaker[Session], job: Job) -
         elif not exp.error:
             exp.error = "internal error: job failed"
         exp.finished_at = utcnow()
+
+
+@register("benchmark.run")
+@register("mlops.evaluate")
+def run_benchmark_worker_handler(session: Session, job: Job) -> None:
+    benchmark_run_id = (job.payload or {}).get("benchmark_run_id")
+    if not benchmark_run_id:
+        log.warning("job %s: missing benchmark_run_id in payload", job.id)
+        return
+    factory = sessionmaker(bind=session.get_bind(), expire_on_commit=False)
+    run_benchmark_job(factory, benchmark_run_id)
+
+
+@on_final_failure("benchmark.run")
+@on_final_failure("mlops.evaluate")
+def settle_failed_benchmark(session_factory: sessionmaker[Session], job: Job) -> None:
+    benchmark_run_id = (job.payload or {}).get("benchmark_run_id")
+    if not isinstance(benchmark_run_id, str):
+        return
+    with session_factory() as session, session.begin():
+        run = session.scalars(
+            select(BenchmarkRun).where(
+                BenchmarkRun.id == benchmark_run_id, BenchmarkRun.project_id == job.project_id
+            )
+        ).first()
+        if run is None or run.status in ("completed", "failed", "cancelled"):
+            return
+        run.status = "failed"
+        if job.error == jobs.LEASE_EXPIRED_ERROR:
+            run.error = LEASE_EXPIRED_MESSAGE
+        elif not run.error:
+            run.error = "internal error: job failed"
+        run.finished_at = utcnow()
+
+
+@register("sandbox.run")
+def run_sandbox_worker_handler(session: Session, job: Job) -> None:
+    sandbox_run_id = (job.payload or {}).get("sandbox_run_id")
+    if not sandbox_run_id:
+        log.warning("job %s: missing sandbox_run_id in payload", job.id)
+        return
+    factory = sessionmaker(bind=session.get_bind(), expire_on_commit=False)
+    run_sandbox_job(factory, sandbox_run_id)
+
+
+@on_final_failure("sandbox.run")
+def settle_failed_sandbox(session_factory: sessionmaker[Session], job: Job) -> None:
+    sandbox_run_id = (job.payload or {}).get("sandbox_run_id")
+    if not isinstance(sandbox_run_id, str):
+        return
+    with session_factory() as session, session.begin():
+        run = session.scalars(
+            select(SandboxRun).where(
+                SandboxRun.id == sandbox_run_id, SandboxRun.project_id == job.project_id
+            )
+        ).first()
+        if run is None or run.status in ("completed", "failed", "cancelled"):
+            return
+        run.status = "failed"
+        if job.error == jobs.LEASE_EXPIRED_ERROR:
+            run.error = LEASE_EXPIRED_MESSAGE
+        elif not run.error:
+            run.error = "internal error: sandbox job failed"
+        run.finished_at = utcnow()
+

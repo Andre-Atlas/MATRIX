@@ -4,6 +4,7 @@ from matrix_server.api import (
     admin,
     annotations,
     auth,
+    benchmarks,
     datasets,
     experiments,
     gateway,
@@ -14,6 +15,7 @@ from matrix_server.api import (
     query,
     rules,
     safety,
+    sandboxes,
     vectors,
 )
 from matrix_server.config import Settings, get_settings
@@ -67,6 +69,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         vectors,
         gateway,
         mlops,
+        benchmarks,
+        sandboxes,
     ):
         app.include_router(module.router)
     return app
