@@ -20,7 +20,10 @@ from . import tracing
 from .prompts import Prompt
 
 if TYPE_CHECKING:
+    from .benchmarks import BenchmarksClient
+    from .datasets import DatasetsClient
     from .mlops import MLOpsClient, TrainingRun
+    from .sandboxes import SandboxesClient
 
 DEFAULT_ENDPOINT = "http://localhost:8000"
 
@@ -76,6 +79,9 @@ class MatrixClient:
         self._threads: list[threading.Thread] = []
         self._lock = threading.Lock()
         self._mlops: MLOpsClient | None = None
+        self._benchmarks: BenchmarksClient | None = None
+        self._sandboxes: SandboxesClient | None = None
+        self._datasets: DatasetsClient | None = None
 
     # -- lifecycle
     def shutdown(self) -> None:
@@ -178,6 +184,7 @@ class MatrixClient:
         input: dict | Any,
         expected_output: str | None = None,
         context: list[str] | None = None,
+        media: list[dict[str, Any]] | None = None,
         metadata: dict | None = None,
     ) -> dict:
         body: dict[str, Any] = {"input": input}
@@ -185,9 +192,43 @@ class MatrixClient:
             body["expected_output"] = expected_output
         if context is not None:
             body["context"] = context
+        if media is not None:
+            body["media"] = media
         if metadata is not None:
             body["metadata"] = metadata
         return self._request("POST", f"/api/v1/datasets/{_seg(dataset_id)}/items", json=body)
+
+    @property
+    def datasets(self) -> DatasetsClient:
+        if self._datasets is None:
+            with self._lock:
+                if self._datasets is None:
+                    from .datasets import DatasetsClient
+
+                    self._datasets = DatasetsClient(self)
+        return self._datasets
+
+    # -- benchmarks
+    @property
+    def benchmarks(self) -> BenchmarksClient:
+        if self._benchmarks is None:
+            with self._lock:
+                if self._benchmarks is None:
+                    from .benchmarks import BenchmarksClient
+
+                    self._benchmarks = BenchmarksClient(self)
+        return self._benchmarks
+
+    # -- sandboxes
+    @property
+    def sandboxes(self) -> SandboxesClient:
+        if self._sandboxes is None:
+            with self._lock:
+                if self._sandboxes is None:
+                    from .sandboxes import SandboxesClient
+
+                    self._sandboxes = SandboxesClient(self)
+        return self._sandboxes
 
     # -- mlops
     @property
