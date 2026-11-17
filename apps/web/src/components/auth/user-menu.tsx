@@ -2,10 +2,12 @@
 
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
+import { performLogout } from "@/lib/login-notice";
 
 export function UserMenu({ email, name }: { email: string; name: string }) {
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [warning, setWarning] = useState<string | null>(null);
   const root = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -28,7 +30,10 @@ export function UserMenu({ email, name }: { email: string; name: string }) {
     setBusy(true);
     try {
       // The server clears the cookies even when the API call fails.
-      await fetch("/api/auth/logout", { method: "POST", cache: "no-store" });
+      // The cookies are gone after this, but with revoked:false the token still works in the API:
+      // say so here and again on /login.
+      const notice = await performLogout();
+      if (notice) setWarning(notice);
     } catch {
       /* offline: the cookie stays; the user can retry */
     }
@@ -53,6 +58,11 @@ export function UserMenu({ email, name }: { email: string; name: string }) {
           <span className="block truncate text-[11px] text-zinc-500">{email}</span>
         </span>
       </button>
+      {warning && (
+        <p role="alert" className="mb-1 rounded border border-amber-800/60 bg-amber-950/40 px-2 py-1.5 text-xs text-amber-200">
+          {warning}
+        </p>
+      )}
       {open && (
         <div role="menu" aria-label="User" className="absolute bottom-full left-0 z-40 mb-1 w-full rounded-md border border-zinc-700 bg-zinc-900 p-1 shadow-xl">
           <Link

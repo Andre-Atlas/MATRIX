@@ -2,11 +2,12 @@
 import { callApi, noStore } from "@/lib/auth-calls";
 import { sameOrigin } from "@/lib/same-origin";
 import {
-  PROJECT_COOKIE,
   PROJECT_ID_RE,
   clearSessionCookies,
+  projectCookieName,
   serializeCookie,
   sessionFromCookieHeader,
+  setLastProject,
 } from "@/lib/session-cookie";
 import type { MeResponse } from "@/lib/types";
 
@@ -44,6 +45,7 @@ export async function POST(req: Request): Promise<Response> {
   // Same lifetime as the session cookie: the remaining one is unknown here, so reuse a long
   // default bounded by the API's own absolute session limit (30 d). The token cookie is untouched.
   const out = noStore({ ok: true, project: target.project, role: target.role });
-  out.headers.append("set-cookie", serializeCookie(PROJECT_COOKIE, id, 30 * 86_400));
+  out.headers.append("set-cookie", serializeCookie(projectCookieName(), id, 30 * 86_400));
+  setLastProject(out.headers, me.user?.id, id);
   return out;
 }

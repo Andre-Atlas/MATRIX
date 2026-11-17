@@ -52,4 +52,14 @@ describe("middleware", () => {
     const res = middleware(r);
     expect(res.headers.get("x-middleware-request-x-matrix-path")).toBe("/traces");
   });
+
+  it("refuses and clears a duplicated session cookie (one of them was planted)", () => {
+    const dup = `matrix_session=${TOKEN}; matrix_session=mxs_planted_token_000000000`;
+    const api = middleware(req("/api/proxy/traces", dup));
+    expect(api.status).toBe(401);
+    expect(api.headers.getSetCookie().some((c) => c.startsWith("matrix_session=;"))).toBe(true);
+    const page = middleware(req("/traces", dup));
+    expect(page.status).toBe(307);
+    expect(page.headers.getSetCookie().some((c) => c.startsWith("matrix_session=;"))).toBe(true);
+  });
 });

@@ -53,3 +53,11 @@ export function upstreamHeaders(
   }
   return h;
 }
+
+export const SAFE_CACHE = "private, no-store";
+
+/** Upstream Cache-Control kept only when it already forbids storing; otherwise `private, no-store`. */
+export function cacheControlFor(upstream: string | null): string {
+  if (upstream && /(^|,)\s*no-store\s*(,|$)/i.test(upstream)) return upstream;
+  return SAFE_CACHE;
+}

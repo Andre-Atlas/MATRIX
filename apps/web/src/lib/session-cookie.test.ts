@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   clearSessionCookies,
+  lastProjectFor,
+  parseCookies,
+  projectCookieName,
+  sessionCookieConflict,
+  sessionCookieName,
   lifetimeSeconds,
   safeNext,
   serializeCookie,
@@ -90,5 +95,53 @@ describe("cookies", () => {
     expect(lifetimeSeconds("2030-01-01T00:00:00Z", now)).toBe(31 * 86400);
     expect(lifetimeSeconds("garbage", now)).toBeNull();
     expect(lifetimeSeconds(undefined, now)).toBeNull();
+  });
+});
+
+describe("__Host- cookie names", () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  it("are prefixed only when Secure is on", () => {
+    vi.stubEnv("NODE_ENV", "production");
+    expect(sessionCookieName()).toBe("__Host-matrix_session");
+    expect(projectCookieName()).toBe("__Host-matrix_project");
+    const h = new Headers();
+    setSessionCookies(h, TOKEN, "p_1", 3600);
+    for (const c of h.getSetCookie()) {
+      expect(c).toMatch(/^__Host-/);
+      expect(c).toMatch(/Secure/);
+      expect(c).toMatch(/Path=\//);
+      expect(c).not.toMatch(/Domain/i);
+    }
+    vi.stubEnv("MATRIX_INSECURE_COOKIES", "1");
+    expect(sessionCookieName()).toBe("matrix_session");
+  });
+
+  it("in production only the prefixed cookie is a session", () => {
+    vi.stubEnv("NODE_ENV", "production");
+    expect(sessionFromCookieHeader(`matrix_session=${TOKEN}`)).toBeNull();
+    expect(sessionFromCookieHeader(`matrix_session=x; __Host-matrix_session=${TOKEN}`)?.token).toBe(TOKEN);
+  });
+
+  it("drops duplicated names and refuses a duplicated session cookie", () => {
+    expect(parseCookies("a=1; b=2; a=3")).toEqual({ b: "2" });
+    const dup = `matrix_session=${TOKEN}; matrix_session=mxs_planted_token_000000000`;
+    expect(sessionCookieConflict(dup)).toBe(true);
+    expect(sessionFromCookieHeader(dup)).toBeNull();
+    expect(sessionFromCookieHeader(`matrix_session=${TOKEN}; matrix_project=a; matrix_project=b`)).toBeNull();
+  });
+
+  it("clearing in production also clears the legacy unprefixed names", () => {
+    vi.stubEnv("NODE_ENV", "production");
+    const h = new Headers();
+    clearSessionCookies(h);
+    const names = h.getSetCookie().map((c) => c.split("=")[0]);
+    expect(names).toEqual(expect.arrayContaining(["__Host-matrix_session", "__Host-matrix_project", "matrix_session", "matrix_project"]));
+  });
+
+  it("the last-project cookie only counts for the same user", () => {
+    expect(lastProjectFor("matrix_last_project=u1~p_1", "u1")).toBe("p_1");
+    expect(lastProjectFor("matrix_last_project=u1~p_1", "u2")).toBeNull();
+    expect(lastProjectFor("matrix_last_project=u1~p 1", "u1")).toBeNull();
   });
 });

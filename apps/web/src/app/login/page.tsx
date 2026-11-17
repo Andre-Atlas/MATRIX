@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { LoginForm } from "@/components/auth/login-form";
+import { LoginNotice } from "@/components/auth/login-notice";
 import { safeNext } from "@/lib/session-cookie";
 
 export const metadata: Metadata = { title: "Sign in · MATRIX" };
@@ -17,6 +18,7 @@ export default async function LoginPage({ searchParams }: { searchParams: Promis
         </div>
         <h1 className="mb-1 text-base font-semibold text-zinc-50">Sign in</h1>
         <p className="mb-4 text-zinc-500">Use your MATRIX account. Accounts are created by a platform admin.</p>
+        <LoginNotice className="mb-3" />
         <div className="rounded-md border border-zinc-800 bg-zinc-900/50 p-4">
           <LoginForm next={next} />
         </div>

@@ -45,6 +45,9 @@ make dev-web   # web em :3000
    MATRIX_ADMIN_TOKEN=
    # chave que a web usa; preenchida no passo 3
    MATRIX_API_KEY=
+   # origem pública da web (esquema + host + porta); o Origin de login/logout/escritas tem de ser
+   # exatamente esta. Ex.: https://matrix.exemplo.com
+   MATRIX_WEB_ORIGIN=
    # juiz de avaliação (vazio = juiz heurístico offline, só para teste/demo)
    MATRIX_JUDGE_PROVIDER=
    MATRIX_JUDGE_MODEL=
@@ -126,6 +129,9 @@ Web (`apps/web`):
 | `MATRIX_API_URL` | `http://localhost:8000` | URL da API vista pelo servidor Next |
 | `MATRIX_API_KEY` | — | Chave do projeto injetada em toda chamada (**ver o aviso acima**); vazia = sem credencial |
 | `MATRIX_MOCK` | — | `1` = dados de exemplo, sem API (desenvolvimento e screenshots) |
+| `MATRIX_WEB_ORIGIN` | — | Origem pública da web (`https://matrix.exemplo.com`, com porta se não for a padrão). Definida, o `Origin` das mutações (login, logout, troca de projeto, escritas pelo proxy) precisa ser exatamente ela. Vazia: compara esquema + `Host` (esquema do `X-Forwarded-Proto` só com `MATRIX_WEB_TRUST_FORWARDED_FOR=1`; em produção com cookies Secure o esquema esperado é sempre `https`). Recomendada atrás de proxy reverso |
+| `MATRIX_WEB_TRUST_FORWARDED_FOR` | — | `1` = há um proxy reverso confiável na frente do Next: usa o último `X-Forwarded-For` como IP do cliente e o `X-Forwarded-Proto` como esquema |
+| `MATRIX_INSECURE_COOKIES` | — | `1` = cookies sem `Secure` em produção (só HTTP local). Com Secure os cookies se chamam `__Host-matrix_session` e `__Host-matrix_project`; sem, `matrix_session` e `matrix_project` |
 
 Compose: `POSTGRES_PASSWORD` e `CLICKHOUSE_PASSWORD` (obrigatórias); `MATRIX_DATABASE_URL` e
 `MATRIX_CLICKHOUSE_URL` são montadas a partir delas.

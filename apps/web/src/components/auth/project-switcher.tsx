@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { ProxyError, explain, proxy } from "@/lib/proxy-client";
 import type { Membership } from "@/lib/types";
 import { RoleBadge } from "@/components/settings/ui";
+import { LoginNotice } from "./login-notice";
 
 async function switchTo(id: string): Promise<void> {
   const res = await fetch("/api/auth/switch-project", {
@@ -85,6 +86,7 @@ export function ProjectSwitcher({ memberships, activeId }: { memberships: Member
 
   return (
     <div ref={root} className="relative mb-3">
+      <LoginNotice className="mb-2" />
       <button
         type="button"
         aria-haspopup="true"

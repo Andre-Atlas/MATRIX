@@ -1,12 +1,13 @@
 // Server-side proxy from the browser to the MATRIX API. The browser never holds a credential: the
-// session token lives in the HttpOnly `matrix_session` cookie and is turned into
+// session token lives in the HttpOnly session cookie (`__Host-matrix_session` in production) and is turned into
 // `Authorization: Bearer` + `X-Matrix-Project` here (ADR-006). No cookie -> 401 without calling the
 // API. Hardening kept from the pre-login version: strict path segments, same-origin check on
 // mutations, streamed body limit, an allowlist of response headers. The login and logout routes of
 // the API are not reachable through here (the login response carries the token).
+import { sessionIsDead } from "@/lib/auth-calls";
 import { sameOrigin } from "@/lib/same-origin";
 import { clearSessionCookies, sessionFromCookieHeader } from "@/lib/session-cookie";
-import { apiBase, upstreamHeaders } from "@/lib/upstream";
+import { apiBase, cacheControlFor, upstreamHeaders } from "@/lib/upstream";
 
 const MAX_PROXY_BODY_BYTES = 10 * 1024 * 1024;
 
@@ -30,8 +31,13 @@ function error(status: number, detail: string, extra?: (h: Headers) => void): Re
   return res;
 }
 
-/** Paths whose responses carry a session token: only the dedicated /api/auth/* routes may call them. */
+/**
+ * Not reachable through the proxy: login/logout (their responses carry or kill a session token; only
+ * the dedicated /api/auth/* routes call them) and admin/* (platform-admin token routes; a browser
+ * session never authorises them, and their 401 used to be a cross-site logout lever).
+ */
 function blocked(path: string[]): boolean {
+  if (path[0] === "admin") return true;
   return path[0] === "auth" && (path[1] === "login" || path[1] === "logout");
 }
 
@@ -59,10 +65,21 @@ function limitedBody(body: ReadableStream<Uint8Array>, limit: number, onOverflow
   );
 }
 
-/** The API says the session is gone: drop the cookies so the next navigation goes to /login. */
-function expired(res: Response): Response {
-  clearSessionCookies(res.headers);
+/**
+ * The API answered 401. The cookies are dropped only when `/auth/me` confirms the session is dead
+ * (the same check as /api/auth/expired), and never on a request another site started: a cross-site
+ * GET must not be able to sign the user out.
+ */
+async function expired(req: Request, res: Response, session: Parameters<typeof sessionIsDead>[1]): Promise<Response> {
   res.headers.set("cache-control", "no-store");
+  if (req.headers.get("sec-fetch-site") === "cross-site") return res;
+  if (await sessionIsDead(req, session)) clearSessionCookies(res.headers);
+  return res;
+}
+
+function finish(res: Response): Response {
+  res.headers.set("cache-control", cacheControlFor(res.headers.get("cache-control")));
+  res.headers.append("vary", "Cookie");
   return res;
 }
 
@@ -94,7 +111,8 @@ async function forward(req: Request, ctx: Ctx): Promise<Response> {
       token: session.token,
       projectId: session.projectId,
     });
-    return res.status === 401 ? expired(res) : res;
+    const out = new Response(res.body, { status: res.status, headers: res.headers });
+    return finish(res.status === 401 ? await expired(req, out, session) : out);
   }
 
   const base = apiBase();
@@ -121,6 +139,9 @@ async function forward(req: Request, ctx: Ctx): Promise<Response> {
       headers,
       body,
       cache: "no-store",
+      // Never follow: a redirect to another host would re-send Authorization/X-Matrix-Project there
+      // and the server would download the target. The 3xx goes back to the browser as is.
+      redirect: "manual",
       ...(body ? { duplex: "half" } : {}),
     } as RequestInit);
   } catch {
@@ -137,9 +158,16 @@ async function forward(req: Request, ctx: Ctx): Promise<Response> {
     const value = res.headers.get(name);
     if (value !== null) out.set(name, value);
   }
+  if (res.status >= 300 && res.status < 400) {
+    // Status and Location only, plus the security headers above; the body is not relayed.
+    await res.body?.cancel();
+    const location = res.headers.get("location");
+    if (location !== null) out.set("location", location);
+    return finish(new Response(null, { status: res.status, headers: out }));
+  }
   if (!out.has("content-type")) out.set("content-type", "application/json");
   const response = new Response(res.body, { status: res.status, headers: out });
-  return res.status === 401 ? expired(response) : response;
+  return finish(res.status === 401 ? await expired(req, response, session) : response);
 }
 
 export { forward as GET, forward as POST, forward as PUT, forward as PATCH, forward as DELETE };

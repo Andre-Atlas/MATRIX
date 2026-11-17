@@ -13,7 +13,7 @@ const P2 = "0f9e8d7c6b5a49382716059483726150";
 function post(path: string, body: unknown, headers: Record<string, string> = {}) {
   return new Request(`http://${HOST}/api/auth/${path}`, {
     method: "POST",
-    headers: { host: HOST, origin: `http://${HOST}`, "content-type": "application/json", ...headers },
+    headers: { host: HOST, origin: `https://${HOST}`, "content-type": "application/json", ...headers },
     body: typeof body === "string" ? body : JSON.stringify(body),
   });
 }
@@ -50,22 +50,22 @@ afterEach(() => {
 
 describe("POST /api/auth/login", () => {
   it("sets HttpOnly cookies and never returns the token to the browser", async () => {
-    const res = await login(post("login", { email: "a@b.co", password: "pw-pw-pw-pw-1", next: "/traces?x=1" }, { "x-forwarded-for": "9.9.9.9, 203.0.113.5" }));
+    const res = await login(post("login", { email: "a@b.co", password: "pw-pw-pw-pw-1", next: "/traces?x=1" }, { "x-forwarded-for": "9.9.9.9, 203.0.113.5", cookie: `__Host-matrix_project=${P1}` }));
     expect(res.status).toBe(200);
     const text = await res.text();
     expect(text).not.toContain(TOKEN);
     expect(JSON.parse(text)).toMatchObject({ ok: true, next: "/traces?x=1", project_id: P1 });
     const cookies = res.headers.getSetCookie();
-    const session = cookies.find((c) => c.startsWith("matrix_session="))!;
+    const session = cookies.find((c) => c.startsWith("__Host-matrix_session="))!;
     expect(session).toContain(TOKEN);
     expect(session).toMatch(/HttpOnly/);
     expect(session).toMatch(/SameSite=Lax/);
     expect(session).toMatch(/Secure/);
     expect(session).toMatch(/Path=\//);
     expect(session).toMatch(/Max-Age=3[56]\d\d/);
-    expect(cookies.find((c) => c.startsWith("matrix_project="))).toContain(`matrix_project=${P1}`);
-    expect(cookies.find((c) => c.startsWith("matrix_project="))).toMatch(/HttpOnly/);
-    for (const [, v] of res.headers) if (!/^matrix_/.test(v)) expect(v).not.toContain(TOKEN);
+    expect(cookies.find((c) => c.startsWith("__Host-matrix_project="))).toContain(`__Host-matrix_project=${P1}`);
+    expect(cookies.find((c) => c.startsWith("__Host-matrix_project="))).toMatch(/HttpOnly/);
+    for (const [, v] of res.headers) if (!/^__Host-matrix_/.test(v)) expect(v).not.toContain(TOKEN);
     // Upstream: the client IP is the one Next saw, written to the trusted header.
     const init = fetchMock.mock.calls[0][1] as RequestInit;
     expect((init.headers as Record<string, string>)["x-real-ip"]).toBe("203.0.113.5");
@@ -73,13 +73,49 @@ describe("POST /api/auth/login", () => {
   });
 
   it("keeps the previously selected project when still a member", async () => {
-    const res = await login(post("login", { email: "a@b.co", password: "pw" }, { cookie: `matrix_project=${P2}` }));
+    const res = await login(post("login", { email: "a@b.co", password: "pw" }, { cookie: `__Host-matrix_project=${P2}` }));
     expect((await res.json()).project_id).toBe(P2);
+  });
+
+  it("never picks the highest-role project: two or more and nothing known -> /projects with a notice", async () => {
+    // P1 is owner (e.g. an attacker added the victim as owner of their project); P2 is the victim's.
+    const res = await login(post("login", { email: "a@b.co", password: "pw", next: "/traces" }));
+    const body = await res.json();
+    expect(body.project_id).toBeNull();
+    expect(body.next).toBe("/projects");
+    expect(body.notice).toMatch(/added/);
+    const project = res.headers.getSetCookie().find((c) => c.startsWith("__Host-matrix_project="))!;
+    expect(project).toMatch(/Max-Age=0/);
+  });
+
+  it("reopens the project this user last used (persistent, user-bound cookie) even after logout", async () => {
+    const res = await login(post("login", { email: "a@b.co", password: "pw" }, { cookie: `__Host-matrix_last_project=u1~${P2}` }));
+    const body = await res.json();
+    expect(body.project_id).toBe(P2);
+    expect(body.notice).toBeUndefined();
+    const last = res.headers.getSetCookie().find((c) => c.startsWith("__Host-matrix_last_project="))!;
+    expect(last).toContain(`u1~${P2}`);
+    expect(last).not.toMatch(/Max-Age=0/);
+    // Another user's record on the same browser does not count.
+    const other = await login(post("login", { email: "a@b.co", password: "pw" }, { cookie: `__Host-matrix_last_project=u9~${P2}` }));
+    expect((await other.json()).project_id).toBeNull();
+  });
+
+  it("with a single project opens it, with a notice when the user used another one before", async () => {
+    const one = { memberships: [{ project: { id: P1, name: "One" }, role: "owner" }] };
+    fetchMock.mockResolvedValueOnce(apiLogin(one));
+    const fresh = await (await login(post("login", { email: "a@b.co", password: "pw" }))).json();
+    expect(fresh).toMatchObject({ project_id: P1 });
+    expect(fresh.notice).toBeUndefined();
+    fetchMock.mockResolvedValueOnce(apiLogin(one));
+    const moved = await (await login(post("login", { email: "a@b.co", password: "pw" }, { cookie: `__Host-matrix_last_project=u1~${P2}` }))).json();
+    expect(moved.project_id).toBe(P1);
+    expect(moved.notice).toBe('You were added to project "One".');
   });
 
   it("neutralises a hostile next", async () => {
     for (const next of ["//evil.example", "https://evil.example", "/\\evil.example", "javascript:1"]) {
-      const res = await login(post("login", { email: "a@b.co", password: "pw", next }));
+      const res = await login(post("login", { email: "a@b.co", password: "pw", next }, { cookie: `__Host-matrix_project=${P1}` }));
       expect((await res.json()).next).toBe("/");
     }
   });
@@ -129,10 +165,47 @@ describe("POST /api/auth/login", () => {
   });
 });
 
+describe("cookie names and conflicts", () => {
+  it("uses unprefixed names when cookies are not Secure (dev / MATRIX_INSECURE_COOKIES)", async () => {
+    vi.stubEnv("MATRIX_INSECURE_COOKIES", "1");
+    const res = await login(post("login", { email: "a@b.co", password: "pw" }, { origin: `http://${HOST}`, cookie: `matrix_project=${P1}` }));
+    expect(res.status).toBe(200);
+    const names = res.headers.getSetCookie().map((c) => c.split("=")[0]);
+    expect(names).toContain("matrix_session");
+    expect(names.some((n) => n.startsWith("__Host-"))).toBe(false);
+  });
+
+  it("ignores a bare matrix_session in production and refuses a duplicated session cookie", async () => {
+    expect((await switchProject(post("switch-project", { project_id: P1 }, { cookie: `matrix_session=${TOKEN}` }))).status).toBe(401);
+    const dup = `__Host-matrix_session=${TOKEN}; __Host-matrix_session=mxs_planted_token_000000000`;
+    expect((await switchProject(post("switch-project", { project_id: P1 }, { cookie: dup }))).status).toBe(401);
+    expect(fetchMock).not.toHaveBeenCalled();
+    const res = await expired(new Request(`https://${HOST}/api/auth/expired`, { headers: { host: HOST, cookie: dup } }));
+    expect(res.headers.getSetCookie().some((c) => c.startsWith("__Host-matrix_session=;"))).toBe(true);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("Cache-Control on /api/auth/*", () => {
+  it("is no-store on every answer, success or failure", async () => {
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ user: { id: "u1" }, memberships: [{ project: { id: P1, name: "One" }, role: "owner" }] })));
+    const answers = [
+      await login(post("login", { email: "a@b.co", password: "pw" })),
+      await login(post("login", "nope")),
+      await login(post("login", {}, { origin: "http://evil.example" })),
+      await logout(post("logout", {})),
+      await switchProject(post("switch-project", { project_id: P1 }, { cookie: `__Host-matrix_session=${TOKEN}` })),
+      await switchProject(post("switch-project", { project_id: P1 })),
+      await expired(new Request(`https://${HOST}/api/auth/expired`, { headers: { host: HOST } })),
+    ];
+    for (const r of answers) expect(r.headers.get("cache-control")).toBe("no-store");
+  });
+});
+
 describe("POST /api/auth/logout", () => {
   it("revokes upstream and clears the cookies", async () => {
     fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }));
-    const res = await logout(post("logout", {}, { cookie: `matrix_session=${TOKEN}; matrix_project=${P1}` }));
+    const res = await logout(post("logout", {}, { cookie: `__Host-matrix_session=${TOKEN}; __Host-matrix_project=${P1}` }));
     const init = fetchMock.mock.calls[0][1] as RequestInit;
     expect((init.headers as Record<string, string>).authorization).toBe(`Bearer ${TOKEN}`);
     expect(res.headers.getSetCookie().every((c) => c.includes("Max-Age=0"))).toBe(true);
@@ -141,18 +214,18 @@ describe("POST /api/auth/logout", () => {
 
   it("clears the cookies even when the API fails", async () => {
     fetchMock.mockRejectedValueOnce(new TypeError("fetch failed"));
-    const res = await logout(post("logout", {}, { cookie: `matrix_session=${TOKEN}` }));
+    const res = await logout(post("logout", {}, { cookie: `__Host-matrix_session=${TOKEN}` }));
     expect(res.status).toBe(200);
-    expect(res.headers.getSetCookie().some((c) => c.startsWith("matrix_session=;"))).toBe(true);
+    expect(res.headers.getSetCookie().some((c) => c.startsWith("__Host-matrix_session=;"))).toBe(true);
     expect((await res.json()).revoked).toBe(false);
   });
 
   it("clears the cookies when the API answers 500, and with no session at all", async () => {
     fetchMock.mockResolvedValueOnce(new Response("boom", { status: 500 }));
-    const a = await logout(post("logout", {}, { cookie: `matrix_session=${TOKEN}` }));
-    expect(a.headers.getSetCookie().length).toBe(2);
+    const a = await logout(post("logout", {}, { cookie: `__Host-matrix_session=${TOKEN}` }));
+    expect(a.headers.getSetCookie().length).toBe(4);
     const b = await logout(post("logout", {}));
-    expect(b.headers.getSetCookie().length).toBe(2);
+    expect(b.headers.getSetCookie().length).toBe(4);
   });
 });
 
@@ -161,18 +234,19 @@ describe("POST /api/auth/switch-project", () => {
 
   it("switches only to a project the API lists for the user", async () => {
     fetchMock.mockResolvedValueOnce(me());
-    const ok = await switchProject(post("switch-project", { project_id: P1 }, { cookie: `matrix_session=${TOKEN}` }));
+    const ok = await switchProject(post("switch-project", { project_id: P1 }, { cookie: `__Host-matrix_session=${TOKEN}` }));
     expect(ok.status).toBe(200);
-    expect(ok.headers.getSetCookie().find((c) => c.startsWith("matrix_project="))).toContain(P1);
-    expect(ok.headers.getSetCookie().find((c) => c.startsWith("matrix_session="))).toBeUndefined();
+    expect(ok.headers.getSetCookie().find((c) => c.startsWith("__Host-matrix_project="))).toContain(P1);
+    expect(ok.headers.getSetCookie().find((c) => c.startsWith("__Host-matrix_session="))).toBeUndefined();
+    expect(ok.headers.getSetCookie().find((c) => c.startsWith("__Host-matrix_last_project="))).toBeUndefined();
     fetchMock.mockResolvedValueOnce(me());
-    const no = await switchProject(post("switch-project", { project_id: P2 }, { cookie: `matrix_session=${TOKEN}` }));
+    const no = await switchProject(post("switch-project", { project_id: P2 }, { cookie: `__Host-matrix_session=${TOKEN}` }));
     expect(no.status).toBe(404);
     expect(no.headers.getSetCookie()).toHaveLength(0);
   });
 
   it("rejects ids that could not be a project and missing sessions", async () => {
-    expect((await switchProject(post("switch-project", { project_id: "a b\r\nx" }, { cookie: `matrix_session=${TOKEN}` }))).status).toBe(400);
+    expect((await switchProject(post("switch-project", { project_id: "a b\r\nx" }, { cookie: `__Host-matrix_session=${TOKEN}` }))).status).toBe(400);
     expect((await switchProject(post("switch-project", { project_id: P1 }))).status).toBe(401);
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -184,15 +258,15 @@ describe("GET /api/auth/expired", () => {
 
   it("clears a dead session and redirects to /login with a safe next", async () => {
     fetchMock.mockResolvedValueOnce(new Response("{}", { status: 401 }));
-    const res = await get("?next=/traces%3Fa%3D1", `matrix_session=${TOKEN}`);
+    const res = await get("?next=/traces%3Fa%3D1", `__Host-matrix_session=${TOKEN}`);
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe("/login?next=%2Ftraces%3Fa%3D1");
-    expect(res.headers.getSetCookie().some((c) => c.startsWith("matrix_session=;"))).toBe(true);
+    expect(res.headers.getSetCookie().some((c) => c.startsWith("__Host-matrix_session=;"))).toBe(true);
   });
 
   it("does not sign anybody out when the session is still valid", async () => {
     fetchMock.mockResolvedValueOnce(new Response("{}", { status: 200 }));
-    const res = await get("?next=/traces", `matrix_session=${TOKEN}`);
+    const res = await get("?next=/traces", `__Host-matrix_session=${TOKEN}`);
     expect(res.headers.get("location")).toBe("/traces");
     expect(res.headers.getSetCookie()).toHaveLength(0);
   });

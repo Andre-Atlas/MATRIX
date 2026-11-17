@@ -36,6 +36,22 @@ export async function callApi(
   });
 }
 
+/**
+ * Asks the API whether this session is really gone (`/auth/me` answers 401). Any other answer, or
+ * no answer, means "not proven dead": callers must then keep the cookies. A stray 401 from some
+ * other endpoint (or a link planted by another site) can therefore never sign anybody out.
+ */
+export async function sessionIsDead(req: Request, session: Session | null): Promise<boolean> {
+  if (!session) return true;
+  try {
+    const res = await callApi(req, "GET", "/api/v1/auth/me", session);
+    await res.body?.cancel();
+    return res.status === 401;
+  } catch {
+    return false;
+  }
+}
+
 export function retryAfterSeconds(res: Response): number | null {
   const n = Number(res.headers.get("retry-after"));
   return Number.isFinite(n) && n > 0 ? Math.min(3600, Math.ceil(n)) : null;

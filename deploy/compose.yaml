@@ -88,6 +88,7 @@ services:
     environment:
       MATRIX_API_URL: http://api:8000
       MATRIX_API_KEY: ${MATRIX_API_KEY:-}
+      MATRIX_WEB_ORIGIN: ${MATRIX_WEB_ORIGIN:-}
     ports:
       - "127.0.0.1:3000:3000"
     depends_on:

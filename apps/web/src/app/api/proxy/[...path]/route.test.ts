@@ -189,13 +189,39 @@ describe("session", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("clears the cookies when the API answers 401", async () => {
-    fetchMock.mockResolvedValueOnce(new Response('{"detail":"invalid or missing credentials"}', { status: 401 }));
+  it("does not expose admin/* (404 without calling the API)", async () => {
+    expect((await GET(req("GET", { "sec-fetch-site": "cross-site" }), ctx("admin", "users"))).status).toBe(404);
+    expect((await POST(req("POST", sameOrigin, "{}"), ctx("admin", "projects"))).status).toBe(404);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("clears the cookies on a 401 only after /auth/me confirms the session is dead", async () => {
+    fetchMock
+      .mockResolvedValueOnce(new Response('{"detail":"invalid or missing credentials"}', { status: 401 }))
+      .mockResolvedValueOnce(new Response("{}", { status: 401 }));
     const res = await GET(req("GET"), ctx("traces"));
     expect(res.status).toBe(401);
+    expect(String(fetchMock.mock.calls[1][0])).toBe("http://api:8000/api/v1/auth/me");
     const cookies = res.headers.getSetCookie();
     expect(cookies.some((c) => c.startsWith("matrix_session=;") && c.includes("Max-Age=0"))).toBe(true);
     expect(cookies.some((c) => c.startsWith("matrix_project=;"))).toBe(true);
+  });
+
+  it("keeps the cookies on a 401 when /auth/me still accepts the session", async () => {
+    fetchMock
+      .mockResolvedValueOnce(new Response("{}", { status: 401 }))
+      .mockResolvedValueOnce(new Response("{}", { status: 200 }));
+    const res = await GET(req("GET"), ctx("evaluators"));
+    expect(res.status).toBe(401);
+    expect(res.headers.getSetCookie()).toHaveLength(0);
+  });
+
+  it("never clears cookies on a cross-site request (no /auth/me call either)", async () => {
+    fetchMock.mockResolvedValueOnce(new Response("{}", { status: 401 }));
+    const res = await GET(req("GET", { "sec-fetch-site": "cross-site" }), ctx("traces"));
+    expect(res.status).toBe(401);
+    expect(res.headers.getSetCookie()).toHaveLength(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("never puts the token in the response, even if the API echoes it", async () => {
@@ -257,7 +283,9 @@ describe("headers", () => {
     expect(res.headers.get("content-disposition")).toBe('attachment; filename="a.bin"');
     expect(res.headers.get("x-content-type-options")).toBe("nosniff");
     expect(res.headers.get("content-security-policy")).toBe("sandbox");
-    expect(res.headers.get("cache-control")).toBe("private, max-age=60");
+    // The upstream's cacheable value is replaced: authenticated answers are never stored.
+    expect(res.headers.get("cache-control")).toBe("private, no-store");
+    expect(res.headers.get("vary")).toMatch(/Cookie/);
     expect(res.headers.get("authorization")).toBeNull();
     expect(res.headers.get("set-cookie")).toBeNull();
     expect(res.headers.get("x-internal")).toBeNull();
@@ -277,5 +305,55 @@ describe("headers", () => {
   it("answers 502 when the API is unreachable", async () => {
     fetchMock.mockRejectedValueOnce(new TypeError("fetch failed"));
     expect((await GET(req("GET"), ctx("traces"))).status).toBe(502);
+  });
+});
+
+describe("cache headers", () => {
+  it("sets private, no-store and Vary: Cookie when the upstream sets nothing", async () => {
+    fetchMock.mockResolvedValueOnce(new Response("{}", { status: 200, headers: { "content-type": "application/json" } }));
+    const res = await GET(req("GET"), ctx("traces"));
+    expect(res.headers.get("cache-control")).toBe("private, no-store");
+    expect(res.headers.get("vary")).toBe("Cookie");
+  });
+
+  it("keeps an upstream value that already forbids storing", async () => {
+    fetchMock.mockResolvedValueOnce(new Response("{}", { status: 200, headers: { "cache-control": "no-store, max-age=0" } }));
+    const res = await GET(req("GET"), ctx("traces"));
+    expect(res.headers.get("cache-control")).toBe("no-store, max-age=0");
+  });
+
+  it("replaces a public upstream value", async () => {
+    fetchMock.mockResolvedValueOnce(new Response("{}", { status: 200, headers: { "cache-control": "public, max-age=3600" } }));
+    const res = await GET(req("GET"), ctx("traces"));
+    expect(res.headers.get("cache-control")).toBe("private, no-store");
+  });
+});
+
+describe("upstream redirects", () => {
+  it("are never followed: 302 to another host goes back to the browser, with no second request", async () => {
+    let calls = 0;
+    // A fake upstream that, like undici, would only follow if asked to.
+    fetchMock.mockImplementation(async (_url: URL, init?: RequestInit) => {
+      calls += 1;
+      expect(init?.redirect).toBe("manual");
+      return new Response("moved", {
+        status: 302,
+        headers: {
+          location: "https://evil.example/steal",
+          "content-disposition": 'attachment; filename="a.bin"',
+          "x-content-type-options": "nosniff",
+          "content-security-policy": "sandbox",
+        },
+      });
+    });
+    const res = await GET(req("GET"), ctx("artifacts", "a1", "download"));
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("https://evil.example/steal");
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(res.headers.get("content-security-policy")).toBe("sandbox");
+    expect(res.headers.get("cache-control")).toBe("private, no-store");
+    expect(await res.text()).toBe("");
+    expect(calls).toBe(1);
+    for (const [url] of fetchMock.mock.calls) expect(new URL(String(url)).host).toBe("api:8000");
   });
 });

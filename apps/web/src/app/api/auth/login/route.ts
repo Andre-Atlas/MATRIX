@@ -3,15 +3,17 @@
 import { callApi, noStore, retryAfterSeconds } from "@/lib/auth-calls";
 import { sameOrigin } from "@/lib/same-origin";
 import {
-  PROJECT_COOKIE,
-  PROJECT_ID_RE,
   TOKEN_RE,
+  lastProjectFor,
   lifetimeSeconds,
   parseCookies,
+  projectCookieName,
   safeNext,
+  setLastProject,
   setSessionCookies,
 } from "@/lib/session-cookie";
-import { roleRank, type Membership } from "@/lib/types";
+import { chooseProject } from "@/lib/project-choice";
+import type { Membership } from "@/lib/types";
 
 const MAX_BODY = 8 * 1024;
 
@@ -69,20 +71,19 @@ export async function POST(req: Request): Promise<Response> {
     return noStore({ detail: "Sign in failed. Try again shortly." }, 502);
   }
   const memberships = data.memberships as Membership[];
-  // Keep the previously selected project when the user still belongs to it.
-  const previous = parseCookies(req.headers.get("cookie"))[PROJECT_COOKIE];
-  const usable = memberships.filter((m) => PROJECT_ID_RE.test(m.project.id));
-  const pick =
-    usable.find((m) => m.project.id === previous) ??
-    [...usable].sort((a, b) => roleRank(b.role) - roleRank(a.role))[0];
+  const cookie = req.headers.get("cookie");
+  const userId = (data.user as { id?: unknown } | null | undefined)?.id;
+  const choice = chooseProject(memberships, lastProjectFor(cookie, userId), parseCookies(cookie)[projectCookieName()] ?? null);
 
   const out = noStore({
     ok: true,
-    next: safeNext(input.next),
+    next: choice.next ?? safeNext(input.next),
     user: data.user,
     memberships,
-    project_id: pick?.project.id ?? null,
+    project_id: choice.projectId,
+    ...(choice.notice ? { notice: choice.notice } : {}),
   });
-  setSessionCookies(out.headers, data.token, pick?.project.id ?? null, maxAge);
+  setSessionCookies(out.headers, data.token, choice.projectId, maxAge);
+  if (choice.projectId) setLastProject(out.headers, userId, choice.projectId);
   return out;
 }

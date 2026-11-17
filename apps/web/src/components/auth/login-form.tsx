@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { retryText } from "@/lib/validation";
+import { saveNotice } from "@/lib/login-notice";
 
 type Failure = { text: string; wait: number | null };
 
@@ -23,8 +24,10 @@ export function LoginForm({ next }: { next: string }) {
         body: JSON.stringify({ email, password, next }),
         cache: "no-store",
       });
-      const body = (await res.json().catch(() => ({}))) as { next?: string; detail?: string; retry_after?: number };
+      const body = (await res.json().catch(() => ({}))) as { next?: string; detail?: string; retry_after?: number; notice?: unknown };
       if (res.ok) {
+        // e.g. "You were added to project X": shown once on the first page after the redirect.
+        if (typeof body.notice === "string" && body.notice) saveNotice(body.notice);
         // Full navigation: the new cookies apply and every server component re-renders signed in.
         window.location.assign(typeof body.next === "string" && body.next.startsWith("/") ? body.next : "/");
         return;
