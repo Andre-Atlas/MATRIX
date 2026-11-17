@@ -253,6 +253,10 @@ class EgressClient:
                 out_headers = httpx.Headers(
                     [(k, v) for k, v in out_headers.multi_items() if k.lower() in _CROSS_ORIGIN_KEEP_HEADERS]
                 )
+                if body is not None:  # 307/308 keep the method: the body never goes to another origin
+                    body = None
+                    for h in ("content-type", "content-length"):
+                        out_headers.pop(h, None)
             current = nxt
         raise AssertionError("unreachable")  # pragma: no cover
 

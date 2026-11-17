@@ -1,8 +1,12 @@
 """Projects, members, API keys and audit log of a project (contract G0 section 1).
 
 Role rules for members: admins manage viewers and members; only an owner grants, changes or removes
-the admin and owner roles; the last owner can be neither demoted nor removed. Egress hosts live in
-`api/egress.py`.
+the admin and owner roles; the last owner can be neither demoted nor removed. Removing an admin or
+owner also revokes the API keys they created in the project (`key.revoke` audited; behaviour change
+of review 5: those keys used to survive the removal). Adding a member answers `202
+{"status": "pending_or_added"}` whether or not the e-mail belongs to a user, so the route cannot be
+used to enumerate accounts; an unknown e-mail adds nothing (no invitations yet: create the user,
+then add them again). Egress hosts live in `api/egress.py`.
 """
 
 from __future__ import annotations
@@ -154,16 +158,27 @@ def list_members(project_id: str, db: DbSession, principal: Admin) -> dict[str, 
     return {"items": [_member_out(u, m) for u, m in rows]}
 
 
-@router.post("/{project_id}/members", status_code=201)
+MEMBER_ADD_ACCEPTED = {"status": "pending_or_added"}
+
+
+@router.post("/{project_id}/members", status_code=202)
 def add_member(
     project_id: str, request: Request, db: DbSession, principal: Admin, payload: Annotated[Any, Body()] = None
 ) -> dict[str, Any]:
+    """Same answer (202) for a known and an unknown e-mail: never reveals whether an account exists.
+    `409` only for a user who is already a member (visible to the admin in the member list anyway)."""
     body: MemberIn = parse_body(MemberIn, payload)
     role = Role.parse(body.role)
     _require_owner_for(principal, role)
     user = users.get_user_by_email(db, body.email)
     if user is None:
-        raise HTTPException(status_code=404, detail="user not found")
+        audit.record(
+            db, action="member.add", project_id=principal.project_id, target=None,
+            detail={"role": body.role, "email": users.mask_email(body.email), "result": "no_such_user",
+                    **request_detail(request)},
+            **_actor(principal),
+        )
+        return dict(MEMBER_ADD_ACCEPTED)
     membership = Membership(user_id=user.id, project_id=principal.project_id, role=body.role)
     try:
         with db.begin_nested():
@@ -174,7 +189,7 @@ def add_member(
         db, action="member.add", project_id=principal.project_id, target=user.id,
         detail={"role": body.role, **request_detail(request)}, **_actor(principal),
     )
-    return _member_out(user, membership)
+    return dict(MEMBER_ADD_ACCEPTED)
 
 
 @router.patch("/{project_id}/members/{user_id}")
@@ -211,12 +226,29 @@ def remove_member(project_id: str, user_id: str, request: Request, db: DbSession
     _require_owner_for(principal, current)
     if current == Role.OWNER:
         _ensure_other_owner(db, principal.project_id, user_id)
-    # Only the membership goes: the user's sessions (other projects) and the keys they created stay.
     db.delete(membership)
     audit.record(
         db, action="member.remove", project_id=principal.project_id, target=user_id,
         detail={"role": membership.role, **request_detail(request)}, **_actor(principal),
     )
+    # The user's sessions stay (they may belong to other projects). An admin/owner may have created
+    # API keys here (only admins can): those are revoked with the membership, so a removed admin
+    # keeps no access through them. Keys of removed viewers/members cannot exist (they cannot create
+    # keys) and keys created by others are untouched.
+    if current >= Role.ADMIN:
+        now = utcnow()
+        keys = db.scalars(
+            select(ApiKey).where(
+                ApiKey.project_id == principal.project_id, ApiKey.created_by == user_id, ApiKey.revoked_at.is_(None)
+            )
+        ).all()
+        for key in keys:
+            key.revoked_at = now
+            audit.record(
+                db, action="key.revoke", project_id=principal.project_id, target=key.id,
+                detail={"prefix": key.prefix, "reason": "member.remove", **request_detail(request)},
+                **_actor(principal),
+            )
     return Response(status_code=204)
 
 

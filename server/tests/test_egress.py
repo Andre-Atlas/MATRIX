@@ -473,13 +473,20 @@ def test_redirect_to_other_port_is_cross_origin(db, server):
     assert "x-api-key" not in other
 
 
-def test_cross_origin_post_keeps_content_type_with_307(db, server):
+@pytest.mark.parametrize("code", [307, 308])
+def test_cross_origin_307_308_drop_the_body(db, server, code):
+    """LOW (review 5): a 307/308 keeps the method, and used to carry the body to the other origin."""
     _Net(server, {"a.example.com": [PUBLIC_IP], "b.example.com": ["8.8.8.8"]})
     seen = _client(db, settings=_public()).post(
-        "http://a.example.com/redirect?code=307&to=http://b.example.com/echo",
-        json={"x": 1}, headers={"X-Api-Key": "k1"},
+        f"http://a.example.com/redirect?code={code}&to=http://b.example.com/echo",
+        json={"secret": "body"}, headers={"X-Api-Key": "k1"},
     ).json()
-    assert seen["content-type"] == "application/json" and "x-api-key" not in seen
+    assert "content-type" not in seen and "x-api-key" not in seen
+    assert seen.get("content-length", "0") == "0"
+    same = _client(db, settings=_public()).post(
+        f"http://a.example.com/redirect?code={code}&to=/echo", json={"x": 1}, headers={"X-Api-Key": "k1"},
+    ).json()
+    assert same["content-type"] == "application/json" and same["content-length"] == str(len(b'{"x":1}'))
 
 
 def test_redirect_limit(db, server):
@@ -688,3 +695,34 @@ def test_tls_verifies_original_hostname_on_pinned_ip(db, tls_server):
         client.get("https://other.example.com/ok")
     assert exc.value.reason == "connection_error"
     assert net.dials == [PUBLIC_IP, PUBLIC_IP]
+
+
+# --- review 5: metadata endpoints and provider wildcards -------------------------------------------
+
+
+@pytest.mark.parametrize("ip", ["fd00:ec2::254", "100.100.100.200", "192.0.0.192", "169.254.169.254",
+                                "::ffff:100.100.100.200"])
+def test_cloud_metadata_blocked_even_with_allow_private(ip):
+    from matrix_server.egress import policy
+
+    assert policy._ip_allowed(ip, EgressSettings(mode="public", allow_private=True)) == "forbidden_address"
+    assert policy.classify_ip(ip) == "forbidden_address"
+    # neighbours in the same private ranges stay governed by allow_private
+    assert policy._ip_allowed("100.100.100.201", EgressSettings(mode="public", allow_private=True)) is None
+
+
+@pytest.mark.parametrize("entry", [
+    "*.amazonaws.com", "*.s3.amazonaws.com", "*.s3.eu-west-1.amazonaws.com", "*.compute.amazonaws.com",
+    "*.cloudfront.net", "*.blob.core.windows.net", "*.storage.googleapis.com", "*.github.io",
+    "*.herokuapp.com", "*.vercel.app", "*.netlify.app", "*.pages.dev", "*.workers.dev",
+    "*.pythonanywhere.com",
+])
+def test_wildcards_under_shared_provider_domains_rejected(entry):
+    with pytest.raises(EgressError) as exc:
+        validate_allowlist_entry(entry)
+    assert exc.value.reason in ("shared_provider_domain", "public_suffix")
+
+
+def test_exact_hosts_under_provider_domains_still_allowed():
+    assert validate_allowlist_entry("mybucket.s3.eu-west-1.amazonaws.com") == "mybucket.s3.eu-west-1.amazonaws.com"
+    assert validate_allowlist_entry("*.api.example.com") == "*.api.example.com"

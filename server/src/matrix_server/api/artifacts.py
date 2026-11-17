@@ -10,6 +10,7 @@ normalized and never reach a disk path or an S3 key.
 from __future__ import annotations
 
 import base64
+import logging
 import threading
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -42,6 +43,8 @@ from matrix_server.artifacts.service import (
     ArtifactError,
     HashMismatch,
     Limits,
+    QuotaExceeded,
+    blob_referenced,
     check_quota_for,
     complete_upload,
     created_by_of,
@@ -59,6 +62,7 @@ Viewer = Annotated[Principal, Depends(require(Role.VIEWER, scope="read"))]
 Member = Annotated[Principal, Depends(require(Role.MEMBER, scope="write"))]
 
 router = APIRouter(prefix="/api/v1", tags=["artifacts"])
+log = logging.getLogger(__name__)
 
 MAX_PAGE = 200
 _store_lock = threading.Lock()
@@ -156,11 +160,15 @@ def _header_sha(request: Request) -> str | None:
 
 def _store_direct(app: Any, principal: Principal, reader: _BodyReader, **kw: Any) -> dict[str, Any]:
     session: Session = app.state.session_factory()
+    store = get_store(app)
     try:
-        artifact = store_stream(
-            session, get_store(app), principal, stream=reader, limits=_limits(app), **kw
-        )
+        artifact = store_stream(session, store, principal, stream=reader, limits=_limits(app), **kw)
         session.commit()
+        if not store.exists(artifact.project_id, artifact.sha256):
+            # A concurrent DELETE removed the (deduplicated) blob between our write and our commit.
+            session.delete(artifact)
+            session.commit()
+            raise HTTPException(status_code=409, detail="artifact content was removed concurrently; retry")
         return artifact_out(artifact)
     except ArtifactError as exc:
         session.rollback()
@@ -275,7 +283,8 @@ def _put_content(app: Any, principal: Principal, artifact_id: str, reader: _Body
             info = store.put(pid, reader, max_bytes=size)
         except BlobTooLarge:
             raise HTTPException(status_code=422, detail="content exceeds the declared size") from None
-        if info.sha256 != sha or info.size != size:
+
+        def drop_new_blob() -> None:
             if info.created:
                 others = session.scalar(
                     select(Artifact.id)
@@ -284,7 +293,17 @@ def _put_content(app: Any, principal: Principal, artifact_id: str, reader: _Body
                 )
                 if others is None:
                     store.delete(pid, info.sha256)
+
+        if info.sha256 != sha or info.size != size:
+            drop_new_blob()
             raise HTTPException(status_code=422, detail="content does not match the declared size or sha256")
+        try:  # again with the size actually received (the reservation may predate other uploads)
+            check_quota_for(session, pid, info.sha256, info.size, _limits(app))
+        except ArtifactError as exc:
+            drop_new_blob()
+            session.delete(artifact)
+            session.commit()
+            raise _http(exc) from None
         session.commit()
     finally:
         session.close()
@@ -305,7 +324,7 @@ def complete(artifact_id: str, request: Request, principal: Member, db: DbSessio
         raise HTTPException(status_code=410, detail="upload expired")
     try:
         complete_upload(db, get_store(request.app), artifact, _limits(request.app))
-    except HashMismatch as exc:
+    except (HashMismatch, QuotaExceeded) as exc:
         db.commit()  # the failed upload's row is removed
         raise _http(exc) from None
     except ArtifactError as exc:
@@ -407,16 +426,31 @@ def download(artifact_id: str, request: Request, principal: Viewer, db: DbSessio
 
 
 @router.delete("/artifacts/{artifact_id}", status_code=204)
-def delete_artifact(artifact_id: str, principal: Member, db: DbSession) -> Response:
+def delete_artifact(artifact_id: str, request: Request, principal: Member, db: DbSession) -> Response:
+    """Delete the row and, when no other artifact of the project references the same content, the
+    blob too (right away, so the quota freed by the delete is also freed on disk; the periodic
+    `artifacts.gc` job only catches what a crash or a race left behind)."""
     artifact = _load(db, principal, artifact_id)
+    pid, sha, pending = artifact.project_id, artifact.sha256, artifact.status == "pending"
     audit.record(
         db,
         action="artifact.delete",
         project_id=principal.project_id,
-        actor_kind=principal.kind,
-        actor_id=principal.user_id,
+        actor_kind=principal.actor_kind,
+        actor_id=principal.actor_id,
         target=artifact.id,
         detail={"sha256": artifact.sha256, "size": artifact.size, "status": artifact.status},
     )
     db.delete(artifact)
+    db.flush()
+    orphan = not blob_referenced(db, pid, sha)
+    db.commit()
+    store = get_store(request.app)
+    try:
+        if pending:
+            store.delete_upload(pid, artifact_id)
+        if orphan:
+            store.delete(pid, sha)
+    except Exception:  # noqa: BLE001 - the row is gone; the GC removes what is left
+        log.warning("artifact %s: blob delete failed; left to the GC", artifact_id)
     return Response(status_code=204)

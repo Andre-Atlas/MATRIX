@@ -142,6 +142,22 @@ def test_delete_run(store, project):
     assert store.keys(project, "keep") == ["loss"]
 
 
+def test_delete_project_removes_every_run_of_the_project(store, project):
+    """Project deletion (`project.purge_spans` job) removes the project's points from `run_metrics`."""
+    other = project + "-other"
+    store.insert(project, "r1", pts("loss", range(3), range(3)))
+    store.insert(project, "r2", pts("acc", range(3), range(3)))
+    store.insert(other, "r1", pts("loss", range(3), range(3)))
+    if isinstance(store, ClickHouseMetricStore):
+        store.delete_project(project, wait=True)
+    else:
+        store.delete_project(project)
+    assert store.keys(project, "r1") == [] and store.keys(project, "r2") == []
+    assert store.read_series(project, ["r1", "r2"], ["loss", "acc"])[0] == {}
+    assert store.keys(other, "r1") == ["loss"]
+    store.delete_project(other)
+
+
 def test_step_range_filter(store, project):
     store.insert(project, "r", pts("loss", range(100), range(100)))
     s = store.read_series(project, ["r"], ["loss"], from_step=10, to_step=19)[0]["r"]["loss"]

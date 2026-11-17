@@ -23,10 +23,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, BinaryIO
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import and_, delete, func, or_, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from matrix_server.artifacts import CHUNK_SIZE, ArtifactStore, BlobNotFound, BlobTooLarge
+from matrix_server.artifacts import CHUNK_SIZE, ArtifactStore, BlobNotFound, BlobTooLarge, UploadChanged
 from matrix_server.artifacts.models import Artifact
 from matrix_server.storage.db import as_utc, utcnow
 
@@ -34,6 +34,8 @@ GC_JOB_KIND = "artifacts.gc"
 GC_JOB_PROJECT = "_system"
 PENDING_TTL = timedelta(hours=24)
 GC_GRACE = timedelta(hours=1)
+GC_INTERVAL = timedelta(hours=1)
+_GC_LOCK_ID = 0x6D78_6172_7467  # pg_advisory_xact_lock key ("mxartg")
 MAX_NAME_CHARS = 255
 DEFAULT_MEDIA_TYPE = "application/octet-stream"
 INLINE_MEDIA_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp", "image/avif"})
@@ -136,17 +138,27 @@ def is_inline_type(media_type: str) -> bool:
 # --- quota --------------------------------------------------------------------------------------
 
 
-def project_usage(session: Session, project_id: str) -> int:
-    per_blob = (
-        select(Artifact.sha256, func.max(Artifact.size).label("size"))
-        .where(Artifact.project_id == project_id)
-        .group_by(Artifact.sha256)
-        .subquery()
+def _counted(now: datetime | None = None):
+    """Rows that hold quota: ready artifacts and pending reservations that have not expired."""
+    cutoff = (now or utcnow()) - PENDING_TTL
+    return or_(Artifact.status == "ready", and_(Artifact.status == "pending", Artifact.created_at >= cutoff))
+
+
+def project_usage(session: Session, project_id: str, *, exclude_sha256: str | None = None) -> int:
+    """Bytes held by the project: one size per distinct blob (`sha256`) among ready artifacts and
+    active pending reservations (by their declared size). `exclude_sha256` leaves one blob out, so
+    a caller can add the size it is about to store for that digest without counting it twice."""
+    stmt = select(Artifact.sha256, func.max(Artifact.size).label("size")).where(
+        Artifact.project_id == project_id, _counted()
     )
+    if exclude_sha256 is not None:
+        stmt = stmt.where(Artifact.sha256 != exclude_sha256)
+    per_blob = stmt.group_by(Artifact.sha256).subquery()
     return int(session.scalar(select(func.coalesce(func.sum(per_blob.c.size), 0))) or 0)
 
 
 def blob_referenced(session: Session, project_id: str, sha256: str) -> bool:
+    """Any row (ready or pending) points at the blob: it must not be deleted from the store."""
     return (
         session.scalar(
             select(Artifact.id).where(Artifact.project_id == project_id, Artifact.sha256 == sha256).limit(1)
@@ -155,23 +167,50 @@ def blob_referenced(session: Session, project_id: str, sha256: str) -> bool:
     )
 
 
+def blob_stored(session: Session, project_id: str, sha256: str, size: int = 0) -> bool:
+    """A ready, verified artifact already holds this content (same digest, at least `size` bytes):
+    storing it again adds nothing to the quota (dedup). Pending reservations never count here, so a
+    reservation (e.g. of size 0) cannot be used to skip the quota check for the same digest."""
+    return (
+        session.scalar(
+            select(Artifact.id)
+            .where(
+                Artifact.project_id == project_id,
+                Artifact.sha256 == sha256,
+                Artifact.status == "ready",
+                Artifact.verified.is_(True),
+                Artifact.size >= size,
+            )
+            .limit(1)
+        )
+        is not None
+    )
+
+
 def upload_budget(session: Session, project_id: str, limits: Limits, sha256: str | None = None) -> int:
     """Max bytes an upload may stream: the per-object limit, capped by the quota left — or by the
-    largest blob already in the project, since content equal to a stored blob (dedup) adds nothing.
-    A new blob that still goes over the quota is removed after hashing (`store_stream`)."""
-    if sha256 and blob_referenced(session, project_id, sha256):
+    largest ready blob already in the project, since content equal to a stored blob (dedup) adds
+    nothing. A new blob that still goes over the quota is removed after hashing (`store_stream`)."""
+    if sha256 and blob_stored(session, project_id, sha256):
         return limits.max_artifact_bytes
-    remaining = limits.project_quota_bytes - project_usage(session, project_id)
-    largest = session.scalar(select(func.max(Artifact.size)).where(Artifact.project_id == project_id)) or 0
+    remaining = limits.project_quota_bytes - project_usage(session, project_id, exclude_sha256=sha256)
+    largest = (
+        session.scalar(
+            select(func.max(Artifact.size)).where(Artifact.project_id == project_id, Artifact.status == "ready")
+        )
+        or 0
+    )
     return max(0, min(limits.max_artifact_bytes, max(remaining, int(largest))))
 
 
 def check_quota_for(session: Session, project_id: str, sha256: str, size: int, limits: Limits) -> None:
+    """Raise unless `size` bytes of content `sha256` fit: free when a ready artifact already stores
+    it, else the usage of every other blob plus `size` must stay within the quota."""
     if size > limits.max_artifact_bytes:
         raise TooLarge("artifact exceeds the size limit")
-    if blob_referenced(session, project_id, sha256):
+    if blob_stored(session, project_id, sha256, size):
         return
-    if project_usage(session, project_id) + size > limits.project_quota_bytes:
+    if project_usage(session, project_id, exclude_sha256=sha256) + size > limits.project_quota_bytes:
         raise QuotaExceeded("project artifact quota exceeded")
 
 
@@ -225,8 +264,9 @@ def store_stream(
     try:
         if expected_sha256 is not None and info.sha256 != expected_sha256:
             raise HashMismatch("sha256 does not match the content")
-        if info.created:
-            check_quota_for(session, project_id, info.sha256, info.size, limits)
+        # Always (also for a blob that already existed in the store: an orphan awaiting deletion,
+        # or one only a pending reservation points at); `check_quota_for` handles real dedup.
+        check_quota_for(session, project_id, info.sha256, info.size, limits)
         artifact = Artifact(
             project_id=project_id,
             name=name,
@@ -287,6 +327,18 @@ def hash_stream(stream: BinaryIO, limit: int | None = None) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
+def _discard(session: Session, store: ArtifactStore, artifact: Artifact, *, staged: bool, blob: bool) -> None:
+    """Remove a failed pending upload: its staged object, its row and, when `blob`, the blob it
+    wrote under its digest if nothing else in the project points at it (the caller commits)."""
+    pid, sha = artifact.project_id, artifact.sha256
+    if staged:
+        store.delete_upload(pid, artifact.id)
+    session.delete(artifact)
+    session.flush()
+    if blob and not blob_referenced(session, pid, sha):
+        store.delete(pid, sha)
+
+
 def complete_upload(session: Session, store: ArtifactStore, artifact: Artifact, limits: Limits) -> Artifact:
     """Settle a pending presigned upload: check the staged object's size and prove its sha256, then
     move it to the blob key and mark the artifact ready. Idempotent for a ready artifact.
@@ -294,32 +346,47 @@ def complete_upload(session: Session, store: ArtifactStore, artifact: Artifact, 
     Invariant (audit S11): a blob key `{project}/{aa}/{sha256}` only ever holds content proven to
     hash to `sha256` — hashed by `put`, re-hashed here up to `verify_hash_max_bytes`, or, above it,
     checked by the S3 server (`x-amz-checksum-sha256`, signed into the presigned PUT; trusted only
-    with `MATRIX_S3_TRUST_CHECKSUM=1`). An object that cannot be proven is never promoted: it is
-    removed with its row and `HashMismatch` (422) is raised; the client can use the direct upload,
-    which hashes any size. `UploadMissing` (409) when nothing was uploaded yet."""
+    with `MATRIX_S3_TRUST_CHECKSUM=1`). The staged object is pinned to the version (ETag) seen by
+    the size check: it is hashed with `If-Match` and promoted with `CopySourceIfMatch`, so a client
+    re-PUTting the presigned URL between the hash and the copy makes the promotion fail
+    (`UploadChanged`) instead of promoting unverified content. An object that cannot be proven is
+    never promoted: it is removed with its row and `HashMismatch` (422) is raised; the client can
+    use the direct upload, which hashes any size. `UploadMissing` (409) when nothing was uploaded
+    yet. The quota is checked again with the size actually received (`QuotaExceeded`, 413; the
+    upload and its row are removed)."""
     if artifact.status == "ready":
         return artifact
     pid, sha, size = artifact.project_id, artifact.sha256, artifact.size
-    staged = store.stat_upload(pid, artifact.id)
+    staged = store.stat_upload_info(pid, artifact.id)
     if staged is not None:
         detail = None
-        if staged != size:  # audit S10: never accept more (or less) than was declared and reserved
+        if staged.size != size:  # audit S10: never accept more (or less) than was declared and reserved
             detail = "uploaded object does not match the declared size"
         elif size <= limits.verify_hash_max_bytes:
-            got, read = hash_stream(store.open_upload(pid, artifact.id), size)
+            try:
+                got, read = hash_stream(store.open_upload(pid, artifact.id, etag=staged.etag), size)
+            except (BlobNotFound, UploadChanged):
+                got, read = "", -1
             if got != sha or read != size:
                 detail = "uploaded object does not match the declared sha256"
-        elif store.upload_checksum(pid, artifact.id) != sha:
+        elif store.upload_checksum(pid, artifact.id, etag=staged.etag) != sha:
             detail = (
                 "uploaded object is larger than MATRIX_VERIFY_HASH_MAX_BYTES and its sha256 cannot be "
                 "verified; use the direct upload (POST /api/v1/artifacts)"
             )
+        if detail is None:
+            try:
+                check_quota_for(session, pid, sha, staged.size, limits)
+            except ArtifactError:
+                _discard(session, store, artifact, staged=True, blob=False)
+                raise
+            try:
+                store.promote_upload(pid, artifact.id, sha, etag=staged.etag)
+            except UploadChanged:
+                detail = "uploaded object changed while it was being verified"
         if detail is not None:
-            store.delete_upload(pid, artifact.id)
-            session.delete(artifact)
-            session.flush()
+            _discard(session, store, artifact, staged=True, blob=False)
             raise HashMismatch(detail)
-        store.promote_upload(pid, artifact.id, sha)
     else:
         # Content already stored under this digest (dedup within the project, or the local
         # backend's content route, which hashes while writing).
@@ -339,6 +406,11 @@ def complete_upload(session: Session, store: ArtifactStore, artifact: Artifact, 
                 session.delete(artifact)
                 session.flush()
                 raise HashMismatch("stored object does not match the declared sha256")
+        try:
+            check_quota_for(session, pid, sha, existing, limits)
+        except ArtifactError:
+            _discard(session, store, artifact, staged=False, blob=True)
+            raise
     artifact.status = "ready"
     artifact.verified = True
     session.flush()
@@ -398,16 +470,34 @@ def gc(
     return result
 
 
-def schedule_gc(session_factory: sessionmaker[Session] | Callable[[], Session], *, run_after=None) -> bool:
-    """Enqueue an `artifacts.gc` job unless one is already queued or running. Returns True if added."""
+def ensure_gc_scheduled(
+    session: Session,
+    *,
+    delay: timedelta = timedelta(0),
+    exclude_job_id: str | None = None,
+    count_running: bool = True,
+) -> bool:
+    """Enqueue an `artifacts.gc` job unless one is already queued (or, with `count_running`, being
+    run: a running GC enqueues its own successor `GC_INTERVAL` later). Same self-rescheduling
+    mechanism as the `runs.reaper` job; the worker calls it at start-up. On PostgreSQL an advisory
+    transaction lock serializes the check-and-insert. The caller commits. True if it enqueued one."""
     from matrix_server.storage import jobs
     from matrix_server.storage.models import Job
 
+    if session.get_bind().dialect.name == "postgresql":
+        session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _GC_LOCK_ID})
+    statuses = ["queued", "running"] if count_running else ["queued"]
+    query = select(func.count()).select_from(Job).where(Job.kind == GC_JOB_KIND, Job.status.in_(statuses))
+    if exclude_job_id is not None:
+        query = query.where(Job.id != exclude_job_id)
+    if session.scalar(query):
+        return False
+    jobs.enqueue(session, GC_JOB_PROJECT, GC_JOB_KIND, {}, run_after=utcnow() + delay, max_attempts=1)
+    return True
+
+
+def schedule_gc(session_factory: sessionmaker[Session] | Callable[[], Session], *, run_after=None) -> bool:
+    """Enqueue an `artifacts.gc` job unless one is already queued or running. Returns True if added."""
+    delay = timedelta(0) if run_after is None else max(timedelta(0), run_after - utcnow())
     with session_factory() as session, session.begin():
-        pending = session.scalar(
-            select(Job.id).where(Job.kind == GC_JOB_KIND, Job.status.in_(("queued", "running"))).limit(1)
-        )
-        if pending is not None:
-            return False
-        jobs.enqueue(session, GC_JOB_PROJECT, GC_JOB_KIND, {}, run_after=run_after, max_attempts=1)
-        return True
+        return ensure_gc_scheduled(session, delay=delay)

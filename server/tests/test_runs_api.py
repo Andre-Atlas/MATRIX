@@ -598,3 +598,23 @@ def test_one_million_points_through_the_api(client, two, request):
     print(f"\nAPI 1M points: ingest {ingest:.1f}s ({1e6 / ingest:,.0f} pts/s), read best {min(timings) * 1000:.0f} ms")
     assert min(timings) < 1.0
     client.app.state.metric_store.delete_run(one.id, rid)
+
+
+def test_run_limits_per_project(client, two):
+    """LOW (review 5): runs per project and running runs per project are bounded."""
+    one, other = two
+    client.app.state.settings = client.app.state.settings.model_copy(
+        update={"max_runs_per_project": 3, "max_active_runs_per_project": 2}
+    )
+    a = new_run(client, one)
+    b = new_run(client, one)
+    busy = client.post("/api/v1/runs", json={}, headers=one.key)
+    assert busy.status_code == 429 and busy.headers["retry-after"]
+    client.patch(f"/api/v1/runs/{a['id']}", json={"status": "finished"}, headers=one.key)
+    new_run(client, one)  # one finished: room for another running run
+    full = client.post("/api/v1/runs", json={}, headers=one.key)
+    assert full.status_code == 409  # 3 runs in the project
+    new_run(client, other)  # per project: the other project is not affected
+    assert client.delete(f"/api/v1/runs/{a['id']}", headers=one.owner).status_code == 204
+    client.patch(f"/api/v1/runs/{b['id']}", json={"status": "finished"}, headers=one.key)
+    new_run(client, one)  # deleting runs makes room again

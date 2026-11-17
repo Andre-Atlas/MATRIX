@@ -48,6 +48,32 @@ PUBLIC_SUFFIXES = frozenset(
 )
 
 
+# Wildcards (`*.x`) are refused under these provider domains (and their subdomains, e.g. the regional
+# `s3.<region>.amazonaws.com`): every customer of the provider can publish under them, so a wildcard
+# would allow anyone's bucket/site. An exact host (`mybucket.s3.amazonaws.com`) is still accepted.
+SHARED_PROVIDER_DOMAINS = frozenset(
+    {
+        "amazonaws.com", "cloudfront.net", "awsapprunner.com", "on.aws",
+        "blob.core.windows.net", "web.core.windows.net", "azurewebsites.net", "azureedge.net",
+        "cloudapp.net", "windows.net", "storage.googleapis.com", "googleusercontent.com",
+        "appspot.com", "run.app", "web.app", "firebaseapp.com", "cloudfunctions.net",
+        "github.io", "githubusercontent.com", "gitlab.io", "herokuapp.com", "herokudns.com",
+        "vercel.app", "netlify.app", "pages.dev", "workers.dev", "r2.dev", "fly.dev", "onrender.com",
+        "pythonanywhere.com", "ngrok.io", "ngrok-free.app", "repl.co", "glitch.me", "blogspot.com",
+        "digitaloceanspaces.com", "ondigitalocean.app", "backblazeb2.com", "wasabisys.com",
+        "linodeobjects.com", "nip.io", "sslip.io",
+    }
+)
+
+# Cloud metadata endpoints refused even with MATRIX_EGRESS_ALLOW_PRIVATE (they sit in ranges that
+# setting would otherwise open): AWS IMDS over IPv6, Alibaba Cloud, Oracle Cloud. The IPv4 link-local
+# endpoint (169.254.169.254) is in an always-forbidden range already.
+ALWAYS_FORBIDDEN_IPS = frozenset(
+    ipaddress.ip_address(a)
+    for a in ("fd00:ec2::254", "fd00:ec2::23", "100.100.100.200", "192.0.0.192", "169.254.169.254")
+)
+
+
 class EgressSettings(BaseSettings):
     """Operator configuration. Never derived from request data."""
 
@@ -146,6 +172,8 @@ PRIVATE = "private_address"  # allowed only with MATRIX_EGRESS_ALLOW_PRIVATE
 
 
 def _classify_v4(ip: ipaddress.IPv4Address) -> str | None:
+    if ip in ALWAYS_FORBIDDEN_IPS:
+        return FORBIDDEN
     if any(ip in n for n in _V4_ALWAYS) or ip.is_multicast or ip.is_link_local or ip.is_unspecified:
         return FORBIDDEN
     if ip.is_reserved:
@@ -160,7 +188,7 @@ def classify_ip(value: str | ipaddress.IPv4Address | ipaddress.IPv6Address) -> s
     ip = ipaddress.ip_address(value) if isinstance(value, str) else value
     if isinstance(ip, ipaddress.IPv4Address):
         return _classify_v4(ip)
-    if ip.scope_id:
+    if ip.scope_id or ip in ALWAYS_FORBIDDEN_IPS:
         return FORBIDDEN
     if any(ip in n for n in _V6_ALWAYS) or ip.is_multicast or ip.is_link_local or ip.is_unspecified:
         return FORBIDDEN
@@ -287,6 +315,8 @@ def validate_allowlist_entry(raw: str) -> str:
         raise EgressError("invalid_host", "host must be a fully qualified domain name")
     if host in PUBLIC_SUFFIXES:
         raise EgressError("public_suffix", "public suffixes are not allowed")
+    if wildcard and any(host == d or host.endswith(f".{d}") for d in SHARED_PROVIDER_DOMAINS):
+        raise EgressError("shared_provider_domain", "wildcards under a shared hosting/storage provider domain are not allowed")
     return f"*.{host}" if wildcard else host
 
 

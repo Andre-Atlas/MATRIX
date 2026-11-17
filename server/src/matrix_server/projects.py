@@ -17,7 +17,8 @@ _RETAINED_TABLES = {"audit_log"}
 def delete_project(session: Session, project_id: str) -> None:
     """Delete every relational row of the project (every table with a `project_id` column, in
     reverse dependency order, so tables added by later modules are covered too) and schedule the
-    removal of its spans. Artifact blobs are left to the artifact GC (no row references them)."""
+    `project.purge_spans` job, which removes what lives outside the relational store: the spans,
+    the run metric points (`run_metrics`) and the artifact blobs (`workers.handlers`)."""
     for table in reversed(Base.metadata.sorted_tables):
         if table.name in _RETAINED_TABLES or "project_id" not in table.c:
             continue

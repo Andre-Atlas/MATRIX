@@ -110,7 +110,14 @@ def settle_failed_experiment(session_factory: sessionmaker[Session], job: Job) -
 
 @register(PURGE_SPANS_JOB)
 def purge_project_spans(session: Session, job: Job) -> None:
-    """Spans of a deleted project (`DELETE /api/v1/projects/{id}`); relational rows are already gone."""
+    """Data of a deleted project kept outside the relational store (`DELETE /api/v1/projects/{id}`;
+    its rows are already gone): spans, run metric points and artifact blobs. Each step is
+    idempotent, so a retry after a partial failure redoes all of them."""
+    from matrix_server.workers.artifact_handlers import get_artifact_store
     from matrix_server.workers.online_handlers import get_span_store
+    from matrix_server.workers.run_handlers import get_metric_store
 
     get_span_store().delete_project(job.project_id)
+    get_metric_store().delete_project(job.project_id)
+    removed = get_artifact_store().delete_project(job.project_id)
+    log.info("project %s purged (%d artifact objects)", job.project_id, removed)

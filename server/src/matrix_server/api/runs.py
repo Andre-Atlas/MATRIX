@@ -351,17 +351,34 @@ StepBound = Annotated[int | None, Query(ge=0, le=service.MAX_STEP)]
 
 
 @router.post("/runs", response_model=RunOut, status_code=201)
-def create_run(principal: Member, db: DbSession, payload: Annotated[Any, Body()] = None) -> RunOut:
+def create_run(
+    request: Request, principal: Member, db: DbSession, payload: Annotated[Any, Body()] = None
+) -> RunOut:
     body: RunCreate = _parse(RunCreate, payload if payload is not None else {})
     project_id = principal.project_id
+    settings = request.app.state.settings
+    total = db.scalar(select(func.count()).select_from(Run).where(Run.project_id == project_id)) or 0
+    if total >= settings.max_runs_per_project:
+        raise HTTPException(
+            status_code=409,
+            detail=f"project reached its limit of {settings.max_runs_per_project} runs; delete runs to create more",
+        )
+    active = db.scalar(
+        select(func.count()).select_from(Run).where(Run.project_id == project_id, Run.status == "running")
+    ) or 0
+    if active >= settings.max_active_runs_per_project:
+        raise HTTPException(
+            status_code=429,
+            detail=f"project has {active} running runs (limit {settings.max_active_runs_per_project})",
+            headers={"Retry-After": "60"},
+        )
     if body.parent_run_id is not None and db.scalar(
         select(Run.id).where(Run.id == body.parent_run_id, Run.project_id == project_id)
     ) is None:
         raise HTTPException(status_code=422, detail="parent run not found")
     name = body.name
     if name is None:
-        ordinal = db.scalar(select(func.count()).select_from(Run).where(Run.project_id == project_id)) or 0
-        name = generate_name(ordinal + 1)
+        name = generate_name(total + 1)
     now = utcnow()
     run = Run(
         project_id=project_id,
@@ -559,8 +576,8 @@ def delete_run(request: Request, run_id: str, principal: Admin, db: DbSession) -
         db,
         action="run.delete",
         project_id=project_id,
-        actor_kind=principal.kind,
-        actor_id=principal.user_id,
+        actor_kind=principal.actor_kind,
+        actor_id=principal.actor_id,
         target=run_id,
         detail={"name": name},
     )

@@ -34,6 +34,8 @@ from matrix_server.artifacts import (
     BlobTooLarge,
     InvalidKey,
     PresignedRequest,
+    UploadChanged,
+    UploadStat,
     check_project_id,
     check_sha256,
     content_disposition,
@@ -43,12 +45,19 @@ from matrix_server.artifacts import (
 
 PART_SIZE = 8 * 1024 * 1024
 _NOT_FOUND = {"404", "NoSuchKey", "NotFound", "NoSuchBucket", "NoSuchUpload"}
+_PRECONDITION = {"412", "PreconditionFailed"}
 
 
 def _is_not_found(exc: ClientError) -> bool:
     err = exc.response.get("Error", {})
     status = str(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", ""))
     return str(err.get("Code", "")) in _NOT_FOUND or status == "404"
+
+
+def _is_precondition(exc: ClientError) -> bool:
+    err = exc.response.get("Error", {})
+    status = str(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", ""))
+    return str(err.get("Code", "")) in _PRECONDITION or status == "412"
 
 
 def _read_up_to(stream: BinaryIO, n: int) -> bytes:
@@ -164,14 +173,23 @@ class S3ArtifactStore:
         except ClientError:
             pass
 
-    def _promote(self, src_key: str, project_id: str, sha256: str) -> bool:
-        """Copy `src_key` to the blob key unless the blob exists; always delete `src_key`."""
+    def _promote(self, src_key: str, project_id: str, sha256: str, etag: str | None = None) -> bool:
+        """Copy `src_key` to the blob key unless the blob exists; always delete `src_key`.
+
+        With `etag`, the copy carries `CopySourceIfMatch`: if the source was replaced since it was
+        checked, the server refuses the copy and `UploadChanged` is raised (nothing is promoted)."""
         final = object_key(project_id, sha256)
         try:
             if self._head(final) is not None:
                 self._touch(final)
                 return False
-            self.client.copy({"Bucket": self.bucket, "Key": src_key}, self.bucket, final)
+            extra = {"CopySourceIfMatch": etag} if etag else None
+            try:
+                self.client.copy({"Bucket": self.bucket, "Key": src_key}, self.bucket, final, ExtraArgs=extra)
+            except ClientError as exc:
+                if _is_precondition(exc):
+                    raise UploadChanged("staged object changed before promotion") from exc
+                raise
             return True
         finally:
             self.client.delete_object(Bucket=self.bucket, Key=src_key)
@@ -306,17 +324,18 @@ class S3ArtifactStore:
 
     # --- staging -----------------------------------------------------------------------------
 
-    def upload_checksum(self, project_id: str, upload_id: str) -> str | None:
+    def upload_checksum(self, project_id: str, upload_id: str, *, etag: str | None = None) -> str | None:
         """Hex sha256 the server computed and verified for the staged object (None when unknown or
-        when checksums are not trusted)."""
+        when checksums are not trusted). With `etag`, only for that version of the object."""
         if not self.trust_checksum:
             return None
+        kwargs: dict[str, Any] = {"IfMatch": etag} if etag else {}
         try:
             head = self.client.head_object(
-                Bucket=self.bucket, Key=self._upload_key(project_id, upload_id), ChecksumMode="ENABLED"
+                Bucket=self.bucket, Key=self._upload_key(project_id, upload_id), ChecksumMode="ENABLED", **kwargs
             )
         except ClientError as exc:
-            if _is_not_found(exc):
+            if _is_not_found(exc) or _is_precondition(exc):
                 return None
             raise
         value = head.get("ChecksumSHA256")
@@ -328,21 +347,30 @@ class S3ArtifactStore:
             return None
 
     def stat_upload(self, project_id: str, upload_id: str) -> int | None:
-        head = self._head(self._upload_key(project_id, upload_id))
-        return None if head is None else int(head["ContentLength"])
+        info = self.stat_upload_info(project_id, upload_id)
+        return None if info is None else info.size
 
-    def open_upload(self, project_id: str, upload_id: str) -> BinaryIO:
+    def stat_upload_info(self, project_id: str, upload_id: str) -> UploadStat | None:
+        head = self._head(self._upload_key(project_id, upload_id))
+        if head is None:
+            return None
+        return UploadStat(size=int(head["ContentLength"]), etag=head.get("ETag") or None)
+
+    def open_upload(self, project_id: str, upload_id: str, *, etag: str | None = None) -> BinaryIO:
+        kwargs: dict[str, Any] = {"IfMatch": etag} if etag else {}
         try:
-            return self.client.get_object(Bucket=self.bucket, Key=self._upload_key(project_id, upload_id))[
-                "Body"
-            ]
+            return self.client.get_object(
+                Bucket=self.bucket, Key=self._upload_key(project_id, upload_id), **kwargs
+            )["Body"]
         except ClientError as exc:
             if _is_not_found(exc):
                 raise BlobNotFound("no staged upload") from exc
+            if _is_precondition(exc):
+                raise UploadChanged("staged object changed") from exc
             raise
 
-    def promote_upload(self, project_id: str, upload_id: str, sha256: str) -> None:
-        self._promote(self._upload_key(project_id, upload_id), project_id, sha256)
+    def promote_upload(self, project_id: str, upload_id: str, sha256: str, *, etag: str | None = None) -> None:
+        self._promote(self._upload_key(project_id, upload_id), project_id, sha256, etag)
 
     def delete_upload(self, project_id: str, upload_id: str) -> None:
         self.client.delete_object(Bucket=self.bucket, Key=self._upload_key(project_id, upload_id))
@@ -366,6 +394,25 @@ class S3ArtifactStore:
                 continue
             if is_sha256(sha) and prefix == sha[:2]:
                 yield BlobRef(project_id, sha, obj["LastModified"])
+
+    def delete_project(self, project_id: str) -> int:
+        """Delete every object under the project's prefix and abort its multipart uploads."""
+        prefix = f"{check_project_id(project_id)}/"
+        removed = 0
+        paginator = self.client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                self.client.delete_object(Bucket=self.bucket, Key=obj["Key"])
+                removed += 1
+        try:
+            for page in self.client.get_paginator("list_multipart_uploads").paginate(
+                Bucket=self.bucket, Prefix=prefix
+            ):
+                for up in page.get("Uploads", []):
+                    self.client.abort_multipart_upload(Bucket=self.bucket, Key=up["Key"], UploadId=up["UploadId"])
+        except ClientError:
+            pass
+        return removed
 
     def purge_stale(self, older_than: datetime) -> int:
         """Delete temp and staged objects older than `older_than`; abort stale multipart uploads."""

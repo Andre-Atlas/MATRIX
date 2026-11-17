@@ -7,11 +7,16 @@
   session expires after `session_idle_ttl_seconds` without use (sliding; `last_seen_at` is written
   at most once per minute) and `session_absolute_ttl_seconds` after creation.
 - Throttling: failures within `FAILURE_WINDOW` are counted under three keys (`throttle_keys`):
-  the (e-mail, IP) pair (`PAIR_MAX_FAILURES`), the IP alone (`IP_MAX_FAILURES`, stops one client
-  spraying many e-mails) and the e-mail alone (`EMAIL_MAX_FAILURES`, stops a distributed attack on
-  one account). Reaching a limit locks that key for `LOCK_STEPS[n]` (escalating). A successful
-  login clears the pair and e-mail keys, never the IP key (an attacker could reset it with their
-  own account). Keys are hashes, so a locked unknown e-mail behaves exactly like a known one.
+  the (e-mail, network) pair (`PAIR_MAX_FAILURES`), the network alone (`IP_MAX_FAILURES`, stops one
+  client spraying many e-mails) and the e-mail alone (`EMAIL_MAX_FAILURES`, stops a distributed
+  attack on one account). A network is an IPv4 address or an IPv6 /64 (`client_network`). Reaching
+  a limit locks that key for `LOCK_STEPS[n]` (escalating). The attempt is counted BEFORE the
+  password is verified (`reserve_login_attempt`, rows locked), so a parallel burst cannot run more
+  verifications than the limit; a success takes the count back, clears the pair and e-mail keys
+  (never the IP key: an attacker could reset it with their own account) and remembers the network.
+  The e-mail lock does not apply to a remembered network, so nobody can lock an owner out of the
+  networks they use. Keys are hashes, so a locked unknown e-mail behaves exactly like a known one.
+  Stale rows are purged a batch at a time on failed logins (`purge_stale_login_rows`).
 - Cost bound: at most `hash_concurrency` argon2 operations run at once in the process (each uses
   64 MiB); a caller that waits longer than `HASH_WAIT_SECONDS` gets `PasswordHasherBusy` (503).
 
@@ -21,6 +26,7 @@ Nothing here logs passwords, tokens or full e-mails.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import math
 import secrets
 import threading
@@ -28,15 +34,16 @@ import unicodedata
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+from typing import Any
 
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
-from sqlalchemy import select, update
+from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from matrix_server.storage.db import as_utc, utcnow
-from matrix_server.storage.models import LoginAttempt, User, WebSession
+from matrix_server.storage.models import LoginAttempt, LoginKnownIp, User, WebSession
 
 PASSWORD_MIN_CHARS = 12
 PASSWORD_MAX_CHARS = 256
@@ -55,6 +62,9 @@ FAILURE_WINDOW = timedelta(minutes=15)
 LOCK_STEPS = (timedelta(minutes=1), timedelta(minutes=2), timedelta(minutes=5), timedelta(minutes=15))
 # Lock escalation is forgotten after this long without a new lock.
 LOCK_MEMORY = timedelta(hours=24)
+# A network the account logged in from successfully bypasses the e-mail-only lock for this long.
+KNOWN_IP_TTL = timedelta(days=30)
+PURGE_BATCH = 200
 
 password_hasher = PasswordHasher()
 _dummy_hash: str | None = None
@@ -273,25 +283,46 @@ def active_sessions(session: Session, user_id: str, idle_ttl: timedelta) -> list
 # --- login throttling -----------------------------------------------------------
 
 
+def client_network(ip: str | None) -> str:
+    """The throttling unit of a client address: an IPv4 address as is, an IPv6 address by its /64
+    (one subscriber usually holds a whole /64, so per-address keys would be trivially rotated).
+    Anything that is not an IP address (e.g. a test client name) is used verbatim."""
+    if not ip:
+        return ""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    if isinstance(addr, ipaddress.IPv6Address):
+        if addr.ipv4_mapped is not None:
+            return str(addr.ipv4_mapped)
+        return str(ipaddress.ip_network(f"{addr}/64", strict=False))
+    return str(addr)
+
+
 def _throttle_hash(*parts: str) -> str:
     return hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()
 
 
 def attempt_key(email: str, ip: str | None) -> str:
-    """Key of the (e-mail, IP) pair."""
-    return _throttle_hash(normalize_email(email), ip or "")
+    """Key of the (e-mail, network) pair."""
+    return _throttle_hash(normalize_email(email), client_network(ip))
 
 
 def ip_key(ip: str | None) -> str:
-    return _throttle_hash("ip", ip or "")
+    return _throttle_hash("ip", client_network(ip))
 
 
 def email_key(email: str) -> str:
     return _throttle_hash("email", normalize_email(email))
 
 
+def known_ip_key(email: str, ip: str | None) -> str:
+    return _throttle_hash("known", normalize_email(email), client_network(ip))
+
+
 def throttle_keys(email: str, ip: str | None) -> list[tuple[str, int]]:
-    """(key, max failures) for every counter a login failure feeds."""
+    """(key, max failures) for every counter a login failure feeds: pair, IP, e-mail (in this order)."""
     return [
         (attempt_key(email, ip), PAIR_MAX_FAILURES),
         (ip_key(ip), IP_MAX_FAILURES),
@@ -319,36 +350,39 @@ def clear_login_failures(session: Session, email: str, ip: str | None) -> None:
     clear_failures(session, email_key(email))
 
 
-def locked_for(session: Session, key: str, now: datetime | None = None) -> int | None:
-    """Seconds until the (e-mail, IP) pair may try again, or None when it is not locked."""
-    now = now or utcnow()
-    row = session.get(LoginAttempt, key)
+def _remaining(row: LoginAttempt | None, now: datetime) -> int | None:
     if row is None or row.locked_until is None:
         return None
     remaining = (as_utc(row.locked_until) - now).total_seconds()
     return max(1, math.ceil(remaining)) if remaining > 0 else None
 
 
+def locked_for(session: Session, key: str, now: datetime | None = None) -> int | None:
+    """Seconds until the key may try again, or None when it is not locked."""
+    return _remaining(session.get(LoginAttempt, key), now or utcnow())
+
+
+def _insert_ignore(session: Session, model: type, values: dict[str, Any]) -> None:
+    """INSERT ... ON CONFLICT DO NOTHING (PostgreSQL and SQLite). On SQLite the statement also takes
+    the database write lock, so the rest of the transaction is serialized with other writers."""
+    dialect = session.get_bind().dialect.name
+    if dialect == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert
+    else:
+        from sqlalchemy.dialects.sqlite import insert
+    session.execute(insert(model).values(**values).on_conflict_do_nothing())
+
+
 def _attempt_row(session: Session, key: str, now: datetime) -> LoginAttempt:
-    row = session.get(LoginAttempt, key, with_for_update=True)
-    if row is not None:
-        return row
-    try:
-        with session.begin_nested():
-            row = LoginAttempt(key=key, window_start=now, count=0, lock_count=0)
-            session.add(row)
-    except IntegrityError:  # concurrent first failure for the same pair
-        row = session.get(LoginAttempt, key, with_for_update=True, populate_existing=True)
-        assert row is not None
+    """The throttle row of `key`, created if missing and locked for the rest of the transaction
+    (`SELECT ... FOR UPDATE` on PostgreSQL; the write lock taken by the insert on SQLite)."""
+    _insert_ignore(session, LoginAttempt, {"key": key, "window_start": now, "count": 0, "lock_count": 0})
+    row = session.get(LoginAttempt, key, with_for_update=True, populate_existing=True)
+    assert row is not None
     return row
 
 
-def register_failure(
-    session: Session, key: str, now: datetime | None = None, max_failures: int = PAIR_MAX_FAILURES
-) -> int | None:
-    """Count one failure; return the lock duration in seconds when this failure locks the pair."""
-    now = now or utcnow()
-    row = _attempt_row(session, key, now)
+def _count_failure(row: LoginAttempt, now: datetime, max_failures: int) -> int | None:
     # `locked_until` stays set after the lock expires: it dates the last lock for LOCK_MEMORY.
     locked_until = as_utc(row.locked_until)
     if locked_until is not None and now - locked_until >= LOCK_MEMORY:
@@ -357,14 +391,22 @@ def register_failure(
         row.window_start = now
         row.count = 0
     row.count += 1
-    lock_seconds = None
     if row.count >= max_failures:
         step = LOCK_STEPS[min(row.lock_count, len(LOCK_STEPS) - 1)]
         row.lock_count += 1
         row.locked_until = now + step
         row.count = 0
         row.window_start = now
-        lock_seconds = int(step.total_seconds())
+        return int(step.total_seconds())
+    return None
+
+
+def register_failure(
+    session: Session, key: str, now: datetime | None = None, max_failures: int = PAIR_MAX_FAILURES
+) -> int | None:
+    """Count one failure; return the lock duration in seconds when this failure locks the key."""
+    now = now or utcnow()
+    lock_seconds = _count_failure(_attempt_row(session, key, now), now, max_failures)
     session.flush()
     return lock_seconds
 
@@ -374,3 +416,97 @@ def clear_failures(session: Session, key: str) -> None:
     if row is not None:
         session.delete(row)
         session.flush()
+
+
+def is_known_ip(session: Session, email: str, ip: str | None, now: datetime | None = None) -> bool:
+    now = now or utcnow()
+    row = session.get(LoginKnownIp, known_ip_key(email, ip))
+    return row is not None and now - as_utc(row.last_success_at) < KNOWN_IP_TTL
+
+
+def remember_ip(session: Session, email: str, ip: str | None, now: datetime | None = None) -> None:
+    now = now or utcnow()
+    key = known_ip_key(email, ip)
+    _insert_ignore(session, LoginKnownIp, {"key": key, "last_success_at": now})
+    session.execute(update(LoginKnownIp).where(LoginKnownIp.key == key).values(last_success_at=now))
+
+
+def reserve_login_attempt(session: Session, email: str, ip: str | None, now: datetime | None = None) -> int | None:
+    """Run BEFORE the password is verified; the caller commits right away (before argon2).
+
+    Locks the attempt's throttle rows (in key order, so concurrent attempts cannot deadlock) and
+    either refuses — returning the seconds to wait — or counts the attempt as a failure in advance
+    under every key. Concurrent attempts are therefore serialized on the rows: a burst of N
+    parallel logins runs at most `PAIR_MAX_FAILURES` verifications before the pair locks, instead
+    of N. `login_succeeded` undoes the advance count; `release_login_attempt` drops it when no
+    verification happened.
+
+    The e-mail-only lock (a distributed attack on one account) does not apply to a network the
+    account logged in from successfully within `KNOWN_IP_TTL`: an attacker can lock an account for
+    unknown networks, never lock its owner out of their usual one (the pair and IP locks still apply
+    there). For unknown networks the lock escalates (`LOCK_STEPS`), i.e. a progressive delay."""
+    now = now or utcnow()
+    keys = throttle_keys(email, ip)
+    email_k = email_key(email)
+    known = is_known_ip(session, email, ip, now)
+    rows = {key: _attempt_row(session, key, now) for key, _ in sorted(keys)}
+    waits = [
+        w for key, _ in keys if not (key == email_k and known) and (w := _remaining(rows[key], now)) is not None
+    ]
+    if waits:
+        session.flush()
+        return max(waits)
+    for key, limit in keys:
+        if _remaining(rows[key], now) is None:  # a locked e-mail key (known network) is not escalated
+            _count_failure(rows[key], now, limit)
+    session.flush()
+    return None
+
+
+def _uncount(session: Session, key: str) -> None:
+    session.execute(
+        update(LoginAttempt).where(LoginAttempt.key == key, LoginAttempt.count > 0).values(count=LoginAttempt.count - 1)
+    )
+
+
+def release_login_attempt(session: Session, email: str, ip: str | None) -> None:
+    """The reserved attempt was not verified (hasher busy): take its advance count back."""
+    for key, _ in sorted(throttle_keys(email, ip)):
+        _uncount(session, key)
+    session.flush()
+
+
+def login_succeeded(session: Session, email: str, ip: str | None, now: datetime | None = None) -> None:
+    """Reset the pair and e-mail counters, take back the IP counter's advance count (a success
+    never resets the IP counter: an attacker could reset it with their own account) and remember
+    the network for the e-mail lock bypass."""
+    clear_login_failures(session, email, ip)
+    _uncount(session, ip_key(ip))
+    remember_ip(session, email, ip, now)
+    session.flush()
+
+
+def purge_stale_login_rows(session: Session, now: datetime | None = None, limit: int = PURGE_BATCH) -> int:
+    """Delete at most `limit` throttle rows that no longer matter — window over and no lock within
+    `LOCK_MEMORY` — and known networks older than `KNOWN_IP_TTL`, so the tables stay bounded.
+    Rows locked by an attempt in flight are skipped (`SKIP LOCKED` on PostgreSQL). Caller commits."""
+    now = now or utcnow()
+    stale = and_(
+        LoginAttempt.window_start < now - FAILURE_WINDOW,
+        or_(LoginAttempt.locked_until.is_(None), LoginAttempt.locked_until < now - LOCK_MEMORY),
+    )
+    keys = session.scalars(
+        select(LoginAttempt.key).where(stale).limit(limit).with_for_update(skip_locked=True)
+    ).all()
+    removed = 0
+    if keys:
+        removed += session.execute(
+            delete(LoginAttempt).where(LoginAttempt.key.in_(keys), stale).execution_options(synchronize_session=False)
+        ).rowcount or 0
+    old = LoginKnownIp.last_success_at < now - KNOWN_IP_TTL
+    known = session.scalars(select(LoginKnownIp.key).where(old).limit(limit).with_for_update(skip_locked=True)).all()
+    if known:
+        removed += session.execute(
+            delete(LoginKnownIp).where(LoginKnownIp.key.in_(known), old).execution_options(synchronize_session=False)
+        ).rowcount or 0
+    return removed

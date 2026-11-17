@@ -100,8 +100,10 @@ def login(request: Request, db: DbSession, payload: Annotated[Any, Body()] = Non
     body: LoginIn = parse_body(LoginIn, payload)
     email = users.normalize_email(body.email)
     ip = client_ip(request)
-    keys = users.throttle_keys(email, ip)
-    retry_after = users.locked_for_any(db, keys)
+    # Count the attempt before verifying (rows locked, committed before argon2): a parallel burst
+    # runs at most PAIR_MAX_FAILURES verifications. Locks refuse without verifying.
+    retry_after = users.reserve_login_attempt(db, email, ip)
+    db.commit()
     if retry_after is not None:
         raise _too_many(retry_after)
 
@@ -111,23 +113,31 @@ def login(request: Request, db: DbSession, payload: Annotated[Any, Body()] = Non
     try:
         ok = users.verify_password(user.password_hash if user else None, body.password)
     except users.PasswordHasherBusy:
+        users.release_login_attempt(db, email, ip)
+        db.commit()
         raise hasher_busy() from None
     ok = ok and len(body.password) <= users.PASSWORD_MAX_CHARS
     if not ok or user is None:
-        lock = users.register_failures(db, keys)
+        locked = users.locked_for_any(db, users.throttle_keys(email, ip)) is not None
         audit.record(
             db,
             action="auth.login_failed",
             actor_kind="user",
             actor_id=user.id if user else None,
             target=user.id if user else None,
-            detail={"email": users.mask_email(email), **request_detail(request), "locked": lock is not None},
+            detail={"email": users.mask_email(email), **request_detail(request), "locked": locked},
         )
         db.commit()
+        try:  # bounded clean-up of expired throttle rows; never fails the request
+            users.purge_stale_login_rows(db)
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.warning("login throttle purge failed", exc_info=True)
         logger.info("login failed for %s from %s", users.mask_email(email), ip)
         raise HTTPException(status_code=401, detail=LOGIN_FAILED, headers={"WWW-Authenticate": "Bearer"})
 
-    users.clear_login_failures(db, email, ip)
+    users.login_succeeded(db, email, ip)
     try:
         users.rehash_if_needed(user, body.password)
     except users.PasswordHasherBusy:
@@ -180,29 +190,32 @@ def change_password(
     if user is None:
         raise HTTPException(status_code=401, detail="invalid or missing credentials")
     ip = client_ip(request)
-    keys = users.throttle_keys(user.email, ip)
-    retry_after = users.locked_for_any(db, keys)
+    email = user.email
+    retry_after = users.reserve_login_attempt(db, email, ip)
+    db.commit()
     if retry_after is not None:
         raise _too_many(retry_after)
     try:
         current_ok = users.verify_password(user.password_hash, body.current_password)
     except users.PasswordHasherBusy:
+        users.release_login_attempt(db, email, ip)
+        db.commit()
         raise hasher_busy() from None
     if not current_ok:
-        users.register_failures(db, keys)
         audit.record(
             db, action="auth.password_change_failed", actor_kind="user", actor_id=user.id, target=user.id,
             detail=request_detail(request),
         )
         db.commit()
         raise HTTPException(status_code=403, detail="current password is incorrect")
+    users.login_succeeded(db, email, ip)  # the current password was right: take the count back
+    db.commit()
     try:
         users.set_password(db, user, body.new_password)
     except users.UserError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except users.PasswordHasherBusy:
         raise hasher_busy() from None
-    users.clear_login_failures(db, user.email, ip)
     revoked = users.revoke_user_sessions(db, user.id, except_id=ctx.session_id)
     audit.record(
         db, action="auth.password_change", actor_kind="user", actor_id=user.id, target=user.id,

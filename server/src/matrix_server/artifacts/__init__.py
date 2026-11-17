@@ -45,11 +45,21 @@ class InvalidKey(ArtifactStoreError, ValueError):
     pass
 
 
+class UploadChanged(ArtifactStoreError):
+    """The staged object is no longer the version that was checked (ETag precondition failed)."""
+
+
 @dataclass(frozen=True)
 class BlobInfo:
     sha256: str
     size: int
     created: bool = True  # False when the blob already existed in the project (dedup)
+
+
+@dataclass(frozen=True)
+class UploadStat:
+    size: int
+    etag: str | None = None  # version pin for open/promote (S3 ETag); None when not applicable
 
 
 @dataclass(frozen=True)
@@ -114,12 +124,15 @@ class ArtifactStore(Protocol):
     # --- extensions (presigned staging and GC) ---
     def size(self, project_id: str, sha256: str) -> int | None: ...
     def stat_upload(self, project_id: str, upload_id: str) -> int | None: ...
-    def upload_checksum(self, project_id: str, upload_id: str) -> str | None: ...  # server-verified hex
-    def open_upload(self, project_id: str, upload_id: str) -> BinaryIO: ...
-    def promote_upload(self, project_id: str, upload_id: str, sha256: str) -> None: ...
+    def stat_upload_info(self, project_id: str, upload_id: str) -> UploadStat | None: ...
+    # Server-verified hex digest. `etag` pins the version; a mismatch raises `UploadChanged`.
+    def upload_checksum(self, project_id: str, upload_id: str, *, etag: str | None = None) -> str | None: ...
+    def open_upload(self, project_id: str, upload_id: str, *, etag: str | None = None) -> BinaryIO: ...
+    def promote_upload(self, project_id: str, upload_id: str, sha256: str, *, etag: str | None = None) -> None: ...
     def delete_upload(self, project_id: str, upload_id: str) -> None: ...
     def iter_blobs(self) -> Iterator[BlobRef]: ...
     def purge_stale(self, older_than: datetime) -> int: ...
+    def delete_project(self, project_id: str) -> int: ...  # every object of the project; returns count
 
 
 def build_artifact_store(settings: Any) -> ArtifactStore:
@@ -146,6 +159,8 @@ __all__ = [
     "BlobTooLarge",
     "InvalidKey",
     "PresignedRequest",
+    "UploadChanged",
+    "UploadStat",
     "build_artifact_store",
     "check_project_id",
     "check_sha256",

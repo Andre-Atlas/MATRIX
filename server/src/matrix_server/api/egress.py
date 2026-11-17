@@ -66,8 +66,8 @@ def add_host(project_id: str, payload: HostIn, db: DbSession, principal: AdminPr
         db,
         action="egress.host_add",
         project_id=project_id,
-        actor_kind=principal.kind,
-        actor_id=principal.user_id,
+        actor_kind=principal.actor_kind,
+        actor_id=principal.actor_id,
         target=host,
     )
     return _out(row)
@@ -83,8 +83,8 @@ def remove_host(project_id: str, host_id: str, db: DbSession, principal: AdminPr
         db,
         action="egress.host_remove",
         project_id=project_id,
-        actor_kind=principal.kind,
-        actor_id=principal.user_id,
+        actor_kind=principal.actor_kind,
+        actor_id=principal.actor_id,
         target=row.host,
     )
     db.delete(row)

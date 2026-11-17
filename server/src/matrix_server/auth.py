@@ -119,6 +119,7 @@ class Principal:
     role: Role  # key: VIEWER (read) or MEMBER (write), VIEWER for ingest-only keys; never ADMIN
     scopes: frozenset[str]
     key_id: str | None = None
+    key_prefix: str | None = None
 
     @property
     def actor_kind(self) -> str:
@@ -126,7 +127,10 @@ class Principal:
 
     @property
     def actor_id(self) -> str | None:
-        return self.user_id if self.kind == "user" else self.key_id
+        """Audit actor: the user id, or the API key's public prefix (what the keys page shows)."""
+        if self.kind == "user":
+            return self.user_id
+        return self.key_prefix or self.key_id
 
 
 @dataclass(frozen=True)
@@ -380,17 +384,17 @@ def _resolve(request: Request, spec: RbacSpec) -> Principal:
     try:
         if kind == "api_key":
             key = authenticate_key(db, raw)
-            key_values = (key.id, key.project_id, key.scopes) if key is not None else None
+            key_values = (key.id, key.project_id, key.scopes, key.prefix) if key is not None else None
             db.commit()
             if key_values is None:
                 raise _unauthorized()
-            key_id, key_project, stored_scopes = key_values
+            key_id, key_project, stored_scopes, key_prefix = key_values
             if conflict or (project_id is not None and project_id != key_project):
                 raise _project_not_found()
             scopes = key_scopes(stored_scopes)
             role = key_role(scopes)
             check_access("api_key", role, scopes, spec.min_role, spec.scope)
-            principal = Principal(key_project, "api_key", None, role or Role.VIEWER, scopes, key_id)
+            principal = Principal(key_project, "api_key", None, role or Role.VIEWER, scopes, key_id, key_prefix)
         else:
             idle_ttl, _ = _settings_ttls(request)
             token_hash = users.hash_token(raw)

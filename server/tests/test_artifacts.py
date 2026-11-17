@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import inspect
+import io
 import os
 import stat
 import threading
@@ -31,7 +32,7 @@ from matrix_server.artifacts.models import Artifact
 from matrix_server.auth import Principal, Role
 from matrix_server.config import Settings
 from matrix_server.limits import BodyLimitMiddleware
-from matrix_server.storage.db import Base, init_db, make_engine, make_session_factory, utcnow
+from matrix_server.storage.db import Base, as_utc, init_db, make_engine, make_session_factory, utcnow
 from matrix_server.storage.models import AuditLog, Project
 
 PG_URL = os.environ.get("MATRIX_TEST_DATABASE_URL")
@@ -453,15 +454,15 @@ class StagingStore(LocalArtifactStore):
         data = self.staged.get((project_id, upload_id))
         return None if data is None else len(data)
 
-    def open_upload(self, project_id, upload_id):
+    def open_upload(self, project_id, upload_id, *, etag=None):
         import io
 
         return io.BytesIO(self.staged[(project_id, upload_id)])
 
-    def upload_checksum(self, project_id, upload_id):
+    def upload_checksum(self, project_id, upload_id, *, etag=None):
         return self.checksum
 
-    def promote_upload(self, project_id, upload_id, sha256):
+    def promote_upload(self, project_id, upload_id, sha256, *, etag=None):
         data = self.staged.pop((project_id, upload_id))
         path = self._blob_path(project_id, sha256)
         self._mkdir(path.parent)
@@ -601,14 +602,16 @@ def test_delete_audits_and_gc_keeps_referenced(env):
     for art in (a, c):
         assert env.client.delete(f"/api/v1/artifacts/{art['id']}", headers=env.h1).status_code == 204
     assert env.client.get(f"/api/v1/artifacts/{a['id']}", headers=env.h1).status_code == 404
-    assert sorted(env.blobs(env.p1.id)) == sorted([sha(shared), sha(lone)])  # blobs leave only on GC
+    # The unreferenced blob goes with its last row (disk freed with the quota); the shared one stays.
+    assert env.blobs(env.p1.id) == [sha(shared)]
     with env.factory() as s:
         rows = s.scalars(select(AuditLog).where(AuditLog.action == "artifact.delete")).all()
         assert {r.target for r in rows} == {a["id"], c["id"]}
         assert all(r.actor_kind == "user" and r.actor_id == "u1" for r in rows)
+    env.store.put(env.p1.id, io.BytesIO(lone), max_bytes=1000)  # an orphan (e.g. a crash) for the GC
     with env.factory() as s:
         result = svc.gc(s, env.store)  # within the grace period: nothing deleted
-        assert result.deleted_blobs == 0
+        assert sha(lone) in env.blobs(env.p1.id)
         result = svc.gc(s, env.store, grace=timedelta(0))
         assert result.deleted_blobs >= 1  # the S3 bucket is shared by the session's tests
     assert env.blobs(env.p1.id) == [sha(shared)]
@@ -640,8 +643,10 @@ def test_pending_expiry_and_gc_job(env):
         artifact_handlers.set_artifact_store(None)
     with env.factory() as s:
         assert s.get(Artifact, art["id"]) is None
-        job = s.scalars(select(Job).where(Job.kind == "artifacts.gc")).one()
-        assert job.status == "done", job.error
+        gc_jobs = s.scalars(select(Job).where(Job.kind == "artifacts.gc").order_by(Job.created_at)).all()
+        assert [j.status for j in gc_jobs] == ["done", "queued"], [j.error for j in gc_jobs]
+        # The job re-arms itself: its successor runs GC_INTERVAL later (periodic GC).
+        assert as_utc(gc_jobs[1].run_after) > utcnow() + svc.GC_INTERVAL - timedelta(minutes=5)
     # The staged object is younger than 24h, so purge_stale keeps it until it ages out.
     with env.factory() as s:
         svc.gc(s, env.store, now=utcnow() + timedelta(hours=25))
@@ -769,3 +774,262 @@ def test_real_app_with_api_key(tmp_path):
         got = client.get(f"/api/v1/artifacts/{resp.json()['id']}/download", headers=key)
         assert got.status_code == 200 and got.content == data
     app.state.db_engine.dispose()
+
+
+# --- review 5 (cycle 2): quota bypass, GC/disk, TOCTOU -------------------------------------------
+
+
+def test_zero_size_reservations_never_bypass_the_quota(make_env):
+    """HIGH: a pending reservation (size 0) used to make its digest count as "already referenced",
+    so a direct upload with that `X-Sha256` skipped the quota. Scenario of review5/quota.py."""
+    env = make_env(project_quota_bytes=1000, max_artifact_bytes=100_000)
+    blobs = [os.urandom(50_000) for _ in range(6)]
+    for data in blobs:
+        r = env.client.post("/api/v1/artifacts/uploads", headers=env.h1,
+                            json={"filename": "z", "size": 0, "sha256": sha(data)})
+        assert r.status_code == 201, r.text
+    for data in blobs[:5]:
+        assert env.upload(data, headers={"X-Sha256": sha(data)}).status_code == 413
+    # presigned variant: a real-size reservation of the same digest is checked against the quota
+    r = env.client.post("/api/v1/artifacts/uploads", headers=env.h1,
+                        json={"filename": "big", "size": 50_000, "sha256": sha(blobs[5])})
+    assert r.status_code == 413
+    # the size-0 reservation itself cannot receive more than it declared
+    pending = env.client.get("/api/v1/artifacts", headers=env.h1).json()["items"]
+    assert pending == []  # pending rows are not listed; none became ready
+    assert env.blobs(env.p1.id) == []
+    assert env.upload(os.urandom(500)).status_code == 201  # the quota itself still works
+
+
+def test_reservations_hold_quota_and_dedup_needs_a_ready_blob(make_env):
+    env = make_env(project_quota_bytes=1000, max_artifact_bytes=100_000)
+    data = os.urandom(600)
+    r = env.client.post("/api/v1/artifacts/uploads", headers=env.h1,
+                        json={"filename": "r", "size": len(data), "sha256": sha(data)})
+    assert r.status_code == 201
+    assert env.upload(os.urandom(600)).status_code == 413  # the 600-byte reservation counts
+    # same digest (declared up front, so the streaming budget knows it): counted once, fits
+    assert env.upload(data, headers={"X-Sha256": sha(data)}).status_code == 201
+    assert env.upload(data).status_code == 201  # now a ready blob exists: dedup is free
+
+
+def test_quota_rechecked_with_real_size_on_complete(env, tmp_path):
+    store = StagingStore(tmp_path / "staging")
+    data = os.urandom(800)
+    art = _pending(env, len(data), sha(data))
+    store.staged[(env.p1.id, art.id)] = data
+    with env.factory() as s:
+        row = s.get(Artifact, art.id)
+        with pytest.raises(svc.QuotaExceeded):
+            svc.complete_upload(s, store, row, svc.Limits(project_quota_bytes=500))
+        s.commit()
+    with env.factory() as s:
+        assert s.get(Artifact, art.id) is None  # the reservation is released
+    assert store.staged == {} and sha(data) not in store_blobs(store, env.p1.id)
+
+
+def store_blobs(store, project_id):
+    return [b.sha256 for b in store.iter_blobs() if b.project_id == project_id]
+
+
+def test_quota_rechecked_on_put_content_and_complete(make_env):
+    env = make_env(project_quota_bytes=1000, max_artifact_bytes=100_000)
+    if not isinstance(env.store, LocalArtifactStore):
+        pytest.skip("the content route exists only with the local backend")
+    data = os.urandom(800)
+    art = env.client.post("/api/v1/artifacts/uploads", headers=env.h1,
+                          json={"filename": "r", "size": len(data), "sha256": sha(data)}).json()["artifact"]
+    # The operator lowers the quota (or other reservations settled first): the received bytes no longer fit.
+    env.app.state.settings = env.settings.model_copy(update={"project_quota_bytes": 500})
+    put = env.client.put(f"/api/v1/artifacts/{art['id']}/content", content=data, headers=env.h1)
+    assert put.status_code == 413
+    assert env.blobs(env.p1.id) == []
+    assert env.client.get(f"/api/v1/artifacts/{art['id']}", headers=env.h1).status_code == 404
+    # complete re-checks too (blob written under the old quota, completed under the new one)
+    env.app.state.settings = env.settings
+    art = env.client.post("/api/v1/artifacts/uploads", headers=env.h1,
+                          json={"filename": "r", "size": len(data), "sha256": sha(data)}).json()["artifact"]
+    assert env.client.put(f"/api/v1/artifacts/{art['id']}/content", content=data, headers=env.h1).status_code == 204
+    env.app.state.settings = env.settings.model_copy(update={"project_quota_bytes": 500})
+    assert env.client.post(f"/api/v1/artifacts/{art['id']}/complete", headers=env.h1).status_code == 413
+    assert env.blobs(env.p1.id) == []
+    assert env.client.get(f"/api/v1/artifacts/{art['id']}", headers=env.h1).status_code == 404
+
+
+def _disk_bytes(env: Env) -> int:
+    return sum(env.store.size(b.project_id, b.sha256) or 0 for b in env.store.iter_blobs()
+               if b.project_id == env.p1.id)
+
+
+def test_upload_delete_cycles_do_not_grow_disk_beyond_quota(make_env):
+    """MEDIUM (review5/fill.py): DELETE freed the quota but left the blob for a GC that never ran."""
+    env = make_env(project_quota_bytes=100_000, max_artifact_bytes=100_000)
+    for _ in range(10):
+        r = env.upload(os.urandom(90_000))
+        assert r.status_code == 201, r.text
+        assert env.client.delete(f"/api/v1/artifacts/{r.json()['id']}", headers=env.h1).status_code == 204
+        assert _disk_bytes(env) <= 100_000
+    assert env.blobs(env.p1.id) == []
+    # deleting a pending upload also drops its staged object / content
+    data = os.urandom(1000)
+    art = env.client.post("/api/v1/artifacts/uploads", headers=env.h1,
+                          json={"filename": "p", "size": len(data), "sha256": sha(data)}).json()
+    if art["upload"]["url"].startswith("http://testserver"):
+        env.client.put(f"/api/v1/artifacts/{art['artifact']['id']}/content", content=data, headers=env.h1)
+    else:
+        assert _presigned_put(env, art["upload"], data).status_code == 200
+    assert env.client.delete(f"/api/v1/artifacts/{art['artifact']['id']}", headers=env.h1).status_code == 204
+    assert env.blobs(env.p1.id) == [] and env.leftovers(env.p1.id) == []
+
+
+def test_worker_start_arms_gc_and_reaper(env):
+    from matrix_server.cli import schedule_periodic_jobs
+    from matrix_server.storage.models import Job
+
+    schedule_periodic_jobs(env.factory)
+    schedule_periodic_jobs(env.factory)  # idempotent: at most one of each queued
+    with env.factory() as s:
+        kinds = sorted(j.kind for j in s.scalars(select(Job).where(Job.status == "queued")))
+    assert kinds == ["artifacts.gc", "runs.reaper"]
+
+
+def test_project_purge_removes_blobs_and_metrics(env):
+    from matrix_server import projects as project_ops
+    from matrix_server.runs.store import MemoryMetricStore, MetricPoint
+    from matrix_server.storage.models import Job
+    from matrix_server.storage.spans import MemorySpanStore
+    from matrix_server.workers import artifact_handlers, handlers, online_handlers, run_handlers
+
+    a = env.upload(os.urandom(300)).json()
+    env.upload(os.urandom(300), project=env.h2)
+    metrics = MemoryMetricStore()
+    for pid in (env.p1.id, env.p2.id):
+        metrics.insert(pid, "run1", [MetricPoint("loss", 0, 1.0, 0)])
+    with env.factory() as s, s.begin():
+        project_ops.delete_project(s, env.p1.id)
+    with env.factory() as s:
+        assert s.get(Artifact, a["id"]) is None
+        job = s.scalars(select(Job).where(Job.kind == project_ops.PURGE_SPANS_JOB)).one()
+    artifact_handlers.set_artifact_store(env.store)
+    run_handlers.set_metric_store(metrics)
+    online_handlers.set_span_store(MemorySpanStore())
+    try:
+        with env.factory() as s:
+            handlers.purge_project_spans(s, job)
+            handlers.purge_project_spans(s, job)  # idempotent (the job retries)
+    finally:
+        artifact_handlers.set_artifact_store(None)
+        run_handlers.set_metric_store(None)
+        online_handlers.set_span_store(None)
+    assert env.blobs(env.p1.id) == [] and env.leftovers(env.p1.id) == []
+    assert len(env.blobs(env.p2.id)) == 1
+    assert metrics.keys(env.p1.id, "run1") == [] and metrics.keys(env.p2.id, "run1") == ["loss"]
+
+
+# --- S11 / TOCTOU: the staged object is pinned to the version that was hashed ----------------------
+
+
+class _FakeS3:
+    """In-memory S3 client double with ETag preconditions (IfMatch / CopySourceIfMatch) and a hook
+    that runs when the hashing read of a staged object is closed."""
+
+    def __init__(self) -> None:
+        self.objects: dict[str, tuple[bytes, str]] = {}
+        self.after_read = None
+        self._n = 0
+
+    def _err(self, code: str, status: int):
+        from botocore.exceptions import ClientError
+
+        return ClientError({"Error": {"Code": code}, "ResponseMetadata": {"HTTPStatusCode": status}}, "op")
+
+    def put(self, key: str, data: bytes) -> None:
+        self._n += 1
+        self.objects[key] = (data, f'"etag-{self._n}"')
+
+    def _get(self, key, if_match=None):
+        if key not in self.objects:
+            raise self._err("404", 404)
+        data, etag = self.objects[key]
+        if if_match is not None and if_match != etag:
+            raise self._err("PreconditionFailed", 412)
+        return data, etag
+
+    def head_object(self, Bucket, Key, IfMatch=None, ChecksumMode=None):
+        data, etag = self._get(Key, IfMatch)
+        return {"ContentLength": len(data), "ETag": etag}
+
+    def get_object(self, Bucket, Key, IfMatch=None):
+        data, _ = self._get(Key, IfMatch)
+        fake = self
+
+        class Body(io.BytesIO):
+            def close(self_inner):
+                super().close()
+                if fake.after_read is not None:
+                    hook, fake.after_read = fake.after_read, None
+                    hook(Key)
+
+        return {"Body": Body(data)}
+
+    def copy(self, CopySource, Bucket, Key, ExtraArgs=None):
+        data, _ = self._get(CopySource["Key"], (ExtraArgs or {}).get("CopySourceIfMatch"))
+        self.put(Key, data)
+
+    def copy_object(self, **kw):
+        return {}
+
+    def delete_object(self, Bucket, Key):
+        self.objects.pop(Key, None)
+
+
+def _fake_s3_store():
+    from matrix_server.artifacts.s3 import S3ArtifactStore
+
+    store = S3ArtifactStore(bucket="b", endpoint="http://127.0.0.1:9", access_key="x", secret_key="y")
+    store.client = _FakeS3()
+    return store
+
+
+def test_s11_s3_object_swapped_between_hash_and_promotion_is_refused(env):
+    store = _fake_s3_store()
+    legit, forged = os.urandom(2000), os.urandom(2000)
+    art = _pending(env, len(legit), sha(legit))
+    key = store._upload_key(env.p1.id, art.id)
+    store.client.put(key, legit)
+    # The client re-PUTs the (still valid) presigned URL right after the server hashed the object.
+    store.client.after_read = lambda k: store.client.put(k, forged)
+    assert _complete(env, store, art, verify_max=10_000) == 422
+    final = f"{env.p1.id}/{sha(legit)[:2]}/{sha(legit)}"
+    assert final not in store.client.objects  # forged content never reaches the blob key
+    assert key not in store.client.objects  # the staged object is removed
+    with env.factory() as s:
+        assert s.get(Artifact, art.id) is None
+
+
+def test_s11_s3_unchanged_object_is_promoted(env):
+    store = _fake_s3_store()
+    data = os.urandom(2000)
+    art = _pending(env, len(data), sha(data))
+    store.client.put(store._upload_key(env.p1.id, art.id), data)
+    assert _complete(env, store, art, verify_max=10_000) == "ready"
+    assert store.client.objects[f"{env.p1.id}/{sha(data)[:2]}/{sha(data)}"][0] == data
+
+
+def test_s11_local_put_refuses_a_file_changed_before_rename(tmp_path, monkeypatch):
+    from matrix_server.artifacts import ArtifactStoreError
+    from matrix_server.artifacts import local as local_mod
+
+    store = LocalArtifactStore(tmp_path / "blobs")
+    real_replace = os.replace
+
+    def tampering_replace(src, dst):
+        with open(src, "r+b") as f:  # another writer changes the temp file after it was hashed
+            f.write(b"forged!!")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(local_mod.os, "replace", tampering_replace)
+    data = os.urandom(4000)
+    with pytest.raises(ArtifactStoreError):
+        store.put("p1", io.BytesIO(data), max_bytes=10_000)
+    assert [b.sha256 for b in store.iter_blobs()] == []

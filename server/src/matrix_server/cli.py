@@ -14,6 +14,18 @@ def run_api() -> None:
     )
 
 
+def schedule_periodic_jobs(session_factory) -> None:
+    """Arm the self-rescheduling system jobs (`runs.reaper`, `artifacts.gc`) when the worker starts,
+    so they run even before the first run is created or the first artifact deleted."""
+    from matrix_server.artifacts.service import ensure_gc_scheduled
+    from matrix_server.runs.service import ensure_reaper_scheduled
+
+    with session_factory() as session, session.begin():
+        ensure_reaper_scheduled(session)
+    with session_factory() as session, session.begin():
+        ensure_gc_scheduled(session)
+
+
 def run_worker() -> None:
     import logging
     import signal
@@ -42,8 +54,10 @@ def run_worker() -> None:
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
     worker_id = f"{socket.gethostname()}-{os.getpid()}"
+    session_factory = make_session_factory(engine)
+    schedule_periodic_jobs(session_factory)
     try:
-        runner.run_forever(make_session_factory(engine), stop_event=stop_event, worker_id=worker_id)
+        runner.run_forever(session_factory, stop_event=stop_event, worker_id=worker_id)
     finally:
         engine.dispose()
 

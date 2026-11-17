@@ -26,7 +26,16 @@ from matrix_server.app import create_app
 from matrix_server.config import Settings
 from matrix_server.projects import PURGE_SPANS_JOB
 from matrix_server.storage.db import Base, make_engine, utcnow
-from matrix_server.storage.models import ApiKey, AuditLog, Dataset, Job, LoginAttempt, Membership, WebSession
+from matrix_server.storage.models import (
+    ApiKey,
+    AuditLog,
+    Dataset,
+    Job,
+    LoginAttempt,
+    LoginKnownIp,
+    Membership,
+    WebSession,
+)
 from matrix_server.workers import handlers, online_handlers
 
 PG_URL = os.environ.get("MATRIX_TEST_DATABASE_URL")
@@ -458,6 +467,96 @@ def test_email_limit_across_ips(db_url):
         app.state.db_engine.dispose()
 
 
+def test_email_lock_never_locks_the_owner_out_of_a_known_network(db_url):
+    """MEDIUM (review 5): the e-mail-only lock let anyone lock any account without credentials."""
+    app, client = _make(db_url, trusted_proxy_header="X-Real-IP")
+    try:
+        _create_user(client)
+        home = {"X-Real-IP": "198.51.100.10"}
+        assert _login(client, **home).status_code == 200  # the owner's usual network is remembered
+        for i in range(users.EMAIL_MAX_FAILURES):
+            assert _login(client, password="bad password!", **{"X-Real-IP": f"192.0.2.{i + 1}"}).status_code == 401
+        assert _login(client, **{"X-Real-IP": "192.0.2.200"}).status_code == 429  # unknown network: locked
+        assert _login(client, **home).status_code == 200  # known network: the e-mail lock does not apply
+        with _factory(app)() as s:
+            dump = " ".join(str(v) for row in s.execute(text("SELECT * FROM login_known_ips")) for v in row)
+        assert "198.51.100.10" not in dump and "ana@example.com" not in dump
+    finally:
+        app.state.db_engine.dispose()
+
+
+def test_ipv6_throttled_per_64(db_url):
+    app, client = _make(db_url, trusted_proxy_header="X-Real-IP")
+    try:
+        _create_user(client)
+        for i in range(users.PAIR_MAX_FAILURES):  # rotating addresses inside one /64
+            h = {"X-Real-IP": f"2001:db8:1:2::{i + 1:x}"}
+            assert _login(client, password="bad password!", **h).status_code == 401
+        assert _login(client, **{"X-Real-IP": "2001:db8:1:2:ffff::9"}).status_code == 429
+        assert _login(client, **{"X-Real-IP": "2001:db8:1:3::1"}).status_code == 200  # another /64
+        assert users.client_network("2001:db8:1:2:aaaa::1") == "2001:db8:1:2::/64"
+        assert users.client_network("::ffff:192.0.2.1") == "192.0.2.1"
+    finally:
+        app.state.db_engine.dispose()
+
+
+def test_stale_login_rows_are_purged(env):
+    app, client = env
+    old = utcnow() - timedelta(days=40)
+    with _factory(app)() as s:
+        s.add_all([LoginAttempt(key=f"{i:064x}", window_start=old, count=1, lock_count=0) for i in range(50)])
+        s.add(LoginAttempt(key="f" * 64, window_start=old, count=0, lock_count=2,
+                           locked_until=utcnow() - timedelta(hours=1)))  # escalation still remembered
+        s.add(LoginKnownIp(key="e" * 64, last_success_at=old))
+        s.add(LoginKnownIp(key="d" * 64, last_success_at=utcnow()))
+        s.commit()
+    assert _login(client, email="nobody@example.com", password="bad password!").status_code == 401
+    with _factory(app)() as s:
+        keys = set(s.scalars(select(LoginAttempt.key)))
+        known = set(s.scalars(select(LoginKnownIp.key)))
+    assert not any(k == f"{i:064x}" for i in range(50) for k in keys)
+    assert "f" * 64 in keys and len(keys) == 4  # + the 3 keys of the failed attempt
+    assert known == {"d" * 64}
+
+
+def test_parallel_burst_verifies_at_most_the_pair_limit(db_url, monkeypatch):
+    """LOW (review5/race.py): every parallel attempt ran argon2 before any failure was counted."""
+    import collections
+    import threading
+
+    app, client = _make(db_url)
+    try:
+        _create_user(client)
+        calls = collections.Counter()
+        real_verify = users.verify_password
+
+        def counting_verify(stored, password):
+            calls["verify"] += 1
+            return real_verify(stored, password)
+
+        monkeypatch.setattr(users, "verify_password", counting_verify)
+        results = collections.Counter()
+        lock = threading.Lock()
+        barrier = threading.Barrier(30)
+
+        def attempt(i):
+            barrier.wait()
+            r = _login(client, password=f"wrong guess {i:04d}")
+            with lock:
+                results[r.status_code] += 1
+
+        threads = [threading.Thread(target=attempt, args=(i,)) for i in range(30)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert calls["verify"] <= users.PAIR_MAX_FAILURES, (calls, results)
+        assert results[401] == calls["verify"] and results[429] == 30 - calls["verify"]
+        assert _login(client).status_code == 429
+    finally:
+        app.state.db_engine.dispose()
+
+
 def test_hasher_saturation_returns_503(env, monkeypatch):
     _app, client = env
     _create_user(client)
@@ -627,7 +726,7 @@ def test_cli_create_user_project_and_member(tmp_path, monkeypatch, capsys):
 # --- projects ---------------------------------------------------------------------------------------------------
 
 
-def test_user_projects_create_and_delete(env):
+def test_user_projects_create_and_delete(env, tmp_path):
     app, client = env
     factory = _factory(app)
     user = make_user(factory)
@@ -651,12 +750,20 @@ def test_user_projects_create_and_delete(env):
     assert client.get("/api/v1/traces", headers=h).status_code == 404
     store = app.state.span_store
     assert store.list_traces(pid)[0]
+    from matrix_server.artifacts.local import LocalArtifactStore
+    from matrix_server.runs.store import MemoryMetricStore
+    from matrix_server.workers import artifact_handlers, run_handlers
+
     online_handlers.set_span_store(store)
+    artifact_handlers.set_artifact_store(LocalArtifactStore(tmp_path / "blobs"))
+    run_handlers.set_metric_store(MemoryMetricStore())
     try:
         with factory() as s:
             handlers.purge_project_spans(s, job)
     finally:
         online_handlers.set_span_store(None)
+        artifact_handlers.set_artifact_store(None)
+        run_handlers.set_metric_store(None)
     assert store.list_traces(pid)[0] == []
 
 
@@ -684,11 +791,15 @@ def test_member_rules_and_last_owner(env):
     make_user(factory, "carol@example.com")
     base = f"/api/v1/projects/{pid}/members"
 
-    assert client.post(base, json={"email": "ghost@example.com", "role": "viewer"}, headers=admin).status_code == 404
+    # Unknown and known e-mails get the same answer (no account enumeration).
+    ghost = client.post(base, json={"email": "ghost@example.com", "role": "viewer"}, headers=admin)
     assert client.post(base, json={"email": "carol@example.com", "role": "admin"}, headers=admin).status_code == 403
     added = client.post(base, json={"email": "Carol@example.com", "role": "viewer"}, headers=admin)
-    assert added.status_code == 201 and added.json()["role"] == "viewer"
-    carol = added.json()["user"]["id"]
+    assert ghost.status_code == added.status_code == 202
+    assert ghost.json() == added.json() == {"status": "pending_or_added"}
+    members = {m["user"]["email"]: m for m in client.get(base, headers=admin).json()["items"]}
+    assert "ghost@example.com" not in members and members["carol@example.com"]["role"] == "viewer"
+    carol = members["carol@example.com"]["user"]["id"]
     assert client.post(base, json={"email": "carol@example.com", "role": "member"}, headers=admin).status_code == 409
     assert client.patch(f"{base}/{carol}", json={"role": "member"}, headers=admin).json()["role"] == "member"
     assert client.patch(f"{base}/{carol}", json={"role": "admin"}, headers=admin).status_code == 403
@@ -706,7 +817,7 @@ def test_member_rules_and_last_owner(env):
     assert client.delete(f"{base}/nope", headers=admin).status_code == 404
 
 
-def test_member_removal_revokes_nothing_else(env):
+def test_member_removal_revokes_only_the_removed_admins_keys(env):
     app, client = env
     factory = _factory(app)
     pa, _ = _project(client, "a")
@@ -720,11 +831,21 @@ def test_member_removal_revokes_nothing_else(env):
     dave_key = {"Authorization": f"Bearer {created.json()['api_key']}"}
     with factory() as s:
         assert s.get(ApiKey, created.json()["id"]).created_by == dave
-    remover = member_headers(factory, pa, "owner")
+    remover_id = make_user(factory)
+    add_membership(factory, remover_id, pa, "owner")
+    remover = session_headers(factory, remover_id, pa)
+    other = client.post(f"/api/v1/projects/{pa}/keys", json={"name": "keep", "scopes": ["read"]}, headers=remover)
+    other_key = {"Authorization": f"Bearer {other.json()['api_key']}"}
     assert client.delete(f"/api/v1/projects/{pa}/members/{dave}", headers=remover).status_code == 204
     assert client.get("/api/v1/traces", headers=_bearer(token, pa)).status_code == 404
     assert client.get("/api/v1/traces", headers=_bearer(token, pb)).status_code == 200  # session survives
-    assert client.get("/api/v1/traces", headers=dave_key).status_code == 200  # their key survives
+    # Behaviour change (review 5): the keys a removed admin created are revoked with the membership.
+    assert client.get("/api/v1/traces", headers=dave_key).status_code == 401
+    assert client.get("/api/v1/traces", headers=other_key).status_code == 200  # other admins' keys stay
+    with factory() as s:
+        revoke = s.scalars(select(AuditLog).where(AuditLog.action == "key.revoke")).one()
+    assert revoke.target == created.json()["id"] and revoke.actor_id == remover_id
+    assert revoke.detail["reason"] == "member.remove"
 
 
 # --- keys --------------------------------------------------------------------------------------------------------------
@@ -777,7 +898,9 @@ def test_audit_rows_written_without_secrets(env):
     base = f"/api/v1/projects/{pid}"
     key = client.post(f"{base}/keys", json={"name": "k", "scopes": ["read"]}, headers=h).json()
     client.delete(f"{base}/keys/{key['id']}", headers=h)
-    eve = client.post(f"{base}/members", json={"email": "eve@example.com", "role": "viewer"}, headers=h).json()["user"]["id"]
+    assert client.post(f"{base}/members", json={"email": "eve@example.com", "role": "viewer"}, headers=h).status_code == 202
+    eve = next(m["user"]["id"] for m in client.get(f"{base}/members", headers=h).json()["items"]
+               if m["user"]["email"] == "eve@example.com")
     client.patch(f"{base}/members/{eve}", json={"role": "member"}, headers=h)
     client.delete(f"{base}/members/{eve}", headers=h)
     client.post("/api/v1/auth/logout", headers=_bearer(token))
@@ -844,3 +967,20 @@ def test_span_store_delete_project(kind):
     finally:
         if kind == "clickhouse":
             store.drop_database()
+
+
+def test_audit_actor_of_api_key_is_its_prefix(env, tmp_path):
+    """LOW (review 5): `artifact.delete` (and other audits) by an API key recorded no actor id."""
+    app, client = env
+    app.state.settings = app.state.settings.model_copy(update={"artifact_local_dir": str(tmp_path / "blobs")})
+    app.state.artifact_store = None
+    pid, key = _project(client)
+    h = {"Authorization": f"Bearer {key}"}
+    art = client.post("/api/v1/artifacts", content=b"data", headers={**h, "X-Filename": "a.txt"})
+    assert art.status_code == 201, art.text
+    assert client.delete(f"/api/v1/artifacts/{art.json()['id']}", headers=h).status_code == 204
+    with _factory(app)() as s:
+        prefix = s.scalars(select(ApiKey.prefix).where(ApiKey.project_id == pid)).one()
+        row = s.scalars(select(AuditLog).where(AuditLog.action == "artifact.delete")).one()
+    assert row.actor_kind == "api_key" and row.actor_id == prefix
+    assert key.startswith(f"mx_{prefix}") or prefix in key

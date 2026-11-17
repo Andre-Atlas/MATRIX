@@ -10,6 +10,7 @@ digest only, and checked to resolve under `root`.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import tempfile
@@ -21,18 +22,29 @@ from typing import BinaryIO
 
 from matrix_server.artifacts import (
     CHUNK_SIZE,
+    ArtifactStoreError,
     BlobInfo,
     BlobNotFound,
     BlobRef,
     BlobTooLarge,
     InvalidKey,
     PresignedRequest,
+    UploadStat,
     check_project_id,
     check_sha256,
     is_sha256,
 )
 
 TMP_DIR = ".tmp"
+
+
+def _same_file(st: os.stat_result, written: os.stat_result, size: int) -> bool:
+    return (
+        st.st_ino == written.st_ino
+        and st.st_dev == written.st_dev
+        and st.st_size == written.st_size == size
+        and st.st_mtime_ns == written.st_mtime_ns
+    )
 
 
 class LocalArtifactStore:
@@ -92,6 +104,7 @@ class LocalArtifactStore:
                     out.write(chunk)
                 out.flush()
                 os.fsync(out.fileno())
+                written = os.fstat(out.fileno())
             sha = digest.hexdigest()
             final = self._blob_path(project_id, sha)
             if final.exists():
@@ -99,7 +112,16 @@ class LocalArtifactStore:
                 os.utime(final)
                 return BlobInfo(sha, size, created=False)
             self._mkdir(final.parent)
+            # Audit S11 (local equivalent of the S3 ETag pin): what is renamed into the blob key must
+            # be the very file that was hashed — same inode, size and mtime — and the rename is atomic.
+            before = tmp.stat()
+            if not _same_file(before, written, size):
+                raise ArtifactStoreError("temporary file changed while it was being stored")
             os.replace(tmp, final)
+            after = final.stat()
+            if not _same_file(after, written, size):
+                final.unlink(missing_ok=True)
+                raise ArtifactStoreError("blob changed while it was being stored")
             return BlobInfo(sha, size, created=True)
         except BaseException:
             tmp.unlink(missing_ok=True)
@@ -136,13 +158,17 @@ class LocalArtifactStore:
     def stat_upload(self, project_id: str, upload_id: str) -> int | None:
         return None
 
-    def upload_checksum(self, project_id: str, upload_id: str) -> str | None:
+    def stat_upload_info(self, project_id: str, upload_id: str) -> UploadStat | None:
+        size = self.stat_upload(project_id, upload_id)  # None here; staging subclasses override it
+        return None if size is None else UploadStat(size=size)
+
+    def upload_checksum(self, project_id: str, upload_id: str, *, etag: str | None = None) -> str | None:
         return None
 
-    def open_upload(self, project_id: str, upload_id: str) -> BinaryIO:
+    def open_upload(self, project_id: str, upload_id: str, *, etag: str | None = None) -> BinaryIO:
         raise BlobNotFound("no staged upload")
 
-    def promote_upload(self, project_id: str, upload_id: str, sha256: str) -> None:
+    def promote_upload(self, project_id: str, upload_id: str, sha256: str, *, etag: str | None = None) -> None:
         raise BlobNotFound("no staged upload")
 
     def delete_upload(self, project_id: str, upload_id: str) -> None:
@@ -181,6 +207,26 @@ class LocalArtifactStore:
                         removed += 1
                 except FileNotFoundError:
                     continue
+        return removed
+
+    def delete_project(self, project_id: str) -> int:
+        """Remove every blob and temp file of the project (project deletion). Idempotent."""
+        project_dir = self._project_dir(project_id)
+        if not project_dir.is_dir() or project_dir.is_symlink():
+            return 0
+        removed = 0
+        for sub in project_dir.iterdir():
+            if sub.is_symlink() or not sub.is_dir():
+                sub.unlink(missing_ok=True)
+                continue
+            for item in sub.iterdir():
+                if item.is_file() or item.is_symlink():
+                    item.unlink(missing_ok=True)
+                    removed += 1
+            with contextlib.suppress(OSError):
+                sub.rmdir()
+        with contextlib.suppress(OSError):
+            project_dir.rmdir()
         return removed
 
     def _touch(self, project_id: str, sha256: str, when: float | None = None) -> None:

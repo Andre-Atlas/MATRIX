@@ -411,15 +411,27 @@ class WebSession(Base):
 class LoginAttempt(Base):
     """Failed-login throttle per (e-mail, IP). `key` is a SHA-256 of both, so the table holds no
     e-mail and unknown e-mails are throttled exactly like known ones. `lock_count` escalates the
-    lock duration and resets on a successful login."""
+    lock duration and resets on a successful login. Stale rows are purged (`users.purge_stale_login_rows`)."""
 
     __tablename__ = "login_attempts"
+    __table_args__ = (Index("ix_login_attempts_window_start", "window_start"),)
 
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     lock_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+class LoginKnownIp(Base):
+    """A network (IPv4 address or IPv6 /64) a user logged in from successfully, for the e-mail lock
+    bypass (`users.reserve_login_attempt`). `key` is a SHA-256 of (e-mail, network): no e-mail or
+    address is stored. Rows older than `users.KNOWN_IP_TTL` are purged."""
+
+    __tablename__ = "login_known_ips"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    last_success_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
 
 
 # --- Model modules registered here (one import per module, appended by each task) ------------

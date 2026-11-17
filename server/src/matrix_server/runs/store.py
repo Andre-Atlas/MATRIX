@@ -98,6 +98,10 @@ class MetricStore(Protocol):
 
     def delete_run(self, project_id: str, run_id: str) -> None: ...
 
+    def delete_project(self, project_id: str) -> None:
+        """Every point of every run of the project (project deletion; idempotent)."""
+        ...
+
 
 # --------------------------------------------------------------------------- shared helpers
 
@@ -258,6 +262,11 @@ class MemoryMetricStore:
         with self._lock:
             self._data.pop((project_id, run_id), None)
 
+    def delete_project(self, project_id: str) -> None:
+        with self._lock:
+            for key in [k for k in self._data if k[0] == project_id]:
+                del self._data[key]
+
 
 # --------------------------------------------------------------------------- ClickHouse
 
@@ -371,6 +380,15 @@ SETTINGS index_granularity = 8192
         self._client.command(
             f"DELETE FROM {self.table} WHERE project_id = {{project_id:String}} AND run_id = {{run_id:String}}",
             parameters={"project_id": project_id, "run_id": run_id},
+            settings={"lightweight_deletes_sync": 2 if wait else 0},
+        )
+
+    def delete_project(self, project_id: str, *, wait: bool = False) -> None:
+        if not project_id:
+            raise ValueError("project_id required")
+        self._client.command(
+            f"DELETE FROM {self.table} WHERE project_id = {{project_id:String}}",
+            parameters={"project_id": project_id},
             settings={"lightweight_deletes_sync": 2 if wait else 0},
         )
 

@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     # Training runs (contract G1): caps on accepted metric point writes per run and per key.
     max_points_per_run: int = 50_000_000
     max_points_per_key: int = 10_000_000
+    # Runs per project (POST /runs answers 409 beyond it; delete runs to make room) and runs in the
+    # `running` state per project (429 beyond it, until some finish or the reaper fails them).
+    max_runs_per_project: int = 100_000
+    max_active_runs_per_project: int = 1000
 
     # Users and web sessions (ADR-006, contract G0 section 1).
     session_idle_ttl_seconds: int = 7 * 24 * 3600
