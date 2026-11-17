@@ -29,7 +29,9 @@ const waitCharts = (page, n) => page.waitForFunction((min) => document.querySele
   const page = await ctx.newPage();
   page.setDefaultTimeout(20000);
   const errors = [];
+  const csp = [];
   page.on("pageerror", (e) => errors.push(e.message));
+  page.on("console", (m) => { if (/Content Security Policy/i.test(m.text())) { csp.push(m.text()); } });
 
   // Login (mock demo user)
   await page.goto(`${BASE}/login?next=/runs`);
@@ -202,6 +204,7 @@ const waitCharts = (page, n) => page.waitForFunction((min) => document.querySele
   await shot(page, "14-latency");
 
   check(errors.length === 0, `no page errors${errors.length ? `: ${errors.slice(0, 3).join(" | ")}` : ""}`);
+  check(csp.length === 0, `no CSP violations${csp.length ? `: ${csp.slice(0, 2).join(" | ")}` : ""}`);
   await browser.close();
   console.log(failed ? `\n${failed} check(s) failed` : "\nall checks passed");
   process.exit(failed ? 1 : 0);

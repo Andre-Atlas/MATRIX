@@ -3,6 +3,7 @@
 import { useMemo, useState } from "react";
 import { confusionCells, curveLegend, histogramBars, prepareRoc, preparePr, prevalence, regressionScatter } from "@/lib/runs/reports";
 import { formatMetric } from "@/lib/runs/format";
+import { confusionTooltip, importanceTooltip, scatterTooltip } from "@/lib/runs/tooltips";
 import type { ClassificationReport, ImportanceReport, RegressionReport, Report, TableReport } from "@/lib/runs/types";
 import { Chart, type EChartOption } from "@/components/charts";
 import { GRID, seriesColor } from "@/components/charts/theme";
@@ -102,7 +103,7 @@ function ClassificationView({ data }: { data: ClassificationReport }) {
       grid: { left: 90, right: 70, top: 10, bottom: 50 },
       tooltip: {
         formatter: (p: { value: [number, number, number] }) =>
-          `true <b>${data.labels[n - 1 - p.value[1]]}</b> → predicted <b>${data.labels[p.value[0]]}</b><br/>${normalized ? `${(p.value[2] * 100).toFixed(1)}% of row` : p.value[2]}`,
+          confusionTooltip(data.labels[n - 1 - p.value[1]], data.labels[p.value[0]], p.value[2], normalized),
       },
       xAxis: { type: "category", data: data.labels, name: "Predicted", nameLocation: "middle", nameGap: 30, splitArea: { show: false } },
       yAxis: { type: "category", data: [...data.labels].reverse(), name: "True", nameLocation: "middle", nameGap: 70 },
@@ -196,7 +197,7 @@ function RegressionView({ data }: { data: RegressionReport }) {
   };
   const sc: EChartOption = {
     grid: { ...GRID, left: 56, bottom: 40 },
-    tooltip: { trigger: "item", formatter: (p: { value: [number, number] }) => `true ${formatMetric(p.value[0])}<br/>pred ${formatMetric(p.value[1])}` },
+    tooltip: { trigger: "item", formatter: (p: { value: [number, number] }) => scatterTooltip(p.value[0], p.value[1]) },
     xAxis: { type: "value", scale: true, name: "y_true", nameLocation: "middle", nameGap: 26 },
     yAxis: { type: "value", scale: true, name: "y_pred" },
     series: [
@@ -234,7 +235,7 @@ function ImportanceView({ data }: { data: ImportanceReport }) {
   const hasStd = feats.some((f) => f.std !== undefined);
   const option: EChartOption = {
     grid: { left: 150, right: 24, top: 10, bottom: 28 },
-    tooltip: { trigger: "axis", axisPointer: { type: "shadow" }, formatter: (ps: { dataIndex: number }[]) => { const f = feats[ps[0].dataIndex]; return `${f.name}<br/>${formatMetric(f.importance)}${f.std !== undefined ? ` ± ${formatMetric(f.std)}` : ""}`; } },
+    tooltip: { trigger: "axis", axisPointer: { type: "shadow" }, formatter: (ps: { dataIndex: number }[]) => { const f = feats[ps[0].dataIndex]; return importanceTooltip(f.name, f.importance, f.std); } },
     xAxis: { type: "value", name: data.method, nameLocation: "middle", nameGap: 22 },
     yAxis: { type: "category", data: feats.map((f) => f.name), axisLabel: { width: 140, overflow: "truncate" } },
     series: [
