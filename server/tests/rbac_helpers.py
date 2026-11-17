@@ -73,3 +73,26 @@ def owner_project(client, name: str, admin_headers: dict[str, str]) -> dict[str,
     resp = client.post("/api/v1/admin/projects", json={"name": name, "owner_email": email}, headers=admin_headers)
     assert resp.status_code == 201, resp.text
     return session_headers(factory, user_id, resp.json()["project"]["id"])
+
+
+def project_with_roles(session_factory, name: str) -> tuple[str, dict[str, dict[str, str]]]:
+    """Create a project (no key) and one user per role; return the id and session headers by role
+    ("owner", "admin", "member", "viewer"). Used by the module tests merged from `main`."""
+    from matrix_server.auth import create_project
+
+    with session_factory() as s:
+        project, _ = create_project(s, name, with_key=False)
+        s.commit()
+        project_id = project.id
+    headers = {role.label: member_headers(session_factory, project_id, role) for role in Role}
+    return project_id, headers
+
+
+def api_key_headers(session_factory, project_id: str, scopes: tuple[str, ...] = ("ingest", "read", "write")) -> dict[str, str]:
+    """Headers with a new API key of the project (never ADMIN, whatever the scopes)."""
+    from matrix_server.auth import create_api_key
+
+    with session_factory() as s:
+        key = create_api_key(s, project_id, name="test", scopes=scopes)
+        s.commit()
+    return {"Authorization": f"Bearer {key}"}

@@ -7,13 +7,13 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 
-from matrix_server.auth import AuthContext, require_role
+from matrix_server.auth import Principal, Role, require
 from matrix_server.gateway.router import GatewayRouter, get_default_gateway_router
 
 router = APIRouter(prefix="/api/v1/gateway", tags=["gateway"])
 
-ViewerAuth = Annotated[AuthContext, Depends(require_role("viewer"))]
-MemberAuth = Annotated[AuthContext, Depends(require_role("member"))]
+ViewerAuth = Annotated[Principal, Depends(require(Role.VIEWER))]
+MemberAuth = Annotated[Principal, Depends(require(Role.MEMBER))]
 
 
 def get_gateway(request: Request) -> GatewayRouter:
@@ -121,14 +121,14 @@ class GatewayLogsResponse(BaseModel):
 async def chat_completions(
     payload: ChatCompletionRequest,
     response: Response,
-    ctx: MemberAuth,
+    principal: MemberAuth,
     gateway: Annotated[GatewayRouter, Depends(get_gateway)],
 ) -> dict[str, Any]:
     """OpenAI-compatible chat completions endpoint with caching, rate limiting, and fallback."""
     serialized_messages = [m.model_dump() for m in payload.messages]
 
     result, cache_status, provider_name = await gateway.route_chat_completion(
-        project_id=ctx.project_id,
+        project_id=principal.project_id,
         model=payload.model,
         messages=serialized_messages,
         temperature=payload.temperature,
@@ -144,7 +144,7 @@ async def chat_completions(
 
 @router.get("/stats", response_model=GatewayStatsResponse)
 def get_gateway_stats(
-    ctx: ViewerAuth,
+    principal: ViewerAuth,
     gateway: Annotated[GatewayRouter, Depends(get_gateway)],
 ) -> dict[str, Any]:
     """Returns gateway aggregate statistics: requests, cache hit rate, saved tokens, and saved cost."""
@@ -153,7 +153,7 @@ def get_gateway_stats(
 
 @router.get("/providers", response_model=GatewayProvidersResponse)
 def get_gateway_providers(
-    ctx: ViewerAuth,
+    principal: ViewerAuth,
     gateway: Annotated[GatewayRouter, Depends(get_gateway)],
 ) -> dict[str, Any]:
     """Returns status of providers (OpenAI, Anthropic, Mock), circuit breakers, and latencies."""
@@ -162,7 +162,7 @@ def get_gateway_providers(
 
 @router.get("/rules", response_model=GatewayRulesResponse)
 def get_gateway_rules(
-    ctx: ViewerAuth,
+    principal: ViewerAuth,
     gateway: Annotated[GatewayRouter, Depends(get_gateway)],
 ) -> dict[str, Any]:
     """Returns active gateway routing and cascading fallback rules."""
@@ -172,11 +172,11 @@ def get_gateway_rules(
 
 @router.get("/logs", response_model=GatewayLogsResponse)
 def get_gateway_logs(
-    ctx: ViewerAuth,
+    principal: ViewerAuth,
     gateway: Annotated[GatewayRouter, Depends(get_gateway)],
     limit: int = Query(default=50, ge=1, le=1000),
 ) -> dict[str, Any]:
     """Returns recent routed request logs with latency, tokens, provider, and cache/fallback status."""
-    logs = gateway.get_logs(limit=limit, project_id=ctx.project_id)
+    logs = gateway.get_logs(limit=limit, project_id=principal.project_id)
     return {"logs": logs, "total": len(logs)}
 

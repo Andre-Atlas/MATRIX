@@ -16,7 +16,7 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from matrix_server.auth import AuthContext, require_role
+from matrix_server.auth import Principal, Role, ensure_role, require
 from matrix_server.mlops.artifact_store import (
     ArtifactCorruptionError,
     ArtifactSha256MismatchError,
@@ -53,9 +53,9 @@ from matrix_server.storage.models import (
 router = APIRouter(prefix="/api/v1/mlops", tags=["mlops"])
 
 DbSession = Annotated[Session, Depends(get_db)]
-ViewerAuth = Annotated[AuthContext, Depends(require_role("viewer"))]
-MemberAuth = Annotated[AuthContext, Depends(require_role("member"))]
-AdminAuth = Annotated[AuthContext, Depends(require_role("admin"))]
+ViewerAuth = Annotated[Principal, Depends(require(Role.VIEWER))]
+MemberAuth = Annotated[Principal, Depends(require(Role.MEMBER))]
+AdminAuth = Annotated[Principal, Depends(require(Role.ADMIN))]
 
 MAX_CREATE_ATTEMPTS = 3
 MAX_PAGE = 500
@@ -126,11 +126,6 @@ def _decode_cursor(cursor: str) -> tuple[datetime, str]:
 
 def _same_tz(db: Session, ts: datetime) -> datetime:
     return ts.replace(tzinfo=None) if db.get_bind().dialect.name == "sqlite" else ts
-
-
-def _require_admin(ctx: AuthContext) -> None:
-    if ctx.role != "admin":
-        raise HTTPException(status_code=403, detail=f"role '{ctx.role}' insufficient; 'admin' required")
 
 
 def _get_dataset_or_404(db: Session, project_id: str, dataset_id: str) -> Dataset:
@@ -500,7 +495,7 @@ class ModelEvaluateIn(BaseModel):
 @router.post("/runs", status_code=201)
 def create_run(
     db: DbSession,
-    ctx: MemberAuth,
+    principal: MemberAuth,
     payload: Annotated[dict[str, Any], Body()],
 ) -> dict[str, Any]:
     body: RunCreate = _parse_body(RunCreate, payload)
@@ -511,15 +506,15 @@ def create_run(
         raise HTTPException(status_code=422, detail=f"invalid status '{body.status}'")
 
     if body.dataset_id is not None:
-        _get_dataset_or_404(db, ctx.project_id, body.dataset_id)
+        _get_dataset_or_404(db, principal.project_id, body.dataset_id)
     if body.sweep_id is not None:
-        _get_sweep_or_404(db, ctx.project_id, body.sweep_id)
+        _get_sweep_or_404(db, principal.project_id, body.sweep_id)
     if body.parent_run_id is not None:
-        _get_run_or_404(db, ctx.project_id, body.parent_run_id)
+        _get_run_or_404(db, principal.project_id, body.parent_run_id)
 
     now = utcnow()
     run = TrainingRun(
-        project_id=ctx.project_id,
+        project_id=principal.project_id,
         name=name,
         run_type=body.run_type,
         status=body.status,
@@ -540,7 +535,7 @@ def create_run(
     if body.dataset_id is not None:
         _add_lineage_edge(
             db,
-            ctx.project_id,
+            principal.project_id,
             "dataset",
             body.dataset_id,
             "run",
@@ -550,7 +545,7 @@ def create_run(
     if body.parent_run_id is not None:
         _add_lineage_edge(
             db,
-            ctx.project_id,
+            principal.project_id,
             "run",
             body.parent_run_id,
             "run",
@@ -564,7 +559,7 @@ def create_run(
 @router.get("/runs")
 def list_runs(
     db: DbSession,
-    ctx: ViewerAuth,
+    principal: ViewerAuth,
     status: str | None = None,
     sweep_id: str | None = None,
     run_type: str | None = None,
@@ -572,7 +567,7 @@ def list_runs(
     limit: Annotated[int, Query(ge=1, le=MAX_PAGE)] = DEFAULT_PAGE,
     cursor: str | None = None,
 ) -> dict[str, Any]:
-    stmt = select(TrainingRun).where(TrainingRun.project_id == ctx.project_id)
+    stmt = select(TrainingRun).where(TrainingRun.project_id == principal.project_id)
     if status is not None:
         stmt = stmt.where(TrainingRun.status == status)
     if sweep_id is not None:
@@ -599,12 +594,12 @@ def list_runs(
 
 
 @router.get("/runs/{run_id}")
-def get_run(run_id: str, db: DbSession, ctx: ViewerAuth) -> dict[str, Any]:
-    run = _get_run_or_404(db, ctx.project_id, run_id)
+def get_run(run_id: str, db: DbSession, principal: ViewerAuth) -> dict[str, Any]:
+    run = _get_run_or_404(db, principal.project_id, run_id)
     artifacts = list(
         db.scalars(
             select(Artifact)
-            .where(Artifact.project_id == ctx.project_id, Artifact.run_id == run.id)
+            .where(Artifact.project_id == principal.project_id, Artifact.run_id == run.id)
             .order_by(Artifact.created_at.desc())
         )
     )
@@ -617,10 +612,10 @@ def get_run(run_id: str, db: DbSession, ctx: ViewerAuth) -> dict[str, Any]:
 def update_run(
     run_id: str,
     db: DbSession,
-    ctx: MemberAuth,
+    principal: MemberAuth,
     payload: Annotated[dict[str, Any], Body()],
 ) -> dict[str, Any]:
-    run = _get_run_or_404(db, ctx.project_id, run_id)
+    run = _get_run_or_404(db, principal.project_id, run_id)
     body: RunUpdate = _parse_body(RunUpdate, payload)
 
     if body.status is not None:
@@ -655,10 +650,10 @@ def ingest_run_metrics(
     run_id: str,
     request: Request,
     db: DbSession,
-    ctx: MemberAuth,
+    principal: MemberAuth,
     payload: Annotated[dict[str, Any], Body()],
 ) -> dict[str, Any]:
-    run = _get_run_or_404(db, ctx.project_id, run_id)
+    run = _get_run_or_404(db, principal.project_id, run_id)
     body: MetricsBatchIn = _parse_body(MetricsBatchIn, payload)
 
     point_dicts = [
@@ -674,7 +669,7 @@ def ingest_run_metrics(
     ]
 
     metric_store = request.app.state.training_metric_store
-    accepted = metric_store.insert_points(ctx.project_id, run.id, point_dicts)
+    accepted = metric_store.insert_points(principal.project_id, run.id, point_dicts)
 
     # Update latest_metrics, total_steps, heartbeat
     summary = dict(run.summary_metrics or {})
@@ -696,7 +691,7 @@ def ingest_run_metrics(
 
     if run.sweep_id is not None:
         sweep = db.scalars(
-            select(MLOpsSweep).where(MLOpsSweep.id == run.sweep_id, MLOpsSweep.project_id == ctx.project_id)
+            select(MLOpsSweep).where(MLOpsSweep.id == run.sweep_id, MLOpsSweep.project_id == principal.project_id)
         ).first()
         if sweep is not None:
             if sweep.status in {"cancelled", "stopped", "completed"}:
@@ -719,7 +714,7 @@ def ingest_run_metrics(
                     peer_runs = list(
                         db.scalars(
                             select(TrainingRun).where(
-                                TrainingRun.project_id == ctx.project_id,
+                                TrainingRun.project_id == principal.project_id,
                                 TrainingRun.sweep_id == sweep.id,
                                 TrainingRun.id != run.id,
                             )
@@ -728,7 +723,7 @@ def ingest_run_metrics(
                     peer_series: list[list[dict[str, Any]]] = []
                     for peer in peer_runs:
                         queried = metric_store.query_metrics(
-                            ctx.project_id,
+                            principal.project_id,
                             peer.id,
                             metric_names=[sweep.metric_name],
                             max_points=5000,
@@ -757,19 +752,19 @@ def get_run_metrics(
     run_id: str,
     request: Request,
     db: DbSession,
-    ctx: ViewerAuth,
+    principal: ViewerAuth,
     metric_names: Annotated[list[str] | None, Query()] = None,
     category: str | None = None,
     min_step: int | None = None,
     max_step: int | None = None,
     max_points: Annotated[int, Query(ge=1, le=5000)] = 500,
 ) -> dict[str, Any]:
-    _get_run_or_404(db, ctx.project_id, run_id)
+    _get_run_or_404(db, principal.project_id, run_id)
     parsed_names: list[str] | None = None
     if metric_names is not None:
         parsed_names = [m.strip() for item in metric_names for m in item.split(",") if m.strip()]
     series = request.app.state.training_metric_store.query_metrics(
-        ctx.project_id,
+        principal.project_id,
         run_id,
         metric_names=parsed_names,
         category=category,
@@ -962,9 +957,9 @@ def _build_lineage_graph(
 
 
 @router.get("/runs/{run_id}/lineage")
-def get_run_lineage(run_id: str, db: DbSession, ctx: ViewerAuth) -> dict[str, Any]:
-    _get_run_or_404(db, ctx.project_id, run_id)
-    nodes, edges = _build_lineage_graph(db, ctx.project_id, [("run", run_id)])
+def get_run_lineage(run_id: str, db: DbSession, principal: ViewerAuth) -> dict[str, Any]:
+    _get_run_or_404(db, principal.project_id, run_id)
+    nodes, edges = _build_lineage_graph(db, principal.project_id, [("run", run_id)])
     return {"run_id": run_id, "nodes": nodes, "edges": edges}
 
 
@@ -976,7 +971,7 @@ def get_run_lineage(run_id: str, db: DbSession, ctx: ViewerAuth) -> dict[str, An
 @router.post("/sweeps", status_code=201)
 def create_sweep(
     db: DbSession,
-    ctx: MemberAuth,
+    principal: MemberAuth,
     payload: Annotated[dict[str, Any], Body()],
 ) -> dict[str, Any]:
     body: SweepCreate = _parse_body(SweepCreate, payload)
@@ -985,7 +980,7 @@ def create_sweep(
         raise HTTPException(status_code=422, detail="name must not be blank")
 
     exists = db.scalar(
-        select(MLOpsSweep.id).where(MLOpsSweep.project_id == ctx.project_id, MLOpsSweep.name == name)
+        select(MLOpsSweep.id).where(MLOpsSweep.project_id == principal.project_id, MLOpsSweep.name == name)
     )
     if exists is not None:
         raise HTTPException(status_code=409, detail="sweep name already exists")
@@ -1001,7 +996,7 @@ def create_sweep(
             raise HTTPException(status_code=422, detail=f"unsupported early stopping strategy '{strat}'")
 
     sweep = MLOpsSweep(
-        project_id=ctx.project_id,
+        project_id=principal.project_id,
         name=name,
         description=body.description,
         method=body.method,
@@ -1018,11 +1013,11 @@ def create_sweep(
 
 
 @router.get("/sweeps")
-def list_sweeps(db: DbSession, ctx: ViewerAuth) -> dict[str, Any]:
+def list_sweeps(db: DbSession, principal: ViewerAuth) -> dict[str, Any]:
     rows = list(
         db.scalars(
             select(MLOpsSweep)
-            .where(MLOpsSweep.project_id == ctx.project_id)
+            .where(MLOpsSweep.project_id == principal.project_id)
             .order_by(MLOpsSweep.created_at.desc())
         )
     )
@@ -1030,12 +1025,12 @@ def list_sweeps(db: DbSession, ctx: ViewerAuth) -> dict[str, Any]:
 
 
 @router.get("/sweeps/{sweep_id}")
-def get_sweep(sweep_id: str, db: DbSession, ctx: ViewerAuth) -> dict[str, Any]:
-    sweep = _get_sweep_or_404(db, ctx.project_id, sweep_id)
+def get_sweep(sweep_id: str, db: DbSession, principal: ViewerAuth) -> dict[str, Any]:
+    sweep = _get_sweep_or_404(db, principal.project_id, sweep_id)
     runs = list(
         db.scalars(
             select(TrainingRun)
-            .where(TrainingRun.project_id == ctx.project_id, TrainingRun.sweep_id == sweep.id)
+            .where(TrainingRun.project_id == principal.project_id, TrainingRun.sweep_id == sweep.id)
             .order_by(TrainingRun.created_at.asc(), TrainingRun.id.asc())
         )
     )
@@ -1050,21 +1045,21 @@ def get_sweep(sweep_id: str, db: DbSession, ctx: ViewerAuth) -> dict[str, Any]:
 def suggest_sweep_trial(
     sweep_id: str,
     db: DbSession,
-    ctx: MemberAuth,
+    principal: MemberAuth,
     payload: Annotated[dict[str, Any] | None, Body()] = None,
 ) -> dict[str, Any]:
-    sweep = _get_sweep_or_404(db, ctx.project_id, sweep_id)
+    sweep = _get_sweep_or_404(db, principal.project_id, sweep_id)
     if sweep.status in {"cancelled", "stopped", "completed"}:
         raise HTTPException(status_code=409, detail=f"sweep is {sweep.status}")
 
     body: SweepNextTrialIn = _parse_body(SweepNextTrialIn, payload or {})
     if body.dataset_id is not None:
-        _get_dataset_or_404(db, ctx.project_id, body.dataset_id)
+        _get_dataset_or_404(db, principal.project_id, body.dataset_id)
 
     existing_runs = list(
         db.scalars(
             select(TrainingRun)
-            .where(TrainingRun.project_id == ctx.project_id, TrainingRun.sweep_id == sweep.id)
+            .where(TrainingRun.project_id == principal.project_id, TrainingRun.sweep_id == sweep.id)
             .order_by(TrainingRun.created_at.asc(), TrainingRun.id.asc())
         )
     )
@@ -1085,7 +1080,7 @@ def suggest_sweep_trial(
     run_name = body.name.strip() if body.name else f"{sweep.name}-trial-{trial_idx + 1}"
     now = utcnow()
     run = TrainingRun(
-        project_id=ctx.project_id,
+        project_id=principal.project_id,
         name=run_name,
         run_type=body.run_type,
         status="running",
@@ -1101,7 +1096,7 @@ def suggest_sweep_trial(
     db.flush()
 
     if body.dataset_id is not None:
-        _add_lineage_edge(db, ctx.project_id, "dataset", body.dataset_id, "run", run.id, "trained_on")
+        _add_lineage_edge(db, principal.project_id, "dataset", body.dataset_id, "run", run.id, "trained_on")
 
     return {
         "sweep_id": sweep.id,
@@ -1112,8 +1107,8 @@ def suggest_sweep_trial(
 
 
 @router.post("/sweeps/{sweep_id}/stop")
-def stop_sweep(sweep_id: str, db: DbSession, ctx: MemberAuth) -> dict[str, Any]:
-    sweep = _get_sweep_or_404(db, ctx.project_id, sweep_id)
+def stop_sweep(sweep_id: str, db: DbSession, principal: MemberAuth) -> dict[str, Any]:
+    sweep = _get_sweep_or_404(db, principal.project_id, sweep_id)
     sweep.status = "cancelled"
     sweep.stopped_at = utcnow()
     db.flush()
@@ -1131,7 +1126,7 @@ def stop_sweep(sweep_id: str, db: DbSession, ctx: MemberAuth) -> dict[str, Any]:
 def presign_artifact_upload(
     request: Request,
     db: DbSession,
-    ctx: MemberAuth,
+    principal: MemberAuth,
     payload: Annotated[dict[str, Any], Body()],
 ) -> dict[str, Any]:
     body: PresignUploadIn = _parse_body(PresignUploadIn, payload)
@@ -1152,7 +1147,7 @@ def presign_artifact_upload(
         )
 
     if body.run_id is not None:
-        _get_run_or_404(db, ctx.project_id, body.run_id)
+        _get_run_or_404(db, principal.project_id, body.run_id)
 
     if body.external_uri is not None:
         try:
@@ -1170,7 +1165,7 @@ def presign_artifact_upload(
         existing_cas = db.scalars(
             select(Artifact)
             .where(
-                Artifact.project_id == ctx.project_id,
+                Artifact.project_id == principal.project_id,
                 Artifact.sha256 == sha256_norm,
                 Artifact.status == "committed",
             )
@@ -1193,7 +1188,7 @@ def presign_artifact_upload(
         deduplicated = False
     else:
         storage_uri, upload_url = artifact_store.presign_put(
-            ctx.project_id,
+            principal.project_id,
             sha256_norm,
             body.size_bytes,
             body.content_type,
@@ -1209,11 +1204,11 @@ def presign_artifact_upload(
             with db.begin_nested():
                 current_ver = db.scalar(
                     select(func.max(Artifact.version)).where(
-                        Artifact.project_id == ctx.project_id, Artifact.name == name
+                        Artifact.project_id == principal.project_id, Artifact.name == name
                     )
                 )
                 art = Artifact(
-                    project_id=ctx.project_id,
+                    project_id=principal.project_id,
                     run_id=body.run_id,
                     name=name,
                     kind=body.kind,
@@ -1236,7 +1231,7 @@ def presign_artifact_upload(
 
     assert art is not None
     if deduplicated and body.run_id is not None:
-        _add_lineage_edge(db, ctx.project_id, "run", body.run_id, "artifact", art.id, "produced")
+        _add_lineage_edge(db, principal.project_id, "run", body.run_id, "artifact", art.id, "produced")
 
     out = _artifact_out(art)
     out["deduplicated"] = deduplicated
@@ -1244,24 +1239,16 @@ def presign_artifact_upload(
     return out
 
 
-def _token_key_in_project(key: str, project_id: str) -> None:
-    """T2 hardening: the signed token alone is not enough; the caller must also be authenticated in
-    the project that owns the object key (keys are `projects/<project_id>/blobs/...`)."""
-    if not key.startswith(f"projects/{project_id}/"):
-        raise HTTPException(status_code=404, detail="artifact blob not found")
-
-
 @router.put("/artifacts/local/{token}")
-async def upload_local_artifact(token: str, request: Request, ctx: MemberAuth) -> dict[str, Any]:
+async def upload_local_artifact(token: str, request: Request, principal: MemberAuth) -> dict[str, Any]:
     artifact_store = request.app.state.mlops_artifact_store
     if not isinstance(artifact_store, LocalFSArtifactStore):
         raise HTTPException(status_code=404, detail="local artifact store not enabled")
 
     try:
-        key = artifact_store.verify_local_token(token, expected_op="put")
+        key = artifact_store.verify_local_token(token, expected_op="put", expected_project_id=principal.project_id)
     except ValueError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
-    _token_key_in_project(key, ctx.project_id)
 
     max_bytes = request.app.state.settings.max_artifact_bytes
 
@@ -1288,16 +1275,15 @@ async def upload_local_artifact(token: str, request: Request, ctx: MemberAuth) -
 
 
 @router.get("/artifacts/local/{token}")
-def download_local_artifact(token: str, request: Request, ctx: ViewerAuth) -> FileResponse:
+def download_local_artifact(token: str, request: Request, principal: ViewerAuth) -> FileResponse:
     artifact_store = request.app.state.mlops_artifact_store
     if not isinstance(artifact_store, LocalFSArtifactStore):
         raise HTTPException(status_code=404, detail="local artifact store not enabled")
 
     try:
-        key = artifact_store.verify_local_token(token, expected_op="get")
+        key = artifact_store.verify_local_token(token, expected_op="get", expected_project_id=principal.project_id)
     except ValueError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
-    _token_key_in_project(key, ctx.project_id)
 
     try:
         path = artifact_store.read_local_blob_path(key)
@@ -1312,15 +1298,15 @@ def commit_artifact(
     artifact_id: str,
     request: Request,
     db: DbSession,
-    ctx: MemberAuth,
+    principal: MemberAuth,
     payload: Annotated[dict[str, Any] | None, Body()] = None,
 ) -> dict[str, Any]:
-    art = _get_artifact_or_404(db, ctx.project_id, artifact_id)
+    art = _get_artifact_or_404(db, principal.project_id, artifact_id)
     body: ArtifactCommitIn = _parse_body(ArtifactCommitIn, payload or {})
 
     source_run_id = body.source_run_id or art.run_id
     if source_run_id is not None:
-        _get_run_or_404(db, ctx.project_id, source_run_id)
+        _get_run_or_404(db, principal.project_id, source_run_id)
         art.run_id = source_run_id
 
     if art.storage_backend != "external":
@@ -1339,7 +1325,7 @@ def commit_artifact(
     db.flush()
 
     if source_run_id is not None:
-        _add_lineage_edge(db, ctx.project_id, "run", source_run_id, "artifact", art.id, "produced")
+        _add_lineage_edge(db, principal.project_id, "run", source_run_id, "artifact", art.id, "produced")
 
     return _artifact_out(art)
 
@@ -1347,13 +1333,13 @@ def commit_artifact(
 @router.get("/artifacts")
 def list_artifacts(
     db: DbSession,
-    ctx: ViewerAuth,
+    principal: ViewerAuth,
     run_id: str | None = None,
     kind: str | None = None,
     status: str | None = None,
     name: str | None = None,
 ) -> dict[str, Any]:
-    stmt = select(Artifact).where(Artifact.project_id == ctx.project_id)
+    stmt = select(Artifact).where(Artifact.project_id == principal.project_id)
     if run_id is not None:
         stmt = stmt.where(Artifact.run_id == run_id)
     if kind is not None:
@@ -1371,13 +1357,13 @@ def get_artifact_download_url(
     artifact_id: str,
     request: Request,
     db: DbSession,
-    ctx: ViewerAuth,
+    principal: ViewerAuth,
 ) -> dict[str, Any]:
-    art = _get_artifact_or_404(db, ctx.project_id, artifact_id)
+    art = _get_artifact_or_404(db, principal.project_id, artifact_id)
     if art.storage_backend == "external":
         download_url = art.storage_uri
     else:
-        download_url = request.app.state.mlops_artifact_store.presign_get(ctx.project_id, art.storage_uri)
+        download_url = request.app.state.mlops_artifact_store.presign_get(principal.project_id, art.storage_uri)
     return {
         "artifact_id": art.id,
         "download_url": download_url,
@@ -1395,7 +1381,7 @@ def get_artifact_download_url(
 @router.post("/models", status_code=201)
 def create_model(
     db: DbSession,
-    ctx: MemberAuth,
+    principal: MemberAuth,
     payload: Annotated[dict[str, Any], Body()],
 ) -> dict[str, Any]:
     body: ModelCreate = _parse_body(ModelCreate, payload)
@@ -1404,13 +1390,13 @@ def create_model(
         raise HTTPException(status_code=422, detail="name must not be blank")
 
     exists = db.scalar(
-        select(RegisteredModel.id).where(RegisteredModel.project_id == ctx.project_id, RegisteredModel.name == name)
+        select(RegisteredModel.id).where(RegisteredModel.project_id == principal.project_id, RegisteredModel.name == name)
     )
     if exists is not None:
         raise HTTPException(status_code=409, detail="model name already exists")
 
     model = RegisteredModel(
-        project_id=ctx.project_id,
+        project_id=principal.project_id,
         name=name,
         description=body.description,
         model_type=body.model_type,
@@ -1427,23 +1413,23 @@ def create_model(
 
 
 @router.get("/models")
-def list_models(db: DbSession, ctx: ViewerAuth) -> dict[str, Any]:
+def list_models(db: DbSession, principal: ViewerAuth) -> dict[str, Any]:
     models = list(
         db.scalars(
             select(RegisteredModel)
-            .where(RegisteredModel.project_id == ctx.project_id)
+            .where(RegisteredModel.project_id == principal.project_id)
             .order_by(RegisteredModel.updated_at.desc())
         )
     )
     versions = list(
         db.scalars(
             select(ModelVersion)
-            .where(ModelVersion.project_id == ctx.project_id)
+            .where(ModelVersion.project_id == principal.project_id)
             .order_by(ModelVersion.version.desc())
         )
     )
     aliases = list(
-        db.scalars(select(ModelAlias).where(ModelAlias.project_id == ctx.project_id))
+        db.scalars(select(ModelAlias).where(ModelAlias.project_id == principal.project_id))
     )
 
     versions_by_model: dict[str, list[ModelVersion]] = {}
@@ -1471,18 +1457,18 @@ def list_models(db: DbSession, ctx: ViewerAuth) -> dict[str, Any]:
 
 
 @router.get("/models/{model_id}")
-def get_model(model_id: str, db: DbSession, ctx: ViewerAuth) -> dict[str, Any]:
-    model = _get_model_or_404(db, ctx.project_id, model_id)
+def get_model(model_id: str, db: DbSession, principal: ViewerAuth) -> dict[str, Any]:
+    model = _get_model_or_404(db, principal.project_id, model_id)
     versions = list(
         db.scalars(
             select(ModelVersion)
-            .where(ModelVersion.project_id == ctx.project_id, ModelVersion.model_id == model.id)
+            .where(ModelVersion.project_id == principal.project_id, ModelVersion.model_id == model.id)
             .order_by(ModelVersion.version.desc())
         )
     )
     aliases = list(
         db.scalars(
-            select(ModelAlias).where(ModelAlias.project_id == ctx.project_id, ModelAlias.model_id == model.id)
+            select(ModelAlias).where(ModelAlias.project_id == principal.project_id, ModelAlias.model_id == model.id)
         )
     )
     out = _model_out(model)
@@ -1495,21 +1481,21 @@ def get_model(model_id: str, db: DbSession, ctx: ViewerAuth) -> dict[str, Any]:
 def delete_model(
     model_id: str,
     db: DbSession,
-    ctx: AdminAuth,
+    principal: AdminAuth,
     force: bool = False,
 ) -> dict[str, Any]:
-    model = _get_model_or_404(db, ctx.project_id, model_id)
+    model = _get_model_or_404(db, principal.project_id, model_id)
     if not force:
         has_protected_alias = db.scalar(
             select(ModelAlias.id).where(
-                ModelAlias.project_id == ctx.project_id,
+                ModelAlias.project_id == principal.project_id,
                 ModelAlias.model_id == model.id,
                 ModelAlias.alias.in_(ADMIN_ONLY_ALIASES),
             )
         )
         has_prod_stage = db.scalar(
             select(ModelVersion.id).where(
-                ModelVersion.project_id == ctx.project_id,
+                ModelVersion.project_id == principal.project_id,
                 ModelVersion.model_id == model.id,
                 ModelVersion.stage == "production",
             )
@@ -1528,23 +1514,23 @@ def delete_model(
 def create_model_version(
     model_id: str,
     db: DbSession,
-    ctx: MemberAuth,
+    principal: MemberAuth,
     payload: Annotated[dict[str, Any], Body()],
 ) -> dict[str, Any]:
-    model = _get_model_or_404(db, ctx.project_id, model_id)
+    model = _get_model_or_404(db, principal.project_id, model_id)
     body: ModelVersionCreate = _parse_body(ModelVersionCreate, payload)
 
     if body.stage == "production":
-        _require_admin(ctx)
+        ensure_role(principal, Role.ADMIN)
 
     if body.artifact_id is not None:
-        _get_artifact_or_404(db, ctx.project_id, body.artifact_id)
+        _get_artifact_or_404(db, principal.project_id, body.artifact_id)
     if body.run_id is not None:
-        _get_run_or_404(db, ctx.project_id, body.run_id)
+        _get_run_or_404(db, principal.project_id, body.run_id)
     if body.eval_experiment_id is not None:
-        _get_experiment_or_404(db, ctx.project_id, body.eval_experiment_id)
+        _get_experiment_or_404(db, principal.project_id, body.eval_experiment_id)
     if body.safety_scan_id is not None:
-        _get_safety_scan_or_404(db, ctx.project_id, body.safety_scan_id)
+        _get_safety_scan_or_404(db, principal.project_id, body.safety_scan_id)
 
     mv: ModelVersion | None = None
     for attempt in range(MAX_CREATE_ATTEMPTS):
@@ -1552,11 +1538,11 @@ def create_model_version(
             with db.begin_nested():
                 current_ver = db.scalar(
                     select(func.max(ModelVersion.version)).where(
-                        ModelVersion.project_id == ctx.project_id, ModelVersion.model_id == model.id
+                        ModelVersion.project_id == principal.project_id, ModelVersion.model_id == model.id
                     )
                 )
                 mv = ModelVersion(
-                    project_id=ctx.project_id,
+                    project_id=principal.project_id,
                     model_id=model.id,
                     version=(current_ver or 0) + 1,
                     artifact_id=body.artifact_id,
@@ -1568,7 +1554,7 @@ def create_model_version(
                     signature=body.signature,
                     metrics_snapshot=body.metrics_snapshot,
                     model_card=body.model_card,
-                    created_by=ctx.user_email or ctx.user_id or "api_key",
+                    created_by=principal.actor_id,
                 )
                 db.add(mv)
                 db.flush()
@@ -1579,16 +1565,16 @@ def create_model_version(
 
     assert mv is not None
     if body.artifact_id is not None:
-        _add_lineage_edge(db, ctx.project_id, "artifact", body.artifact_id, "model_version", mv.id, "packaged_as")
+        _add_lineage_edge(db, principal.project_id, "artifact", body.artifact_id, "model_version", mv.id, "packaged_as")
     if body.run_id is not None:
-        _add_lineage_edge(db, ctx.project_id, "run", body.run_id, "model_version", mv.id, "registered_as")
+        _add_lineage_edge(db, principal.project_id, "run", body.run_id, "model_version", mv.id, "registered_as")
     if body.eval_experiment_id is not None:
         _add_lineage_edge(
-            db, ctx.project_id, "model_version", mv.id, "experiment", body.eval_experiment_id, "evaluated_by"
+            db, principal.project_id, "model_version", mv.id, "experiment", body.eval_experiment_id, "evaluated_by"
         )
     if body.safety_scan_id is not None:
         _add_lineage_edge(
-            db, ctx.project_id, "model_version", mv.id, "safety_scan", body.safety_scan_id, "audited_by"
+            db, principal.project_id, "model_version", mv.id, "safety_scan", body.safety_scan_id, "audited_by"
         )
 
     model.updated_at = utcnow()
@@ -1601,16 +1587,16 @@ def update_model_version_stage(
     model_id: str,
     version: int,
     db: DbSession,
-    ctx: MemberAuth,
+    principal: MemberAuth,
     payload: Annotated[dict[str, Any], Body()],
 ) -> dict[str, Any]:
-    model = _get_model_or_404(db, ctx.project_id, model_id)
+    model = _get_model_or_404(db, principal.project_id, model_id)
     body: ModelStagePatch = _parse_body(ModelStagePatch, payload)
     if body.stage == "production":
-        _require_admin(ctx)
-    mv = _get_model_version_or_404(db, ctx.project_id, model.id, version)
+        ensure_role(principal, Role.ADMIN)
+    mv = _get_model_version_or_404(db, principal.project_id, model.id, version)
     if mv.stage == "production":
-        _require_admin(ctx)
+        ensure_role(principal, Role.ADMIN)
     mv.stage = body.stage
     model.updated_at = utcnow()
     db.flush()
@@ -1621,28 +1607,28 @@ def update_model_version_stage(
 def set_model_alias(
     model_id: str,
     db: DbSession,
-    ctx: MemberAuth,
+    principal: MemberAuth,
     payload: Annotated[dict[str, Any], Body()],
 ) -> dict[str, Any]:
-    model = _get_model_or_404(db, ctx.project_id, model_id)
+    model = _get_model_or_404(db, principal.project_id, model_id)
     body: ModelAliasIn = _parse_body(ModelAliasIn, payload)
     alias = body.alias.strip().lstrip("@")
     if not alias:
         raise HTTPException(status_code=422, detail="alias must not be blank")
     if alias.lower() in ADMIN_ONLY_ALIASES:
-        _require_admin(ctx)
+        ensure_role(principal, Role.ADMIN)
 
-    _get_model_version_or_404(db, ctx.project_id, model.id, body.version)
+    _get_model_version_or_404(db, principal.project_id, model.id, body.version)
 
     existing = db.scalars(
         select(ModelAlias).where(
-            ModelAlias.project_id == ctx.project_id,
+            ModelAlias.project_id == principal.project_id,
             ModelAlias.model_id == model.id,
             ModelAlias.alias == alias,
         )
     ).first()
     if existing is None:
-        db.add(ModelAlias(project_id=ctx.project_id, model_id=model.id, alias=alias, version=body.version))
+        db.add(ModelAlias(project_id=principal.project_id, model_id=model.id, alias=alias, version=body.version))
     else:
         existing.version = body.version
         existing.updated_at = utcnow()
@@ -1652,12 +1638,12 @@ def set_model_alias(
 
 
 @router.get("/models/{model_id}/lineage")
-def get_model_lineage(model_id: str, db: DbSession, ctx: ViewerAuth) -> dict[str, Any]:
-    model = _get_model_or_404(db, ctx.project_id, model_id)
+def get_model_lineage(model_id: str, db: DbSession, principal: ViewerAuth) -> dict[str, Any]:
+    model = _get_model_or_404(db, principal.project_id, model_id)
     mvs = list(
         db.scalars(
             select(ModelVersion).where(
-                ModelVersion.project_id == ctx.project_id,
+                ModelVersion.project_id == principal.project_id,
                 ModelVersion.model_id == model.id,
             )
         )
@@ -1665,7 +1651,7 @@ def get_model_lineage(model_id: str, db: DbSession, ctx: ViewerAuth) -> dict[str
     seed_nodes = [("model_version", mv.id) for mv in mvs]
     if not seed_nodes:
         return {"model_id": model.id, "nodes": [], "edges": []}
-    nodes, edges = _build_lineage_graph(db, ctx.project_id, seed_nodes)
+    nodes, edges = _build_lineage_graph(db, principal.project_id, seed_nodes)
     return {"model_id": model.id, "nodes": nodes, "edges": edges}
 
 
@@ -1674,19 +1660,19 @@ def evaluate_model_version(
     model_id: str,
     version: int,
     db: DbSession,
-    ctx: MemberAuth,
+    principal: MemberAuth,
     payload: Annotated[dict[str, Any] | None, Body()] = None,
 ) -> dict[str, Any]:
-    model = _get_model_or_404(db, ctx.project_id, model_id)
-    mv = _get_model_version_or_404(db, ctx.project_id, model.id, version)
+    model = _get_model_or_404(db, principal.project_id, model_id)
+    mv = _get_model_version_or_404(db, principal.project_id, model.id, version)
     body: ModelEvaluateIn = _parse_body(ModelEvaluateIn, payload or {})
 
     if body.dataset_id is not None:
-        _get_dataset_or_404(db, ctx.project_id, body.dataset_id)
+        _get_dataset_or_404(db, principal.project_id, body.dataset_id)
 
     job = enqueue(
         db,
-        ctx.project_id,
+        principal.project_id,
         "mlops.evaluate",
         {
             "model_id": model.id,

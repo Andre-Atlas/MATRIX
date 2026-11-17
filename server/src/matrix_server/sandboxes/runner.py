@@ -46,6 +46,15 @@ FORBIDDEN_SOCKET_PATTERNS = (
     "/run/docker.sock",
 )
 
+# Written by the API (never accepted from the client) when an ADMIN approves network access; the
+# worker derives `is_admin` from it. `is_admin` itself is reserved so an old/forged policy is inert.
+NETWORK_APPROVED_BY = "network_approved_by"
+RESERVED_POLICY_KEYS = frozenset({NETWORK_APPROVED_BY, "is_admin"})
+
+
+def network_approved(policy: dict[str, Any]) -> bool:
+    return bool(policy.get(NETWORK_APPROVED_BY))
+
 
 class SandboxPolicyError(ValueError):
     """Raised when sandbox policy violates security invariants."""
@@ -874,7 +883,7 @@ def run_sandbox_job(
                     sandbox = DockerSandbox(
                         workdir=workdir,
                         sandbox_policy=sandbox_policy,
-                        is_admin=sandbox_policy.get("is_admin", False),
+                        is_admin=network_approved(sandbox_policy),
                     )
                 else:
                     sandbox = LocalSandbox(

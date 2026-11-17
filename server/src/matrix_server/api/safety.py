@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from matrix_server.auth import AuthContext, require_role
+from matrix_server.auth import Principal, Role, require
 from matrix_server.safety import (
     PROBES,
     get_category,
@@ -25,8 +25,8 @@ from matrix_server.storage.models import SafetyScan
 router = APIRouter(prefix="/api/v1/safety", tags=["safety"])
 
 DbSession = Annotated[Session, Depends(get_db)]
-ViewerAuth = Annotated[AuthContext, Depends(require_role("viewer"))]
-MemberAuth = Annotated[AuthContext, Depends(require_role("member"))]
+ViewerAuth = Annotated[Principal, Depends(require(Role.VIEWER))]
+MemberAuth = Annotated[Principal, Depends(require(Role.MEMBER))]
 
 
 def _iso_utc(dt: datetime | None) -> str | None:
@@ -94,7 +94,7 @@ class CreateSafetyScanRequest(BaseModel):
 
 
 @router.get("/categories")
-def get_safety_categories(ctx: ViewerAuth) -> dict[str, Any]:
+def get_safety_categories(principal: ViewerAuth) -> dict[str, Any]:
     """List supported OWASP Top 10 for LLMs compliance categories and probe statistics."""
     categories_list = []
     for cat in list_categories():
@@ -124,7 +124,7 @@ def get_safety_categories(ctx: ViewerAuth) -> dict[str, Any]:
 def create_safety_scan(
     payload: CreateSafetyScanRequest,
     db: DbSession,
-    ctx: MemberAuth,
+    principal: MemberAuth,
 ) -> dict[str, Any]:
     """Execute a defensive security audit scan and record the compliance report."""
     effective_prompt = payload.target_prompt if payload.target_prompt is not None else payload.target_system_prompt
@@ -143,7 +143,7 @@ def create_safety_scan(
 
     scan_record = SafetyScan(
         id=report.scan_id,
-        project_id=ctx.project_id,
+        project_id=principal.project_id,
         target_prompt=report.target_prompt,
         target_model=report.target_model,
         status=report.status,
@@ -164,7 +164,7 @@ def create_safety_scan(
         **report.model_dump(),
         "id": report.scan_id,
         "scan_id": report.scan_id,
-        "project_id": ctx.project_id,
+        "project_id": principal.project_id,
         "name": scan_name,
         "safety_score": round(report.global_score, 1),
         "probes_passed": report.passed_count,
@@ -180,12 +180,12 @@ def create_safety_scan(
 @router.get("/scans")
 def list_safety_scans(
     db: DbSession,
-    ctx: ViewerAuth,
+    principal: ViewerAuth,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> dict[str, Any]:
     """List audit scan history for the current project."""
-    base_query = select(SafetyScan).where(SafetyScan.project_id == ctx.project_id)
+    base_query = select(SafetyScan).where(SafetyScan.project_id == principal.project_id)
     total = db.scalar(select(func.count()).select_from(base_query.subquery())) or 0
 
     scans = db.scalars(
@@ -235,13 +235,13 @@ def list_safety_scans(
 def get_safety_scan(
     scan_id: str,
     db: DbSession,
-    ctx: ViewerAuth,
+    principal: ViewerAuth,
 ) -> dict[str, Any]:
     """Retrieve full audit report and findings for a given scan ID."""
     scan = db.scalar(
         select(SafetyScan).where(
             SafetyScan.id == scan_id,
-            SafetyScan.project_id == ctx.project_id,
+            SafetyScan.project_id == principal.project_id,
         )
     )
     if scan is None:

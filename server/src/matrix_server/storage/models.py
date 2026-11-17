@@ -442,11 +442,6 @@ class LoginKnownIp(Base):
     last_success_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
 
 
-# TEMPORARY compat for main's routers — removed by T3: `main` called the membership table
-# `project_members` / `ProjectMember`; the branch's `memberships` / `Membership` is the only one.
-ProjectMember = Membership
-
-
 # --- Defensive Security & OWASP Top 10 Scans --------------------------------
 
 

@@ -161,11 +161,9 @@ class LocalFSArtifactStore:
 
     def __init__(self, settings: Settings) -> None:
         self._root = Path(settings.artifact_dir).resolve()
-        configured = settings.artifact_token_secret
-        # No public default (ADR-013 §3): without a configured key, a random per-process key.
-        self._secret = (
-            configured.get_secret_value().encode("utf-8") if configured is not None else _PROCESS_TOKEN_KEY
-        )
+        # No public default (ADR-013 §3). Outside tests the key is mandatory (raises ConfigError), so
+        # every API/worker process signs and verifies with the same key; tests get a per-process key.
+        self._secret = settings.artifact_token_key() or _PROCESS_TOKEN_KEY
         self._ttl_seconds = max(1, int(settings.artifact_presign_ttl_seconds))
         self._max_artifact_bytes = int(settings.max_artifact_bytes)
 
@@ -179,22 +177,24 @@ class LocalFSArtifactStore:
             raise ValueError("Artifact path escapes configured root directory")
         return target
 
-    def _sign_token(self, op: Literal["put", "get"], key: str, exp: int) -> str:
-        payload = json.dumps({"op": op, "key": key, "exp": exp}, separators=(",", ":"), sort_keys=True)
+    def _sign_token(self, op: Literal["put", "get"], project_id: str, key: str, exp: int) -> str:
+        payload = json.dumps(
+            {"op": op, "pid": project_id, "key": key, "exp": exp}, separators=(",", ":"), sort_keys=True
+        )
         payload_b64 = _b64url_encode(payload.encode("utf-8"))
         sig = hmac.new(self._secret, payload_b64.encode("ascii"), hashlib.sha256).hexdigest()
         return f"{payload_b64}.{sig}"
 
-    def verify_local_token(self, token: str, expected_op: Literal["put", "get"]) -> str:
-        """Verify HMAC signature, operation, expiration, and path confinement; return object key."""
-        if not isinstance(token, str) or "." not in token:
+    def verify_local_token(
+        self, token: str, expected_op: Literal["put", "get"], expected_project_id: str
+    ) -> str:
+        """Verify the token and return its object key. The HMAC is compared in constant time; the
+        token is bound to (project, object key, operation) and expires (`exp`, Unix seconds)."""
+        if not isinstance(token, str) or token.count(".") != 1:
             raise ValueError("Malformed artifact token")
-        parts = token.split(".")
-        if len(parts) != 2:
-            raise ValueError("Malformed artifact token")
-        payload_b64, sig = parts
-        expected_sig = hmac.new(self._secret, payload_b64.encode("ascii"), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(sig, expected_sig):
+        payload_b64, sig = token.split(".")
+        expected_sig = hmac.new(self._secret, payload_b64.encode("ascii", "replace"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig.encode("ascii", "replace"), expected_sig.encode("ascii")):
             raise ValueError("Invalid artifact token signature")
 
         try:
@@ -213,8 +213,12 @@ class LocalFSArtifactStore:
         if exp < int(time.time()):
             raise ValueError("Artifact token has expired")
 
+        pid = payload.get("pid")
+        if type(pid) is not str or not hmac.compare_digest(pid.encode(), expected_project_id.encode()):
+            raise ValueError("Artifact token project mismatch")
+
         key = payload.get("key")
-        if type(key) is not str:
+        if type(key) is not str or not key.startswith(f"projects/{pid}/"):
             raise ValueError("Invalid artifact token key")
         self._resolve_key(key)
         return key
@@ -232,7 +236,7 @@ class LocalFSArtifactStore:
         key = self.object_key(project_id, sha256)
         self._resolve_key(key)
         exp = int(time.time()) + self._ttl_seconds
-        token = self._sign_token("put", key, exp)
+        token = self._sign_token("put", project_id, key, exp)
         return f"local://{key}", f"/api/v1/mlops/artifacts/local/{token}"
 
     def presign_get(self, project_id: str, storage_uri: str) -> str:
@@ -241,7 +245,7 @@ class LocalFSArtifactStore:
         if not key.startswith(f"projects/{safe_project}/"):
             raise ValueError("Artifact does not belong to the requested project")
         exp = int(time.time()) + self._ttl_seconds
-        token = self._sign_token("get", key, exp)
+        token = self._sign_token("get", safe_project, key, exp)
         return f"/api/v1/mlops/artifacts/local/{token}"
 
     def _extract_local_key(self, storage_uri: str) -> str:

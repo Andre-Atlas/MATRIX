@@ -37,6 +37,8 @@ from matrix_server.storage.spans import build_span_store
 def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="MATRIX")
     settings = settings or get_settings()
+    # Fail fast (ConfigError) on a deployment without MATRIX_ARTIFACT_TOKEN_SECRET (MATRIX_ENV != test).
+    settings.artifact_token_key()
     app.state.settings = settings
     users.configure_hash_concurrency(settings.password_hash_concurrency)
     app.add_middleware(

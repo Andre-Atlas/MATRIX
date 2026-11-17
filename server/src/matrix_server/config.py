@@ -6,8 +6,16 @@ from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+class ConfigError(RuntimeError):
+    """Invalid configuration detected at startup."""
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="MATRIX_")
+
+    # Deployment kind (MATRIX_ENV). "test" (the test suite) and "dev" (Makefile/dev scripts) relax
+    # startup requirements meant for real deployments; anything else is treated as production.
+    env: Literal["production", "dev", "test"] = "production"
 
     database_url: str = "sqlite:///./matrix.db"
     span_store: Literal["memory", "clickhouse"] = "memory"
@@ -67,10 +75,26 @@ class Settings(BaseSettings):
     project_quota_bytes: int = 50 * 1024**3
     verify_hash_max_bytes: int = 256 * 1024**2
     artifact_url_ttl_seconds: int = 3600
-    # HMAC key of the signed upload/download tokens of main's MLOps local store (ADR-013 §3: no
-    # `jwt_secret`, no public default). Unset: a random key per process (tokens die on restart and
-    # are not shared between workers), which is safe; set it for multi-worker deployments.
+    # HMAC key of the signed upload/download tokens of the MLOps local store (ADR-013 §3: no
+    # `jwt_secret`, no public default). REQUIRED (MATRIX_ARTIFACT_TOKEN_SECRET) unless env is
+    # "test": every API and worker process must share it, see `artifact_token_key`.
     artifact_token_secret: SecretStr | None = None
+
+    def artifact_token_key(self) -> bytes | None:
+        """The configured token key, or None in tests (callers then use a per-process key).
+        Raises `ConfigError` outside tests when MATRIX_ARTIFACT_TOKEN_SECRET is unset or blank."""
+        secret = self.artifact_token_secret.get_secret_value() if self.artifact_token_secret else ""
+        if secret.strip():
+            if len(secret) < 32 and self.env == "production":
+                raise ConfigError("MATRIX_ARTIFACT_TOKEN_SECRET must have at least 32 characters")
+            return secret.encode("utf-8")
+        if self.env == "test":
+            return None
+        raise ConfigError(
+            "MATRIX_ARTIFACT_TOKEN_SECRET is required (MATRIX_ENV="
+            f"{self.env!r}): set it to the same random value (e.g. `openssl rand -hex 32`) on every "
+            "API and worker process; it signs MLOps artifact upload/download tokens"
+        )
 
     # --- TEMPORARY compat for main's code (removed by T3/T4): read-only aliases onto the branch's
     # artifact settings. There is one set of artifact settings; these names are not configurable.

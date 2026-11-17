@@ -17,9 +17,11 @@ from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
-from matrix_server.auth import AuthContext, require_role
+from matrix_server.auth import Principal, Role, ensure_role, require
 from matrix_server.sandboxes.runner import (
     FORBIDDEN_SOCKET_PATTERNS,
+    NETWORK_APPROVED_BY,
+    RESERVED_POLICY_KEYS,
     run_sandbox_job,
     validate_sandbox_path,
 )
@@ -34,9 +36,8 @@ from matrix_server.storage.models import (
 router = APIRouter(prefix="/api/v1/sandboxes", tags=["sandboxes"])
 
 DbSession = Annotated[Session, Depends(get_db)]
-ViewerAuth = Annotated[AuthContext, Depends(require_role("viewer"))]
-MemberAuth = Annotated[AuthContext, Depends(require_role("member"))]
-AdminAuth = Annotated[AuthContext, Depends(require_role("admin"))]
+ViewerAuth = Annotated[Principal, Depends(require(Role.VIEWER))]
+MemberAuth = Annotated[Principal, Depends(require(Role.MEMBER))]
 
 DEFAULT_PAGE = 50
 MAX_PAGE = 500
@@ -169,7 +170,7 @@ def create_sandbox_run(
     request: Request,
     payload: Annotated[dict[str, Any], Body()],
     db: DbSession,
-    ctx: MemberAuth,
+    principal: MemberAuth,
 ) -> dict[str, Any]:
     """Create and enqueue an Inspect AI Sandbox run."""
     _reject_non_finite(payload)
@@ -181,15 +182,19 @@ def create_sandbox_run(
             detail=exc.errors(include_input=False, include_context=False, include_url=False),
         ) from exc
 
-    policy = body.sandbox_policy or {}
+    policy = dict(body.sandbox_policy or {})
 
-    # Security rule 1: Non-admin requesting network access rejected with 403
+    # Server-owned policy keys: the worker trusts them, so a client may never send them.
+    reserved = sorted(k for k in policy if k in RESERVED_POLICY_KEYS)
+    if reserved:
+        raise HTTPException(status_code=422, detail=f"sandbox_policy keys are server-owned: {', '.join(reserved)}")
+
+    # Security rule 1: network access is approved only by an ADMIN of the project (never an API
+    # key); the approval comes from the authenticated principal, never from the request body.
     network_mode = policy.get("network_mode", "none")
-    if network_mode != "none" and ctx.role != "admin":
-        raise HTTPException(
-            status_code=403,
-            detail="network_mode != 'none' requires admin role",
-        )
+    if network_mode != "none":
+        ensure_role(principal, Role.ADMIN)
+        policy[NETWORK_APPROVED_BY] = principal.actor_id
 
     # Security rule 2: Docker socket mounting strictly forbidden
     mounts = policy.get("mounts", [])
@@ -249,21 +254,21 @@ def create_sandbox_run(
         ds = db.scalar(
             select(Dataset).where(
                 Dataset.id == body.dataset_id,
-                Dataset.project_id == ctx.project_id,
+                Dataset.project_id == principal.project_id,
             )
         )
         if ds is None:
             raise HTTPException(status_code=404, detail="dataset not found")
 
     run = SandboxRun(
-        project_id=ctx.project_id,
+        project_id=principal.project_id,
         name=body.name,
         runner_backend=body.runner_backend,
         dataset_id=body.dataset_id,
         dataset_commit_id=body.dataset_commit_id,
         solver_config=body.solver_config,
         scorer_config=body.scorer_config,
-        sandbox_policy=body.sandbox_policy,
+        sandbox_policy=policy,
         status="queued",
     )
     db.add(run)
@@ -271,7 +276,7 @@ def create_sandbox_run(
 
     job = jobs.enqueue(
         session=db,
-        project_id=ctx.project_id,
+        project_id=principal.project_id,
         kind="sandbox.run",
         payload={"sandbox_run_id": run.id},
     )
@@ -293,14 +298,14 @@ def create_sandbox_run(
 @router.get("/runs")
 def list_sandbox_runs(
     db: DbSession,
-    ctx: ViewerAuth,
+    principal: ViewerAuth,
     status: str | None = None,
     dataset_id: str | None = None,
     limit: Annotated[int, Query(ge=1, le=MAX_PAGE)] = DEFAULT_PAGE,
     cursor: str | None = None,
 ) -> dict[str, Any]:
     """List sandbox runs with keyset cursor pagination."""
-    stmt = select(SandboxRun).where(SandboxRun.project_id == ctx.project_id)
+    stmt = select(SandboxRun).where(SandboxRun.project_id == principal.project_id)
     if status is not None:
         stmt = stmt.where(SandboxRun.status == status)
     if dataset_id is not None:
@@ -334,13 +339,13 @@ def list_sandbox_runs(
 def get_sandbox_run(
     run_id: str,
     db: DbSession,
-    ctx: ViewerAuth,
+    principal: ViewerAuth,
 ) -> dict[str, Any]:
     """Get detailed information about a sandbox run."""
     run = db.scalar(
         select(SandboxRun).where(
             SandboxRun.id == run_id,
-            SandboxRun.project_id == ctx.project_id,
+            SandboxRun.project_id == principal.project_id,
         )
     )
     if run is None:
@@ -352,7 +357,7 @@ def get_sandbox_run(
 def list_run_transcripts(
     run_id: str,
     db: DbSession,
-    ctx: ViewerAuth,
+    principal: ViewerAuth,
     status: str | None = None,
     limit: Annotated[int, Query(ge=1, le=MAX_PAGE)] = DEFAULT_PAGE,
     offset: Annotated[int, Query(ge=0)] = 0,
@@ -361,7 +366,7 @@ def list_run_transcripts(
     run = db.scalar(
         select(SandboxRun.id).where(
             SandboxRun.id == run_id,
-            SandboxRun.project_id == ctx.project_id,
+            SandboxRun.project_id == principal.project_id,
         )
     )
     if run is None:
@@ -369,7 +374,7 @@ def list_run_transcripts(
 
     stmt = select(SandboxTaskTranscript).where(
         SandboxTaskTranscript.sandbox_run_id == run_id,
-        SandboxTaskTranscript.project_id == ctx.project_id,
+        SandboxTaskTranscript.project_id == principal.project_id,
     )
     if status is not None:
         stmt = stmt.where(SandboxTaskTranscript.status == status)
@@ -388,7 +393,7 @@ def get_run_transcript_detail(
     run_id: str,
     task_key: str,
     db: DbSession,
-    ctx: ViewerAuth,
+    principal: ViewerAuth,
 ) -> dict[str, Any]:
     """Get full transcript details including steps and verified artifacts for a task."""
     try:
@@ -399,7 +404,7 @@ def get_run_transcript_detail(
     run = db.scalar(
         select(SandboxRun.id).where(
             SandboxRun.id == run_id,
-            SandboxRun.project_id == ctx.project_id,
+            SandboxRun.project_id == principal.project_id,
         )
     )
     if run is None:
@@ -409,7 +414,7 @@ def get_run_transcript_detail(
         select(SandboxTaskTranscript).where(
             SandboxTaskTranscript.sandbox_run_id == run_id,
             SandboxTaskTranscript.task_key == clean_key,
-            SandboxTaskTranscript.project_id == ctx.project_id,
+            SandboxTaskTranscript.project_id == principal.project_id,
         )
     )
     if transcript is None:
@@ -422,13 +427,13 @@ def get_run_transcript_detail(
 def cancel_sandbox_run(
     run_id: str,
     db: DbSession,
-    ctx: MemberAuth,
+    principal: MemberAuth,
 ) -> dict[str, Any]:
     """Cancel an ongoing or queued sandbox run."""
     run = db.scalar(
         select(SandboxRun).where(
             SandboxRun.id == run_id,
-            SandboxRun.project_id == ctx.project_id,
+            SandboxRun.project_id == principal.project_id,
         )
     )
     if run is None:

@@ -64,6 +64,8 @@ services:
       MATRIX_MAX_ACTIVE_RUNS_PER_PROJECT: ${MATRIX_MAX_ACTIVE_RUNS_PER_PROJECT:-1000}
       MATRIX_ARTIFACT_BACKEND: ${MATRIX_ARTIFACT_BACKEND:-local}
       MATRIX_ARTIFACT_LOCAL_DIR: /app/artifacts
+      # Signs MLOps artifact upload/download tokens; api and worker share it (this anchor). Required.
+      MATRIX_ARTIFACT_TOKEN_SECRET: ${MATRIX_ARTIFACT_TOKEN_SECRET:?defina MATRIX_ARTIFACT_TOKEN_SECRET em deploy/.env (openssl rand -hex 32)}
     volumes:
       - artifacts-data:/app/artifacts
     ports:
