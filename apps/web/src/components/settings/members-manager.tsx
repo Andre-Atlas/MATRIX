@@ -9,6 +9,8 @@ import { td, th } from "@/components/ui";
 import { ConfirmButton } from "./confirm-button";
 import { ErrorNote, RoleBadge, formatWhen, inputCls, labelCls, primaryBtn } from "./ui";
 
+export const ADD_NOTICE = "Se este e-mail tiver uma conta, o acesso foi concedido; confira a lista";
+
 /** Roles the caller may grant or assign: admins manage viewer/member, only owners hand out admin/owner. */
 const grantable = (me: Role): Role[] => (me === "owner" ? [...ROLES] : ROLES.filter((r) => roleRank(r) < roleRank("admin")));
 /** A row is editable unless it is admin/owner and the caller is not an owner. */
@@ -31,11 +33,13 @@ export function MembersManager({
   const [role, setRole] = useState<Role>("member");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const roles = grantable(myRole);
 
   async function run(fn: () => Promise<unknown>) {
     setBusy(true);
     setError(null);
+    setNotice(null);
     try {
       await fn();
       router.refresh();
@@ -51,14 +55,19 @@ export function MembersManager({
   async function add(e: React.FormEvent) {
     e.preventDefault();
     if (!validEmail(email)) return setError("Enter a valid email address.");
-    if (await run(() => proxy("POST", base, { email: email.trim(), role }))) setEmail("");
+    // The API answers 202 {"status":"pending_or_added"} whether or not the e-mail has an account,
+    // so the UI claims neither success nor failure: it refreshes the list and says so neutrally.
+    if (await run(() => proxy("POST", base, { email: email.trim(), role }))) {
+      setEmail("");
+      setNotice(ADD_NOTICE);
+    }
   }
 
   return (
     <div className="space-y-3">
       <form onSubmit={add} aria-label="Add member" className="flex flex-wrap items-end gap-2">
         <label className={labelCls}>
-          Email of an existing user
+          Email
           <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="dario@example.com" className={`${inputCls} w-64`} />
         </label>
         <label className={labelCls}>
@@ -79,6 +88,11 @@ export function MembersManager({
         <p className="text-xs text-zinc-500">Only an owner can grant or change the admin and owner roles.</p>
       )}
       {error && <ErrorNote>{error}</ErrorNote>}
+      {notice && (
+        <p role="status" className="text-xs text-zinc-400">
+          {notice}
+        </p>
+      )}
       <div className="overflow-x-auto rounded-md border border-zinc-800">
         <table className="w-full">
           <thead className="border-b border-zinc-800 bg-zinc-900/60">

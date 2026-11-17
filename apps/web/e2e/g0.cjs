@@ -1,7 +1,9 @@
 // End-to-end check of the G0 web (login, project switch, settings, latency) against the mock.
 //
 //   cd apps/web && npm run build
-//   MATRIX_MOCK=1 MATRIX_MOCK_LATENCY_MS=300 npm run start -- -p 3100 &      # server-side latency too
+//   MATRIX_MOCK=1 MATRIX_MOCK_LATENCY_MS=300 MATRIX_WEB_ORIGIN=http://localhost:3100 MATRIX_INSECURE_COOKIES=1 \
+//     npm run start -- -p 3100 &      # server-side latency too; production requires MATRIX_WEB_ORIGIN,
+//                                     # and plain HTTP needs MATRIX_INSECURE_COOKIES=1 (cookie names without __Host-)
 //   NODE_PATH=$(npm root -g) node e2e/g0.cjs [baseUrl] [screenshotDir]
 //
 // Part 2 is the "latency" criterion: every browser request is delayed 300 ms (page.route) while the
@@ -41,8 +43,12 @@ const shot = (page, name) => page.screenshot({ path: path.join(OUT, `g0-${name}.
   await shot(page, "02-login-error");
   await page.fill('input[name="password"]', "demo-password-123");
   await page.click('button[type="submit"]');
-  await page.waitForURL((u) => new URL(u).pathname === "/");
-  check(new URL(page.url()).origin === new URL(BASE).origin, "hostile next ignored: landed on the app home");
+  // The demo user belongs to 2 projects: after login the app asks which one (/projects), never an external next.
+  await page.waitForURL((u) => new URL(u).pathname === "/projects");
+  check(new URL(page.url()).origin === new URL(BASE).origin, "hostile next ignored: stayed on this origin (/projects)");
+  await shot(page, "02b-projects");
+  await page.click('li:has-text("Support Copilot") button:has-text("Open")');
+  await page.waitForURL((u) => !new URL(u).pathname.startsWith("/projects"));
   const cookies = await ctx.cookies();
   const sess = cookies.find((c) => c.name === "matrix_session");
   check(sess && sess.httpOnly && sess.sameSite === "Lax" && sess.path === "/", "matrix_session is HttpOnly, SameSite=Lax, Path=/");
@@ -95,7 +101,12 @@ const shot = (page, name) => page.screenshot({ path: path.join(OUT, `g0-${name}.
   await page.fill('input[type="email"]', "dario@example.com");
   await page.click('button:has-text("Add member")');
   await page.waitForSelector('select[aria-label="Role of dario@example.com"]');
-  check(true, "member added by email");
+  check((await page.textContent('main [role="status"]')).includes("Se este e-mail tiver uma conta"), "202 shows the neutral notice and the list is refreshed with the member");
+  await page.fill('input[type="email"]', "ghost@example.com");
+  await page.click('button:has-text("Add member")');
+  await page.waitForSelector('main [role="status"]');
+  check(!(await page.textContent("main")).includes("ghost@example.com"), "unknown e-mail: same neutral notice, nobody added");
+  await shot(page, "07b-members-notice");
   await page.fill('input[type="email"]', "dario@example.com");
   await page.click('button:has-text("Add member")');
   await page.waitForSelector("text=already a member");

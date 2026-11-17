@@ -2,8 +2,10 @@ name: matrix
 
 # Required variables (put them in deploy/.env; see README "Stack completa via docker compose"):
 # POSTGRES_PASSWORD, CLICKHOUSE_PASSWORD (URL-safe characters: they are embedded in URLs).
-# Published ports bind to 127.0.0.1 only: the web has no login yet and MATRIX_API_KEY gives full
-# read/write access to whoever reaches port 3000. Expose it only behind an authenticating proxy.
+# MATRIX_WEB_ORIGIN is required (public origin of the web, e.g. https://matrix.example.com; for local
+# use http://localhost:3000 plus MATRIX_INSECURE_COOKIES=1 if you serve plain HTTP). deploy/.env.example
+# lists every variable. The web has its own login (users/sessions) and holds no API key.
+# Published ports bind to 127.0.0.1 only: put a TLS reverse proxy in front to expose them.
 
 services:
   clickhouse:
@@ -39,8 +41,8 @@ services:
       timeout: 3s
       retries: 20
 
-  # No S3/MinIO service: nothing uses S3 yet. The S3 artifact store (cycle 2) comes back with a
-  # pinned S3-compatible image.
+  # No S3/MinIO service: no S3-compatible image has been validated. Artifacts go to the local volume
+  # (MATRIX_ARTIFACT_BACKEND=local). MATRIX_S3_* exist in the server but are NOT validated here.
 
   api:
     build: ../server
@@ -51,6 +53,14 @@ services:
       MATRIX_SPAN_STORE: clickhouse
       MATRIX_CLICKHOUSE_URL: http://default:${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in deploy/.env}@clickhouse:8123
       MATRIX_ADMIN_TOKEN: ${MATRIX_ADMIN_TOKEN:-}
+      MATRIX_TRUSTED_PROXY_HEADER: ${MATRIX_TRUSTED_PROXY_HEADER:-}
+      MATRIX_PASSWORD_HASH_CONCURRENCY: ${MATRIX_PASSWORD_HASH_CONCURRENCY:-4}
+      MATRIX_MAX_RUNS_PER_PROJECT: ${MATRIX_MAX_RUNS_PER_PROJECT:-100000}
+      MATRIX_MAX_ACTIVE_RUNS_PER_PROJECT: ${MATRIX_MAX_ACTIVE_RUNS_PER_PROJECT:-1000}
+      MATRIX_ARTIFACT_BACKEND: ${MATRIX_ARTIFACT_BACKEND:-local}
+      MATRIX_ARTIFACT_LOCAL_DIR: /app/artifacts
+    volumes:
+      - artifacts-data:/app/artifacts
     ports:
       - "127.0.0.1:8000:8000"
     healthcheck:
@@ -68,6 +78,8 @@ services:
     build: ../server
     restart: unless-stopped
     command: ["matrix-worker"]
+    volumes:
+      - artifacts-data:/app/artifacts
     environment:
       <<: *server-env
       # Judge for experiments and online evals. Empty provider = offline heuristic judge
@@ -87,13 +99,17 @@ services:
     restart: unless-stopped
     environment:
       MATRIX_API_URL: http://api:8000
-      MATRIX_API_KEY: ${MATRIX_API_KEY:-}
-      MATRIX_WEB_ORIGIN: ${MATRIX_WEB_ORIGIN:-}
+      MATRIX_WEB_ORIGIN: ${MATRIX_WEB_ORIGIN:?defina a origem pública, ex. https://matrix.exemplo.com}
+      MATRIX_WEB_TRUST_FORWARDED_FOR: ${MATRIX_WEB_TRUST_FORWARDED_FOR:-0}
+      MATRIX_TRUSTED_PROXY_HEADER: ${MATRIX_TRUSTED_PROXY_HEADER:-}
+      MATRIX_INSECURE_COOKIES: ${MATRIX_INSECURE_COOKIES:-}  # 1 only for local plain HTTP
     ports:
       - "127.0.0.1:3000:3000"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
 
 volumes:
+  artifacts-data:
   clickhouse-data:
   postgres-data:

@@ -21,6 +21,8 @@ import {
 } from "./types";
 
 export const NO_CONTENT = Symbol("no-content");
+/** POST /projects/{id}/members answers 202 with this body whether or not the e-mail has an account. */
+export const MEMBER_ACCEPTED = { status: "pending_or_added" } as const;
 export type MockCtx = { token: string | null; projectId: string | null; ip?: string | null; userAgent?: string | null };
 type Params = Record<string, string | number | undefined>;
 
@@ -392,12 +394,13 @@ export function authSend(ctx: MockCtx, method: string, path: string, body: unkno
         const { email, role } = body as { email: string; role: Role };
         ownerOnly(role);
         const user = s.users.find((u) => u.email === email.trim().toLowerCase());
-        if (!user) throw new ApiError(404, JSON.stringify({ detail: "user not found" }));
+        // Same answer for an unknown e-mail (no account enumeration); 409 only for an existing member.
+        if (!user) return MEMBER_ACCEPTED;
         if (s.members.some((x) => x.project_id === pid && x.user_id === user.id)) throw new ApiError(409, JSON.stringify({ detail: "user is already a member" }));
         const row: MemberRow = { user_id: user.id, project_id: pid, role, added_at: iso(Date.now()) };
         s.members.push(row);
         record(s, pid, actor, "member.add", user.id, { role });
-        return out(row);
+        return MEMBER_ACCEPTED;
       }
       const row = sub ? s.members.find((x) => x.project_id === pid && x.user_id === sub) : undefined;
       if (method === "PATCH" && sub) {

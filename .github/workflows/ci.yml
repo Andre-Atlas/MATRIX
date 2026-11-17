@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   server:
     runs-on: ubuntu-latest
@@ -35,7 +38,12 @@ jobs:
       - run: uv run ruff check .
       - name: Wait for ClickHouse
         run: for i in $(seq 1 30); do curl -sf http://localhost:8123/ping && break; sleep 2; done
-      - run: uv run pytest -q
+      # Skips fail the job, except the S3 backend ones (no S3 endpoint in CI): see scripts/check_skips.py.
+      - name: pytest (no unexpected skips)
+        run: |
+          set -o pipefail
+          uv run pytest -q -rs | tee "$RUNNER_TEMP/pytest.out"
+          python3 ../scripts/check_skips.py "$RUNNER_TEMP/pytest.out"
       - name: Migrations apply and match the models
         env:
           MATRIX_DATABASE_URL: postgresql+psycopg://matrix:matrix@localhost:5432/matrix_test
@@ -72,3 +80,53 @@ jobs:
       - run: npx tsc --noEmit
       - run: npm run test
       - run: npm run build
+
+  e2e:
+    needs: server
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: matrix
+          POSTGRES_PASSWORD: matrix
+          POSTGRES_DB: matrix
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U matrix" --health-interval 5s --health-timeout 5s --health-retries 10
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.8
+        env:
+          CLICKHOUSE_SKIP_USER_SETUP: "1"
+        ports: ["8123:8123"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Wait for ClickHouse
+        run: for i in $(seq 1 30); do curl -sf http://localhost:8123/ping && break; sleep 2; done
+      - name: Apply migrations
+        working-directory: server
+        env:
+          MATRIX_DATABASE_URL: postgresql+psycopg://matrix:matrix@localhost:5432/matrix
+        run: uv sync --frozen && uv run alembic upgrade head
+      - name: verify_mvp (6 criteria against real databases)
+        env:
+          MATRIX_DATABASE_URL: postgresql+psycopg://matrix:matrix@localhost:5432/matrix
+          MATRIX_CLICKHOUSE_URL: http://localhost:8123
+          MATRIX_CLICKHOUSE_DATABASE: matrix_demo
+        run: uv run --project server python scripts/verify_mvp.py
+
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compose config with the example .env
+        run: |
+          cp deploy/.env.example deploy/.env
+          docker compose -f deploy/compose.yaml config --quiet
+      - name: Compose file checks (ports, volumes, depends_on)
+        run: python3 -m pip install pyyaml && python3 scripts/check_compose.py
+      - name: Build server image (no push)
+        run: docker build -t matrix-server:ci server
+      - name: Build web image (no push)
+        run: docker build -t matrix-web:ci apps/web

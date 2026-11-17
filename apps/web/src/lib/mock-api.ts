@@ -1,6 +1,6 @@
 // In-memory implementation of the API, used only when MATRIX_MOCK=1.
 import { ApiError } from "./api-error";
-import { authGet, authSend, mockGate, NO_CONTENT, type MockCtx } from "./mock-auth";
+import { authGet, authSend, mockGate, MEMBER_ACCEPTED, NO_CONTENT, type MockCtx } from "./mock-auth";
 import { mockDb } from "./mock-data";
 import { evalExportJsonl, evalGet, evalSend } from "./mock-evals";
 import { dpoExportJsonl, opsGet, opsSend } from "./mock-ops";
@@ -182,6 +182,7 @@ export async function mockFetch(
     const out = await mockSend(method, path, body, ctx);
     if (out === NO_CONTENT) return new Response(null, { status: 204 });
     const login = path.replace(/\/+$/, "") === "/api/v1/auth/login";
+    if (out === MEMBER_ACCEPTED) return Response.json(out, { status: 202 });
     return Response.json(out, { status: method === "POST" && !login ? 201 : 200 });
   } catch (e) {
     if (e instanceof ApiError) {

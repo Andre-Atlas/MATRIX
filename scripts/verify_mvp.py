@@ -5,6 +5,9 @@ Sobe `matrix-api` (porta 8765) e `matrix-worker` com ClickHouse + PostgreSQL rea
 de RAG e confere cada critério pela API HTTP. Código de saída 0 só se todos passarem.
 
 Pré-requisitos: ClickHouse em :8123, PostgreSQL com o esquema aplicado (alembic upgrade head) e uv.
+Autenticação: o admin token cria usuário e projeto (com `owner_email`); regras, avaliações online e o
+label `production` de prompts exigem ADMIN, que uma chave de API nunca tem, então são feitos com uma
+SESSÃO do owner (login + `X-Matrix-Project`). A chave de API do projeto só ingere, lê e escreve dados.
 Variáveis opcionais: MATRIX_DATABASE_URL, MATRIX_CLICKHOUSE_URL, MATRIX_CLICKHOUSE_DATABASE.
 """
 
@@ -104,13 +107,23 @@ def main() -> int:
             raise RuntimeError(f"matrix-api não respondeu; veja {tmp / 'api.log'}")
 
         admin = httpx.Client(base_url=BASE, headers={"Authorization": f"Bearer {ADMIN_TOKEN}"}, timeout=30)
-        created = admin.post("/api/v1/admin/projects", json={"name": f"rag-demo-{RUN}"})
+        email, password = f"verify-{RUN}@example.com", f"verify-pw-{RUN}-xyz"
+        admin.post("/api/v1/admin/users", json={"email": email, "name": "Verify Owner", "password": password}).raise_for_status()
+        created = admin.post("/api/v1/admin/projects", json={"name": f"rag-demo-{RUN}", "owner_email": email})
         created.raise_for_status()
         api_key = created.json()["api_key"]
+        project_id = created.json()["project"]["id"]
+        login = httpx.post(f"{BASE}/api/v1/auth/login", json={"email": email, "password": password}, timeout=30)
+        login.raise_for_status()
+        owner = httpx.Client(
+            base_url=BASE,
+            headers={"Authorization": f"Bearer {login.json()['token']}", "X-Matrix-Project": project_id},
+            timeout=30,
+        )
         http = httpx.Client(base_url=BASE, headers={"Authorization": f"Bearer {api_key}"}, timeout=30)
 
-        def call(method: str, path: str, **kw: Any) -> Any:
-            r = http.request(method, path, **kw)
+        def call(method: str, path: str, *, as_owner: bool = False, **kw: Any) -> Any:
+            r = (owner if as_owner else http).request(method, path, **kw)
             if r.status_code >= 400:
                 raise RuntimeError(f"{method} {path} -> {r.status_code}: {r.text[:300]}")
             return r.json() if r.headers.get("content-type", "").startswith("application/json") else r.text
@@ -123,10 +136,10 @@ def main() -> int:
              {"score_name": "faithfulness", "op": "<", "value": 0.7}, ["annotate", "alert"]),
         ]
         for name, condition, actions in rules:
-            call("POST", "/api/v1/rules", json={"name": name, "condition": condition, "actions": actions})
-        call("POST", "/api/v1/online-evals",
+            call("POST", "/api/v1/rules", as_owner=True, json={"name": name, "condition": condition, "actions": actions})
+        call("POST", "/api/v1/online-evals", as_owner=True,
              json={"name": "faithfulness", "metric": "faithfulness", "sampling_rate": 1.0})
-        print("Regras e avaliação online criadas; rodando o demo...")
+        print("Regras e avaliação online criadas (sessão do owner); rodando o demo...")
 
         demo = subprocess.run(
             ["uv", "run", "--project", "sdk/python", "python", "examples/rag_demo.py"],
@@ -185,7 +198,7 @@ def main() -> int:
                 call("POST", f"/api/v1/datasets/{ds}/items/from-span", json={"trace_id": t["trace_id"]})
             got = call("GET", f"/api/v1/datasets/{ds}")
             c.expect(len(got["items"]) >= 4, f"dataset com >= 4 itens ({len(got['items'])})")
-            v1 = call("POST", "/api/v1/prompts", json={
+            v1 = call("POST", "/api/v1/prompts", as_owner=True, json={
                 "name": "rag/answer", "type": "text", "labels": ["production"],
                 "template": "Answer the support question briefly.\n\nQuestion: {{question}}",
                 "commit_message": "v1"})

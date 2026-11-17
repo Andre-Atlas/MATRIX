@@ -2,12 +2,10 @@
 
 Servidor da MATRIX (FastAPI + SQLAlchemy). Comandos: `matrix-api`, `matrix-worker`, `matrix-admin`.
 
-> **⚠️ A web ainda não tem login.** Ela usa uma única `MATRIX_API_KEY`, e quem alcança a porta da
-> web (3000) tem leitura e escrita completas no projeto dessa chave. O `deploy/compose.yaml` publica
-> as portas só em `127.0.0.1` por isso. Até o login do G0 entrar, acesse por túnel SSH ou por um
-> proxy reverso **com autenticação** e TLS; não exponha a web fora de rede privada. Passo a passo de
-> bootstrap (`matrix-admin create-project`, `MATRIX_API_KEY` da web) e a tabela completa das
-> variáveis `MATRIX_*`: [README da raiz, seção Execução](../README.md#execução).
+> A web tem login próprio e não guarda chave de API; o compose publica as portas só em `127.0.0.1`.
+> **Não validados nesta rodada:** o store S3 real e o `docker compose up` completo. Passo a passo de
+> bootstrap (`matrix-admin create-user`, `create-project --owner-email`, login pela web) e a tabela
+> completa das variáveis `MATRIX_*`: [README da raiz, seção Execução](../README.md#execução).
 
 ## Banco de dados
 

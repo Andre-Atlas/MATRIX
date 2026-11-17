@@ -95,10 +95,15 @@ describe("mock members, keys, egress, audit", () => {
   it("adds, updates and removes members with the contract's errors", async () => {
     const c = ctx((await login()).token);
     const base = `/api/v1/projects/${PROJECT_A}/members`;
-    const added = await mockSend<{ role: string }>("POST", base, { email: "dario@example.com", role: "member" }, c);
-    expect(added.role).toBe("member");
+    const added = await mockSend<{ status: string }>("POST", base, { email: "dario@example.com", role: "member" }, c);
+    expect(added).toEqual({ status: "pending_or_added" });
+    const listed = await mockGet<{ items: { user: { id: string }; role: string }[] }>(base, {}, c);
+    expect(listed.items.find((m) => m.user.id === "u_dario")?.role).toBe("member");
     expect(await status(mockSend("POST", base, { email: "dario@example.com", role: "member" }, c))).toBe(409);
-    expect(await status(mockSend("POST", base, { email: "ghost@example.com", role: "member" }, c))).toBe(404);
+    // Unknown e-mail: the same neutral answer, nothing added.
+    const before = listed.items.length;
+    expect(await mockSend("POST", base, { email: "ghost@example.com", role: "member" }, c)).toEqual({ status: "pending_or_added" });
+    expect((await mockGet<{ items: unknown[] }>(base, {}, c)).items).toHaveLength(before);
     await mockSend("PATCH", `${base}/u_dario`, { role: "viewer" }, c);
     expect(await mockSend("DELETE", `${base}/u_dario`, undefined, c)).toBe(NO_CONTENT);
     expect(await status(mockSend("DELETE", `${base}/u_dario`, undefined, c))).toBe(404);
