@@ -2,8 +2,15 @@
 presigned completion, GC, and `store_bytes` (store bytes and create a ready `Artifact` row).
 
 Quota: the bytes of the distinct blobs (`sha256`) a project's artifacts reference, pending uploads
-included (they reserve space). Concurrent uploads can overshoot the quota by at most what is in
-flight; the per-object limit always holds.
+included (they reserve space). The check and the row insert run under a per-project lock held until
+the caller commits (`lock_quota`), so concurrent uploads cannot overshoot the quota together.
+
+Blob lifetime: every path that decides a blob is (still) there and adds a row pointing at it, and
+every path that decides a blob is orphaned and deletes it, holds the per-(project, sha256) lock
+(`lock_blob`) until its transaction ends. An upload re-checks, under that lock, that the blob it
+wrote or deduplicated still exists; a DELETE decides `orphan` and removes the blob under it.
+Locks: `pg_advisory_xact_lock` on PostgreSQL; an in-process lock on SQLite (single process). Order:
+blob lock before quota lock.
 
 GC (`gc`): drops pending uploads older than `PENDING_TTL` (and their staged objects), purges stale
 temp/staged objects, then deletes every blob no artifact row of its project references and whose
@@ -17,13 +24,14 @@ from __future__ import annotations
 import hashlib
 import io
 import re
+import threading
 import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, BinaryIO
 
-from sqlalchemy import and_, delete, func, or_, select, text
+from sqlalchemy import and_, delete, event, func, or_, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from matrix_server.artifacts import CHUNK_SIZE, ArtifactStore, BlobNotFound, BlobTooLarge, UploadChanged
@@ -71,6 +79,62 @@ class HashMismatch(ArtifactError):
 
 class UploadMissing(ArtifactError):
     status_code = 409
+
+
+class BlobGone(ArtifactError):
+    """A concurrent DELETE removed the blob this upload wrote or deduplicated; the client retries."""
+
+    status_code = 409
+
+
+# --- transaction-scoped locks -------------------------------------------------------------------
+
+_BLOB_LOCK_NS = 0x6D78_626C  # "mxbl": pg_advisory_xact_lock(ns, hashtext(project_id || sha256))
+_QUOTA_LOCK_NS = 0x6D78_7174  # "mxqt": pg_advisory_xact_lock(ns, hashtext(project_id))
+_LOCAL_STRIPES = 64
+_LOCAL_LOCK_TIMEOUT = 60.0
+_local_locks = {
+    ns: [threading.Lock() for _ in range(_LOCAL_STRIPES)] for ns in (_BLOB_LOCK_NS, _QUOTA_LOCK_NS)
+}
+_HELD = "matrix_xact_locks"
+
+
+class LockTimeout(ArtifactError):
+    status_code = 503
+
+
+def _xact_lock(session: Session, ns: int, key: str) -> None:
+    """Lock `key` in namespace `ns` until the session's current transaction ends."""
+    session.connection()  # make sure the transaction the lock belongs to has begun
+    if session.get_bind().dialect.name == "postgresql":
+        session.execute(text("SELECT pg_advisory_xact_lock(:ns, hashtext(:k))"), {"ns": ns, "k": key})
+        return
+    lock = _local_locks[ns][int(hashlib.sha256(key.encode()).hexdigest()[:8], 16) % _LOCAL_STRIPES]
+    held: list[threading.Lock] = session.info.setdefault(_HELD, [])
+    if lock in held:  # this transaction already holds the stripe
+        return
+    if not lock.acquire(timeout=_LOCAL_LOCK_TIMEOUT):
+        raise LockTimeout("artifact store is busy; retry")
+    held.append(lock)
+
+
+@event.listens_for(Session, "after_transaction_end")
+def _release_local_locks(session: Session, transaction: Any) -> None:
+    if transaction.parent is not None:  # savepoint or subtransaction: the lock outlives it
+        return
+    for lock in session.info.pop(_HELD, []):
+        lock.release()
+
+
+def lock_blob(session: Session, project_id: str, sha256: str) -> None:
+    """Serialize, until the transaction ends, everything that adds or drops a reference to (or
+    deletes) the blob `sha256` of `project_id`."""
+    _xact_lock(session, _BLOB_LOCK_NS, f"{project_id}{sha256}")
+
+
+def lock_quota(session: Session, project_id: str) -> None:
+    """Serialize quota check + row insert of `project_id` until the transaction ends."""
+    _xact_lock(session, _QUOTA_LOCK_NS, project_id)
 
 
 @dataclass(frozen=True)
@@ -262,10 +326,15 @@ def store_stream(
             raise QuotaExceeded("project artifact quota exceeded") from exc
         raise TooLarge("artifact exceeds the size limit") from exc
     try:
+        lock_blob(session, project_id, info.sha256)
         if expected_sha256 is not None and info.sha256 != expected_sha256:
             raise HashMismatch("sha256 does not match the content")
+        # A DELETE that decided the blob was orphaned may have removed it after our put.
+        if not store.exists(project_id, info.sha256):
+            raise BlobGone("artifact content was removed concurrently; retry")
         # Always (also for a blob that already existed in the store: an orphan awaiting deletion,
         # or one only a pending reservation points at); `check_quota_for` handles real dedup.
+        lock_quota(session, project_id)
         check_quota_for(session, project_id, info.sha256, info.size, limits)
         artifact = Artifact(
             project_id=project_id,
@@ -357,6 +426,7 @@ def complete_upload(session: Session, store: ArtifactStore, artifact: Artifact, 
     if artifact.status == "ready":
         return artifact
     pid, sha, size = artifact.project_id, artifact.sha256, artifact.size
+    lock_blob(session, pid, sha)
     staged = store.stat_upload_info(pid, artifact.id)
     if staged is not None:
         detail = None
@@ -376,6 +446,7 @@ def complete_upload(session: Session, store: ArtifactStore, artifact: Artifact, 
             )
         if detail is None:
             try:
+                lock_quota(session, pid)
                 check_quota_for(session, pid, sha, staged.size, limits)
             except ArtifactError:
                 _discard(session, store, artifact, staged=True, blob=False)
@@ -407,6 +478,7 @@ def complete_upload(session: Session, store: ArtifactStore, artifact: Artifact, 
                 session.flush()
                 raise HashMismatch("stored object does not match the declared sha256")
         try:
+            lock_quota(session, pid)
             check_quota_for(session, pid, sha, existing, limits)
         except ArtifactError:
             _discard(session, store, artifact, staged=False, blob=True)
@@ -461,12 +533,17 @@ def gc(
         if ref.sha256 in referenced[ref.project_id] or (modified is not None and modified > now - grace):
             result.kept_blobs += 1
             continue
-        # Re-check just before deleting: a row may have been committed since the snapshot.
-        if blob_referenced(session, ref.project_id, ref.sha256):
-            result.kept_blobs += 1
-            continue
-        store.delete(ref.project_id, ref.sha256)
-        result.deleted_blobs += 1
+        # Re-check just before deleting, under the blob lock: a row may have been committed since
+        # the snapshot, and an upload deduplicating onto the blob waits for the lock.
+        lock_blob(session, ref.project_id, ref.sha256)
+        try:
+            if blob_referenced(session, ref.project_id, ref.sha256):
+                result.kept_blobs += 1
+                continue
+            store.delete(ref.project_id, ref.sha256)
+            result.deleted_blobs += 1
+        finally:
+            session.commit()  # releases the lock
     return result
 
 

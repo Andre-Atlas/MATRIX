@@ -62,9 +62,18 @@ def db_url(request, tmp_path):
     _drop(PG_URL)
 
 
-def _make(url, **settings):
+PROXY_PEER = ("172.18.0.5", 50000)  # e.g. the web container on the compose network
+PROXY_NET = "172.16.0.0/12"
+
+
+def _make(url, peer=None, **settings):
     app = create_app(Settings(database_url=url, admin_token="adm", **settings))
-    return app, TestClient(app)
+    return app, (TestClient(app, client=peer) if peer else TestClient(app))
+
+
+def _make_proxied(url, header, **settings):
+    """App behind a trusted reverse proxy: the peer is inside MATRIX_TRUSTED_PROXIES."""
+    return _make(url, peer=PROXY_PEER, trusted_proxy_header=header, trusted_proxies=PROXY_NET, **settings)
 
 
 @pytest.fixture
@@ -428,8 +437,31 @@ def test_lockout_retry_after_and_reset(env):
     assert "ana@example.com" not in dump and "ghost" not in dump
 
 
-def test_ip_limit_across_emails_and_trusted_proxy_header(db_url):
-    app, client = _make(db_url)
+@pytest.mark.parametrize("peer", [None, ("172.18.0.5", 50000), ("127.0.0.1", 50000), ("10.1.2.3", 50000)])
+def test_failures_without_a_real_client_ip_never_lock_everyone(db_url, peer):
+    """HIGH (review 7): behind the web container with MATRIX_WEB_TRUST_FORWARDED_FOR=0 every client
+    shares the container's address; 30 anonymous failures used to lock every user's login."""
+    app, client = _make(db_url, peer=peer)
+    try:
+        _create_user(client)
+        for i in range(users.IP_MAX_FAILURES + 5):
+            assert _login(client, email=f"spray{i}@example.com", password="bad password!").status_code == 401
+        assert _login(client, email="fresh@example.com", password="bad password!").status_code == 401
+        assert _login(client).status_code == 200  # another user is not locked out
+        with _factory(app)() as s:
+            ip = users.client_network(peer[0] if peer else "testclient")
+            assert s.get(LoginAttempt, users.ip_key(ip)) is None  # no shared IP key at all
+        # The pair and e-mail keys still apply.
+        for _ in range(users.PAIR_MAX_FAILURES):
+            assert _login(client, password="bad password!").status_code == 401
+        assert _login(client).status_code == 429
+    finally:
+        app.state.db_engine.dispose()
+
+
+def test_ip_limit_applies_to_a_real_client_ip(db_url):
+    # A direct connection from a public address: that address is the client's own.
+    app, client = _make(db_url, peer=("8.8.8.8", 50000))
     try:
         for i in range(users.IP_MAX_FAILURES):
             assert _login(client, email=f"spray{i}@example.com", password="bad password!").status_code == 401
@@ -440,15 +472,19 @@ def test_ip_limit_across_emails_and_trusted_proxy_header(db_url):
         assert resp.status_code == 429
     finally:
         app.state.db_engine.dispose()
-    app, client = _make(db_url, trusted_proxy_header="X-Forwarded-For")
+    # The address forwarded by a trusted proxy is real too: the IP lock holds per forwarded client.
+    app, client = _make_proxied(db_url, "X-Forwarded-For")
     try:
         _create_user(client, email="bia@example.com")
         proxied = {"X-Forwarded-For": "198.51.100.1, 203.0.113.7"}
-        for _ in range(users.PAIR_MAX_FAILURES):
-            assert _login(client, email="bia@example.com", password="bad password!", **proxied).status_code == 401
+        for i in range(users.IP_MAX_FAILURES):
+            assert _login(client, email=f"spray{i}@example.com", password="bad password!", **proxied).status_code == 401
         assert _login(client, email="bia@example.com", **proxied).status_code == 429
-        # Another real client behind the same proxy is not locked by the first one's pair.
+        # Another real client behind the same proxy is not locked by the first one.
         assert _login(client, email="bia@example.com", **{"X-Forwarded-For": "203.0.113.8"}).status_code == 200
+        for _ in range(users.PAIR_MAX_FAILURES):
+            assert _login(client, email="bia@example.com", password="bad password!", **{"X-Forwarded-For": "203.0.113.9"}).status_code == 401
+        assert _login(client, email="bia@example.com", **{"X-Forwarded-For": "203.0.113.9"}).status_code == 429
         with _factory(app)() as s:
             ips = set(s.scalars(select(WebSession.ip)))
         assert ips == {"203.0.113.8"}
@@ -456,8 +492,135 @@ def test_ip_limit_across_emails_and_trusted_proxy_header(db_url):
         app.state.db_engine.dispose()
 
 
+@pytest.mark.parametrize(
+    ("peer", "trusted", "expected"),
+    [
+        (("172.18.0.5", 50000), "", "172.18.0.5"),  # empty list: the header is never trusted
+        (("8.8.8.8", 50000), "10.0.0.0/8,192.168.0.0/16", "8.8.8.8"),  # peer outside the list
+        (("172.18.0.5", 50000), "10.0.0.0/8, 172.16.0.0/12", "203.0.113.7"),  # in the list: rightmost entry
+        (("10.0.0.9", 50000), "10.0.0.9", "203.0.113.7"),  # a single address
+        (None, "0.0.0.0/0", "testclient"),  # a peer that is not an address is never trusted
+    ],
+)
+def test_proxy_header_only_from_trusted_peers(db_url, peer, trusted, expected):
+    """MEDIUM (review 7): MATRIX_TRUSTED_PROXY_HEADER used to be accepted from any peer."""
+    app, client = _make(db_url, peer=peer, trusted_proxy_header="X-Forwarded-For", trusted_proxies=trusted)
+    try:
+        _create_user(client)
+        assert _login(client, **{"X-Forwarded-For": "198.51.100.1, 203.0.113.7"}).status_code == 200
+        with _factory(app)() as s:
+            assert set(s.scalars(select(WebSession.ip))) == {expected}
+    finally:
+        app.state.db_engine.dispose()
+
+
+def test_forged_header_from_an_untrusted_public_peer_does_not_dodge_the_ip_lock(db_url):
+    app, client = _make(db_url, peer=("8.8.8.8", 50000), trusted_proxy_header="X-Real-IP",
+                        trusted_proxies="172.16.0.0/12")
+    try:
+        for i in range(users.IP_MAX_FAILURES):
+            h = {"X-Real-IP": f"198.51.100.{i + 1}"}
+            assert _login(client, email=f"spray{i}@example.com", password="bad password!", **h).status_code == 401
+        assert _login(client, email="x@example.com", password="bad password!", **{"X-Real-IP": "1.1.1.1"}).status_code == 429
+    finally:
+        app.state.db_engine.dispose()
+
+
+def test_correct_login_that_reaches_the_ip_limit_does_not_lock_the_ip(db_url):
+    """LOW (review 7): a correct login counted as the 30th attempt used to leave the IP locked."""
+    app, client = _make(db_url, peer=("8.8.8.8", 50000))
+    try:
+        _create_user(client)
+        for i in range(users.IP_MAX_FAILURES - 1):
+            assert _login(client, email=f"spray{i}@example.com", password="bad password!").status_code == 401
+        assert _login(client).status_code == 200  # the 30th counted attempt, and it is right
+        with _factory(app)() as s:
+            row = s.get(LoginAttempt, users.ip_key("8.8.8.8"))
+            assert row.locked_until is None and row.lock_count == 0 and row.count == users.IP_MAX_FAILURES - 1
+        # Not locked; the next failure is the 30th and locks it as before.
+        assert _login(client, email="other@example.com", password="bad password!").status_code == 401
+        assert _login(client, email="other2@example.com", password="bad password!").status_code == 429
+    finally:
+        app.state.db_engine.dispose()
+
+
+def test_reserve_survives_a_purge_between_insert_and_select(env, monkeypatch):
+    """LOW (review 7): a concurrent purge deleting the throttle row made the login answer 500."""
+    from sqlalchemy import delete
+    from sqlalchemy.orm import Session
+
+    app, _ = env
+    real_get = Session.get
+    purged = []
+
+    def racing_get(self, entity, ident, **kw):
+        if entity is LoginAttempt and kw.get("with_for_update") and not purged:
+            purged.append(ident)  # the purge wins the race once
+            self.execute(delete(LoginAttempt).where(LoginAttempt.key == ident))
+        return real_get(self, entity, ident, **kw)
+
+    monkeypatch.setattr(Session, "get", racing_get)
+    with _factory(app)() as s:
+        assert users.reserve_login_attempt(s, "a@b.com", "8.8.8.8") is None
+        s.commit()
+        assert purged and s.get(LoginAttempt, purged[0]).count == 1
+
+
+@pytest.fixture
+def pg_url():
+    if not PG_URL:
+        pytest.skip("MATRIX_TEST_DATABASE_URL not set")
+    _drop(PG_URL)
+    yield PG_URL
+    _drop(PG_URL)
+
+
+def test_purge_vs_reserve(pg_url):
+    """The same race for real on PostgreSQL (row locks): the purge deletes the row the reservation
+    inserted (a no-op on conflict) before its SELECT ... FOR UPDATE."""
+    db_url = pg_url
+    import threading
+    import time
+
+    from matrix_server.storage.db import init_db, make_session_factory
+
+    eng = make_engine(db_url)
+    init_db(eng)
+    factory = make_session_factory(eng)
+    email, ip = "a@b.com", "10.0.0.1"
+    key = users.attempt_key(email, ip)
+    with factory() as s, s.begin():
+        s.add(LoginAttempt(key=key, window_start=utcnow() - timedelta(hours=1), count=1, lock_count=0))
+    purger = factory()
+    stale = purger.scalars(
+        select(LoginAttempt.key)
+        .where(LoginAttempt.window_start < utcnow() - users.FAILURE_WINDOW)
+        .with_for_update(skip_locked=True)
+    ).all()
+    assert key in stale
+    res = {}
+
+    def reserve():
+        with factory() as r:
+            try:
+                res["v"] = users.reserve_login_attempt(r, email, ip)
+                r.commit()
+            except BaseException as e:  # noqa: BLE001
+                res["e"] = repr(e)
+
+    t = threading.Thread(target=reserve)
+    t.start()
+    time.sleep(1.0)  # the reservation's insert is a no-op and its select waits on our row lock
+    purger.execute(text("DELETE FROM login_attempts WHERE key = ANY(:k)"), {"k": list(stale)})
+    purger.commit()
+    purger.close()
+    t.join(30)
+    eng.dispose()
+    assert res == {"v": None}
+
+
 def test_email_limit_across_ips(db_url):
-    app, client = _make(db_url, trusted_proxy_header="X-Real-IP")
+    app, client = _make_proxied(db_url, "X-Real-IP")
     try:
         _create_user(client)
         for i in range(users.EMAIL_MAX_FAILURES):
@@ -469,7 +632,7 @@ def test_email_limit_across_ips(db_url):
 
 def test_email_lock_never_locks_the_owner_out_of_a_known_network(db_url):
     """MEDIUM (review 5): the e-mail-only lock let anyone lock any account without credentials."""
-    app, client = _make(db_url, trusted_proxy_header="X-Real-IP")
+    app, client = _make_proxied(db_url, "X-Real-IP")
     try:
         _create_user(client)
         home = {"X-Real-IP": "198.51.100.10"}
@@ -486,7 +649,7 @@ def test_email_lock_never_locks_the_owner_out_of_a_known_network(db_url):
 
 
 def test_ipv6_throttled_per_64(db_url):
-    app, client = _make(db_url, trusted_proxy_header="X-Real-IP")
+    app, client = _make_proxied(db_url, "X-Real-IP")
     try:
         _create_user(client)
         for i in range(users.PAIR_MAX_FAILURES):  # rotating addresses inside one /64
@@ -515,7 +678,7 @@ def test_stale_login_rows_are_purged(env):
         keys = set(s.scalars(select(LoginAttempt.key)))
         known = set(s.scalars(select(LoginKnownIp.key)))
     assert not any(k == f"{i:064x}" for i in range(50) for k in keys)
-    assert "f" * 64 in keys and len(keys) == 4  # + the 3 keys of the failed attempt
+    assert "f" * 64 in keys and len(keys) == 3  # + the pair and e-mail keys of the failed attempt
     assert known == {"d" * 64}
 
 
@@ -846,6 +1009,34 @@ def test_member_removal_revokes_only_the_removed_admins_keys(env):
         revoke = s.scalars(select(AuditLog).where(AuditLog.action == "key.revoke")).one()
     assert revoke.target == created.json()["id"] and revoke.actor_id == remover_id
     assert revoke.detail["reason"] == "member.remove"
+
+
+@pytest.mark.parametrize("then_remove", [False, True])
+def test_demoting_an_admin_revokes_their_keys(env, then_remove):
+    """MEDIUM (review 7): demote-then-remove used to keep the keys the admin created."""
+    app, client = env
+    factory = _factory(app)
+    pa, _ = _project(client, "a")
+    dave = make_user(factory, "dave@example.com")
+    add_membership(factory, dave, pa, "admin")
+    token = session_token(factory, dave)
+    created = client.post(
+        f"/api/v1/projects/{pa}/keys", json={"name": "ci", "scopes": ["read", "write"]}, headers=_bearer(token, pa)
+    )
+    assert created.status_code == 201
+    dave_key = {"Authorization": f"Bearer {created.json()['api_key']}"}
+    owner = make_user(factory)
+    add_membership(factory, owner, pa, "owner")
+    oh = session_headers(factory, owner, pa)
+    assert client.patch(f"/api/v1/projects/{pa}/members/{dave}", json={"role": "admin"}, headers=oh).status_code == 200
+    assert client.get("/api/v1/traces", headers=dave_key).status_code == 200  # still admin: key kept
+    assert client.patch(f"/api/v1/projects/{pa}/members/{dave}", json={"role": "viewer"}, headers=oh).status_code == 200
+    if then_remove:
+        assert client.delete(f"/api/v1/projects/{pa}/members/{dave}", headers=oh).status_code == 204
+    assert client.get("/api/v1/traces", headers=dave_key).status_code == 401
+    with factory() as s:
+        revokes = s.scalars(select(AuditLog).where(AuditLog.action == "key.revoke")).all()
+    assert [(r.target, r.detail["reason"]) for r in revokes] == [(created.json()["id"], "member.demote")]
 
 
 # --- keys --------------------------------------------------------------------------------------------------------------

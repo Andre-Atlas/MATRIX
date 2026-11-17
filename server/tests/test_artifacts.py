@@ -1033,3 +1033,124 @@ def test_s11_local_put_refuses_a_file_changed_before_rename(tmp_path, monkeypatc
     with pytest.raises(ArtifactStoreError):
         store.put("p1", io.BytesIO(data), max_bytes=10_000)
     assert [b.sha256 for b in store.iter_blobs()] == []
+
+
+# --- review 7: delete vs dedup upload, quota races ------------------------------------------------
+
+
+def _local_env(db_url, tmp_path, **kw) -> Env:
+    return Env(Settings(database_url=db_url, artifact_backend="local", artifact_local_dir=str(tmp_path / "b"), **kw))
+
+
+def test_delete_never_leaves_a_dedup_upload_ready_without_content(db_url, tmp_path):
+    """MEDIUM (review 7): a DELETE deciding the blob was orphaned removed it after a concurrent
+    upload of the same content had deduplicated onto it and committed its row (ready, no content)."""
+    env = _local_env(db_url, tmp_path)
+    try:
+        data = os.urandom(5000)
+        first = env.upload(data).json()
+        real_delete = env.store.delete
+        out: dict = {}
+
+        def racing_delete(pid, digest):
+            # The same content is uploaded again right before the blob goes. Without the blob lock
+            # it completes (deduplicated, 201) inside this window; with it, it waits for our commit.
+            t = threading.Thread(target=lambda: out.setdefault("up", env.upload(data)))
+            t.start()
+            t.join(1.5)
+            out["thread"] = t
+            return real_delete(pid, digest)
+
+        env.store.delete = racing_delete
+        assert env.client.delete(f"/api/v1/artifacts/{first['id']}", headers=env.h1).status_code == 204
+        env.store.delete = real_delete
+        out["thread"].join(30)
+        up = out["up"]
+        assert up.status_code in (201, 409), up.text
+        with env.factory() as s:
+            ready = s.scalars(select(Artifact).where(Artifact.status == "ready")).all()
+        for art in ready:  # the invariant: a ready artifact always has its content
+            assert env.store.exists(art.project_id, art.sha256), "ready artifact without content"
+        if up.status_code == 201:
+            assert env.fetch(up.json()["id"]).content == data
+        else:
+            assert ready == [] and "retry" in up.json()["detail"]
+            assert env.upload(data).status_code == 201  # the retry works
+    finally:
+        env.close()
+
+
+def _slow_quota_check(monkeypatch, *modules):
+    orig = svc.check_quota_for
+
+    def slow(*a, **k):
+        result = orig(*a, **k)
+        import time
+
+        time.sleep(0.3)  # widen the window between the check and the insert/commit
+        return result
+
+    for mod in modules:
+        monkeypatch.setattr(mod, "check_quota_for", slow)
+
+
+def test_parallel_direct_uploads_never_exceed_the_quota(db_url, tmp_path, monkeypatch):
+    """MEDIUM (review 7): check_quota_for -> insert -> commit ran without a lock."""
+    quota = 1_000_000
+    env = _local_env(db_url, tmp_path, project_quota_bytes=quota, max_artifact_bytes=quota)
+    _slow_quota_check(monkeypatch, svc)
+    barrier = threading.Barrier(5)
+    codes: list[int] = []
+    limits = svc.Limits(project_quota_bytes=quota, max_artifact_bytes=quota)
+
+    def upload():
+        data = os.urandom(900_000)
+        with env.factory() as s:
+            barrier.wait()
+            try:
+                svc.store_stream(s, env.store, (env.p1.id, None), "x", io.BytesIO(data), limits=limits)
+                s.commit()
+                codes.append(201)
+            except svc.QuotaExceeded:
+                s.rollback()
+                codes.append(413)
+
+    try:
+        threads = [threading.Thread(target=upload) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+        with env.factory() as s:
+            used = svc.project_usage(s, env.p1.id)
+        assert sorted(codes) == [201, 413, 413, 413, 413]
+        assert used <= quota
+        assert len(env.blobs(env.p1.id)) == 1  # the refused uploads' blobs are removed
+    finally:
+        env.close()
+
+
+def test_parallel_reservations_never_exceed_the_quota(db_url, tmp_path, monkeypatch):
+    quota = 1_000_000
+    env = _local_env(db_url, tmp_path, project_quota_bytes=quota, max_artifact_bytes=quota)
+    _slow_quota_check(monkeypatch, artifacts_api)
+    barrier = threading.Barrier(5)
+    codes: list[int] = []
+
+    def reserve():
+        barrier.wait()
+        body = {"filename": "r.bin", "size": 900_000, "sha256": os.urandom(32).hex()}
+        codes.append(env.client.post("/api/v1/artifacts/uploads", json=body, headers=env.h1).status_code)
+
+    try:
+        threads = [threading.Thread(target=reserve) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+        with env.factory() as s:
+            used = svc.project_usage(s, env.p1.id)
+        assert sorted(codes) == [201, 413, 413, 413, 413]
+        assert used <= quota
+    finally:
+        env.close()

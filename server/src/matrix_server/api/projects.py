@@ -1,10 +1,10 @@
 """Projects, members, API keys and audit log of a project (contract G0 section 1).
 
 Role rules for members: admins manage viewers and members; only an owner grants, changes or removes
-the admin and owner roles; the last owner can be neither demoted nor removed. Removing an admin or
-owner also revokes the API keys they created in the project (`key.revoke` audited; behaviour change
-of review 5: those keys used to survive the removal). Adding a member answers `202
-{"status": "pending_or_added"}` whether or not the e-mail belongs to a user, so the route cannot be
+the admin and owner roles; the last owner can be neither demoted nor removed. Removing a member (any
+role) or demoting one below admin revokes the API keys they created in the project (`key.revoke`
+audited, reason `member.remove`/`member.demote`; reviews 5 and 7: demote-then-remove used to keep
+them). Adding a member answers `202 {"status": "pending_or_added"}` whether or not the e-mail belongs to a user, so the route cannot be
 used to enumerate accounts; an unknown e-mail adds nothing (no invitations yet: create the user,
 then add them again). Egress hosts live in `api/egress.py`.
 """
@@ -210,6 +210,9 @@ def update_member(
     previous = membership.role
     membership.role = body.role
     db.flush()
+    if new < Role.ADMIN:
+        # Below admin the user can no longer manage keys: the keys they created here stop working.
+        _revoke_keys_created_by(db, principal, user_id, "member.demote", request)
     audit.record(
         db, action="member.update", project_id=principal.project_id, target=user_id,
         detail={"from": previous, "to": body.role, **request_detail(request)}, **_actor(principal),
@@ -217,6 +220,23 @@ def update_member(
     user = db.get(User, user_id)
     assert user is not None
     return _member_out(user, membership)
+
+
+def _revoke_keys_created_by(db: Session, principal: Any, user_id: str, reason: str, request: Request) -> None:
+    """Revoke the live API keys `user_id` created in the principal's project (`key.revoke` audited)."""
+    now = utcnow()
+    keys = db.scalars(
+        select(ApiKey).where(
+            ApiKey.project_id == principal.project_id, ApiKey.created_by == user_id, ApiKey.revoked_at.is_(None)
+        )
+    ).all()
+    for key in keys:
+        key.revoked_at = now
+        audit.record(
+            db, action="key.revoke", project_id=principal.project_id, target=key.id,
+            detail={"prefix": key.prefix, "reason": reason, **request_detail(request)},
+            **_actor(principal),
+        )
 
 
 @router.delete("/{project_id}/members/{user_id}", status_code=204)
@@ -231,24 +251,10 @@ def remove_member(project_id: str, user_id: str, request: Request, db: DbSession
         db, action="member.remove", project_id=principal.project_id, target=user_id,
         detail={"role": membership.role, **request_detail(request)}, **_actor(principal),
     )
-    # The user's sessions stay (they may belong to other projects). An admin/owner may have created
-    # API keys here (only admins can): those are revoked with the membership, so a removed admin
-    # keeps no access through them. Keys of removed viewers/members cannot exist (they cannot create
-    # keys) and keys created by others are untouched.
-    if current >= Role.ADMIN:
-        now = utcnow()
-        keys = db.scalars(
-            select(ApiKey).where(
-                ApiKey.project_id == principal.project_id, ApiKey.created_by == user_id, ApiKey.revoked_at.is_(None)
-            )
-        ).all()
-        for key in keys:
-            key.revoked_at = now
-            audit.record(
-                db, action="key.revoke", project_id=principal.project_id, target=key.id,
-                detail={"prefix": key.prefix, "reason": "member.remove", **request_detail(request)},
-                **_actor(principal),
-            )
+    # The user's sessions stay (they may belong to other projects). Keys this user created here are
+    # revoked on EVERY removal, whatever the current role (an admin demoted first and removed later
+    # must not keep them; see also update_member).
+    _revoke_keys_created_by(db, principal, user_id, "member.remove", request)
     return Response(status_code=204)
 
 

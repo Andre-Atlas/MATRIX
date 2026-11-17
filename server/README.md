@@ -7,6 +7,17 @@ Servidor da MATRIX (FastAPI + SQLAlchemy). Comandos: `matrix-api`, `matrix-worke
 > bootstrap (`matrix-admin create-user`, `create-project --owner-email`, login pela web) e a tabela
 > completa das variáveis `MATRIX_*`: [README da raiz, seção Execução](../README.md#execução).
 
+## IP do cliente e trava de login
+
+- `MATRIX_TRUSTED_PROXY_HEADER` (ex. `X-Real-IP`) só é lido quando o peer da conexão está em
+  `MATRIX_TRUSTED_PROXIES` (CIDRs separados por vírgula; vazio, o padrão, = nunca). No compose, a web
+  chama a API pela rede interna: liste-a, por exemplo `172.16.0.0/12,10.0.0.0/8,192.168.0.0/16`
+  (exemplo; restrinja à sua rede).
+- A trava por IP (30 falhas) só vale com o IP real do cliente: cabeçalho aceito de um proxy
+  confiável, ou conexão direta de um endereço público. Se a API só vê o proxy (peer loopback,
+  privado ou da lista, sem cabeçalho aceito), valem só as travas por e-mail+IP e por e-mail; assim 30
+  falhas anônimas não travam o login de todos.
+
 ## Banco de dados
 
 - Os metadados (projetos, chaves, prompts, datasets, experimentos, anotações, regras, alertas e a

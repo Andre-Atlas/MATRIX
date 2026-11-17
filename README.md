@@ -89,7 +89,8 @@ G0/G1 em andamento.
 | `MATRIX_MAX_POINTS_PER_RUN`, `MATRIX_MAX_POINTS_PER_KEY` | `50000000`, `10000000` | Pontos de métrica aceitos por run e por chave (*ciclo 2*) |
 | `MATRIX_SESSION_IDLE_TTL_SECONDS`, `MATRIX_SESSION_ABSOLUTE_TTL_SECONDS` | 7 dias, 30 dias | Validade das sessões web (*ciclo 2*) |
 | `MATRIX_ALLOW_PROJECT_CREATION` | `true` | Qualquer usuário logado pode criar projeto (*ciclo 2*) |
-| `MATRIX_TRUSTED_PROXY_HEADER` | — | Cabeçalho com o IP real, sobrescrito por um proxy confiável. Server e web devem usar o mesmo valor (no compose, a mesma variável vai aos dois) |
+| `MATRIX_TRUSTED_PROXY_HEADER` | — | Cabeçalho com o IP real, sobrescrito por um proxy confiável (entrada mais à direita). Só vale para conexões vindas de `MATRIX_TRUSTED_PROXIES`. Server e web devem usar o mesmo valor (no compose, a mesma variável vai aos dois) |
+| `MATRIX_TRUSTED_PROXIES` | — (nunca confia no cabeçalho) | CIDRs/endereços, separados por vírgula, dos proxies cujo `MATRIX_TRUSTED_PROXY_HEADER` é aceito; de qualquer outro peer o cabeçalho é ignorado. No compose, liste a rede interna de onde a web chama a API, por exemplo `172.16.0.0/12,10.0.0.0/8,192.168.0.0/16` (exemplo: restrinja à sua rede). A trava de login por IP só vale com IP real do cliente (cabeçalho aceito ou conexão direta de endereço público); quando a API só vê o IP do proxy (loopback, privado ou da lista), ficam as travas por e-mail+IP e por e-mail |
 | `MATRIX_MAX_RUNS_PER_PROJECT`, `MATRIX_MAX_ACTIVE_RUNS_PER_PROJECT` | `100000`, `1000` | Runs por projeto (409 acima) e runs `running` por projeto (429 acima) |
 | `MATRIX_PASSWORD_HASH_CONCURRENCY` | `4` | Operações argon2 simultâneas por processo (*ciclo 2*) |
 | `MATRIX_ARTIFACT_BACKEND` | `local` | `local` (validado) ou `s3` (**não validado** nesta rodada) |

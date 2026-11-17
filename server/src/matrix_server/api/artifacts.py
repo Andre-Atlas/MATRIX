@@ -49,6 +49,8 @@ from matrix_server.artifacts.service import (
     complete_upload,
     created_by_of,
     is_inline_type,
+    lock_blob,
+    lock_quota,
     normalize_filename,
     normalize_media_type,
     normalize_owner,
@@ -230,6 +232,7 @@ def create_upload(body: UploadCreate, request: Request, principal: Member, db: D
         name = normalize_filename(body.filename)
         media_type = normalize_media_type(body.media_type)
         owner_kind, owner_id = normalize_owner(body.owner_kind, body.owner_id)
+        lock_quota(db, principal.project_id)  # held until get_db commits the reservation
         check_quota_for(db, principal.project_id, sha, body.size, limits)
     except ArtifactError as exc:
         raise _http(exc) from None
@@ -283,6 +286,7 @@ def _put_content(app: Any, principal: Principal, artifact_id: str, reader: _Body
             info = store.put(pid, reader, max_bytes=size)
         except BlobTooLarge:
             raise HTTPException(status_code=422, detail="content exceeds the declared size") from None
+        lock_blob(session, pid, info.sha256)
 
         def drop_new_blob() -> None:
             if info.created:
@@ -298,6 +302,7 @@ def _put_content(app: Any, principal: Principal, artifact_id: str, reader: _Body
             drop_new_blob()
             raise HTTPException(status_code=422, detail="content does not match the declared size or sha256")
         try:  # again with the size actually received (the reservation may predate other uploads)
+            lock_quota(session, pid)
             check_quota_for(session, pid, info.sha256, info.size, _limits(app))
         except ArtifactError as exc:
             drop_new_blob()
@@ -429,9 +434,13 @@ def download(artifact_id: str, request: Request, principal: Viewer, db: DbSessio
 def delete_artifact(artifact_id: str, request: Request, principal: Member, db: DbSession) -> Response:
     """Delete the row and, when no other artifact of the project references the same content, the
     blob too (right away, so the quota freed by the delete is also freed on disk; the periodic
-    `artifacts.gc` job only catches what a crash or a race left behind)."""
+    `artifacts.gc` job only catches what a crash or a race left behind). The orphan decision and the
+    blob removal run under the (project, sha256) lock, before the commit: an upload deduplicating
+    onto the same content either commits its row first (the blob is kept) or waits and then finds
+    the blob gone (409, retry) — it never ends `ready` without content."""
     artifact = _load(db, principal, artifact_id)
     pid, sha, pending = artifact.project_id, artifact.sha256, artifact.status == "pending"
+    lock_blob(db, pid, sha)
     audit.record(
         db,
         action="artifact.delete",
@@ -443,14 +452,16 @@ def delete_artifact(artifact_id: str, request: Request, principal: Member, db: D
     )
     db.delete(artifact)
     db.flush()
-    orphan = not blob_referenced(db, pid, sha)
-    db.commit()
     store = get_store(request.app)
-    try:
-        if pending:
-            store.delete_upload(pid, artifact_id)
-        if orphan:
+    if not blob_referenced(db, pid, sha):
+        try:
             store.delete(pid, sha)
-    except Exception:  # noqa: BLE001 - the row is gone; the GC removes what is left
-        log.warning("artifact %s: blob delete failed; left to the GC", artifact_id)
+        except Exception:  # noqa: BLE001 - the row goes anyway; the GC removes what is left
+            log.warning("artifact %s: blob delete failed; left to the GC", artifact_id)
+    db.commit()
+    if pending:
+        try:
+            store.delete_upload(pid, artifact_id)
+        except Exception:  # noqa: BLE001
+            log.warning("artifact %s: staged upload delete failed; left to the GC", artifact_id)
     return Response(status_code=204)

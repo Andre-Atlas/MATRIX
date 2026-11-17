@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from matrix_server import audit, users
 from matrix_server.auth import (
     UserContext,
+    client_address,
     client_ip,
     require_user,
     session_absolute_ttl,
@@ -99,10 +100,12 @@ def _too_many(retry_after: int) -> HTTPException:
 def login(request: Request, db: DbSession, payload: Annotated[Any, Body()] = None) -> dict[str, Any]:
     body: LoginIn = parse_body(LoginIn, payload)
     email = users.normalize_email(body.email)
-    ip = client_ip(request)
+    ip, ip_lock = client_address(request)
+    undo: users.Undo = {}
     # Count the attempt before verifying (rows locked, committed before argon2): a parallel burst
-    # runs at most PAIR_MAX_FAILURES verifications. Locks refuse without verifying.
-    retry_after = users.reserve_login_attempt(db, email, ip)
+    # runs at most PAIR_MAX_FAILURES verifications. Locks refuse without verifying. The per-IP key
+    # only applies to a real client address (not the address of a proxy shared by every client).
+    retry_after = users.reserve_login_attempt(db, email, ip, ip_lock=ip_lock, undo=undo)
     db.commit()
     if retry_after is not None:
         raise _too_many(retry_after)
@@ -113,12 +116,12 @@ def login(request: Request, db: DbSession, payload: Annotated[Any, Body()] = Non
     try:
         ok = users.verify_password(user.password_hash if user else None, body.password)
     except users.PasswordHasherBusy:
-        users.release_login_attempt(db, email, ip)
+        users.release_login_attempt(db, email, ip, ip_lock=ip_lock, undo=undo)
         db.commit()
         raise hasher_busy() from None
     ok = ok and len(body.password) <= users.PASSWORD_MAX_CHARS
     if not ok or user is None:
-        locked = users.locked_for_any(db, users.throttle_keys(email, ip)) is not None
+        locked = users.locked_for_any(db, users.throttle_keys(email, ip, ip_lock)) is not None
         audit.record(
             db,
             action="auth.login_failed",
@@ -137,7 +140,7 @@ def login(request: Request, db: DbSession, payload: Annotated[Any, Body()] = Non
         logger.info("login failed for %s from %s", users.mask_email(email), ip)
         raise HTTPException(status_code=401, detail=LOGIN_FAILED, headers={"WWW-Authenticate": "Bearer"})
 
-    users.login_succeeded(db, email, ip)
+    users.login_succeeded(db, email, ip, ip_lock=ip_lock, undo=undo)
     try:
         users.rehash_if_needed(user, body.password)
     except users.PasswordHasherBusy:
@@ -189,16 +192,17 @@ def change_password(
     user = db.get(User, ctx.user.id)
     if user is None:
         raise HTTPException(status_code=401, detail="invalid or missing credentials")
-    ip = client_ip(request)
+    ip, ip_lock = client_address(request)
+    undo: users.Undo = {}
     email = user.email
-    retry_after = users.reserve_login_attempt(db, email, ip)
+    retry_after = users.reserve_login_attempt(db, email, ip, ip_lock=ip_lock, undo=undo)
     db.commit()
     if retry_after is not None:
         raise _too_many(retry_after)
     try:
         current_ok = users.verify_password(user.password_hash, body.current_password)
     except users.PasswordHasherBusy:
-        users.release_login_attempt(db, email, ip)
+        users.release_login_attempt(db, email, ip, ip_lock=ip_lock, undo=undo)
         db.commit()
         raise hasher_busy() from None
     if not current_ok:
@@ -208,7 +212,7 @@ def change_password(
         )
         db.commit()
         raise HTTPException(status_code=403, detail="current password is incorrect")
-    users.login_succeeded(db, email, ip)  # the current password was right: take the count back
+    users.login_succeeded(db, email, ip, ip_lock=ip_lock, undo=undo)  # the current password was right: take the count back
     db.commit()
     try:
         users.set_password(db, user, body.new_password)

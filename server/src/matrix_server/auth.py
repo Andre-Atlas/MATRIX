@@ -32,13 +32,14 @@ from __future__ import annotations
 import hashlib
 import hmac
 import ipaddress
+import logging
 import secrets
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import IntEnum
 from functools import cache
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import Depends, HTTPException, Request
 from sqlalchemy import and_, select
@@ -47,6 +48,8 @@ from sqlalchemy.orm import Session
 from matrix_server import users
 from matrix_server.storage.db import as_utc, utcnow
 from matrix_server.storage.models import API_KEY_SCOPES, ApiKey, Membership, Project, User, WebSession
+
+logger = logging.getLogger(__name__)
 
 KEY_SCHEME = "mx"
 PREFIX_BYTES = 4  # 8 hex chars
@@ -329,22 +332,79 @@ def _credential(request: Request) -> tuple[Literal["api_key", "session"], str] |
     return None
 
 
-def client_ip(request: Request) -> str | None:
-    """Client address for throttling and audit: the socket peer, or the value of
-    `settings.trusted_proxy_header` when configured (rightmost entry of a comma-separated list,
-    i.e. the address the trusted proxy saw). An absent or invalid header falls back to the peer."""
+def _trusted_networks(settings: Any) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    raw = getattr(settings, "trusted_proxies", None) or ""
+    cached = _TRUSTED_CACHE.get(raw)
+    if cached is not None:
+        return cached
+    nets = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(part, strict=False))
+        except ValueError:
+            logger.warning("ignoring invalid MATRIX_TRUSTED_PROXIES entry %r", part[:64])
+    _TRUSTED_CACHE[raw] = result = tuple(nets)
+    return result
+
+
+_TRUSTED_CACHE: dict[str, tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]] = {}
+
+
+def _parse_ip(value: str | None) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    if not value:
+        return None
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        return addr.ipv4_mapped
+    return addr
+
+
+def _in_networks(addr: Any, nets: tuple[Any, ...]) -> bool:
+    return any(addr.version == net.version and addr in net for net in nets)
+
+
+def client_address(request: Request) -> tuple[str | None, bool]:
+    """(client address, whether it is the client's real address).
+
+    The address is the value of `settings.trusted_proxy_header` (rightmost entry of a comma-separated
+    list, i.e. the address the trusted proxy saw) when the socket peer is inside
+    `settings.trusted_proxies`, and the socket peer otherwise (an absent or invalid header falls back
+    to the peer; the header of an untrusted peer is ignored). It is "real" when it came from that
+    trusted header, or when it is a direct peer that is a public address (not private, loopback,
+    link-local or in `trusted_proxies`). A private/loopback peer is usually a proxy in front of the
+    API (e.g. the web container), whose address is shared by all its clients."""
     peer = request.client.host if request.client else None
     settings = getattr(request.app.state, "settings", None)
+    nets = _trusted_networks(settings)
+    peer_addr = _parse_ip(peer)
     header = getattr(settings, "trusted_proxy_header", None)
-    if header:
+    if header and peer_addr is not None and _in_networks(peer_addr, nets):
         raw = request.headers.get(header)
         if raw:
-            candidate = raw.split(",")[-1].strip()
-            try:
-                return str(ipaddress.ip_address(candidate))
-            except ValueError:
-                pass
-    return peer
+            candidate = _parse_ip(raw.split(",")[-1].strip())
+            if candidate is not None:
+                return str(candidate), True
+    if peer_addr is None:
+        return peer, False
+    real = not (
+        peer_addr.is_private
+        or peer_addr.is_loopback
+        or peer_addr.is_link_local
+        or peer_addr.is_unspecified
+        or _in_networks(peer_addr, nets)
+    )
+    return peer, real
+
+
+def client_ip(request: Request) -> str | None:
+    """Client address for throttling and audit (see `client_address`)."""
+    return client_address(request)[0]
 
 
 def _settings_ttls(request: Request) -> tuple[timedelta, timedelta]:

@@ -37,7 +37,13 @@ class Settings(BaseSettings):
     # Header carrying the real client IP, set (overwritten) by a trusted reverse proxy such as the
     # Next.js server, e.g. "X-Forwarded-For" or "X-Real-IP". Off by default: the socket peer is used.
     # With a comma-separated list the rightmost entry (the one the trusted proxy saw) is taken.
+    # Honoured ONLY when the socket peer is inside `trusted_proxies`.
     trusted_proxy_header: str | None = None
+    # Comma-separated CIDRs (or addresses) of the reverse proxies allowed to set
+    # `trusted_proxy_header`, e.g. "172.16.0.0/12,10.0.0.0/8,192.168.0.0/16" for a compose network.
+    # Empty (default): the header is never trusted. Peers in this list (and private/loopback peers)
+    # are never treated as the client's real IP for the per-IP login lock.
+    trusted_proxies: str = ""
     # Concurrent argon2 operations per process (each needs 64 MiB); excess waits, then 503.
     password_hash_concurrency: int = 4
 

@@ -15,7 +15,11 @@
   verifications than the limit; a success takes the count back, clears the pair and e-mail keys
   (never the IP key: an attacker could reset it with their own account) and remembers the network.
   The e-mail lock does not apply to a remembered network, so nobody can lock an owner out of the
-  networks they use. Keys are hashes, so a locked unknown e-mail behaves exactly like a known one.
+  networks they use. The IP key only exists when the caller knows the client's real address
+  (`ip_lock`, see `auth.client_address`): behind a proxy that does not forward it (e.g. the web
+  container with `MATRIX_WEB_TRUST_FORWARDED_FOR=0`) every client shares the proxy's address, and an
+  IP lock there would let 30 anonymous failures lock everybody out; only the pair and e-mail keys
+  apply then. A correct login that was itself the attempt that reached a lock takes that lock back. Keys are hashes, so a locked unknown e-mail behaves exactly like a known one.
   Stale rows are purged a batch at a time on failed logins (`purge_stale_login_rows`).
 - Cost bound: at most `hash_concurrency` argon2 operations run at once in the process (each uses
   64 MiB); a caller that waits longer than `HASH_WAIT_SECONDS` gets `PasswordHasherBusy` (503).
@@ -321,13 +325,14 @@ def known_ip_key(email: str, ip: str | None) -> str:
     return _throttle_hash("known", normalize_email(email), client_network(ip))
 
 
-def throttle_keys(email: str, ip: str | None) -> list[tuple[str, int]]:
-    """(key, max failures) for every counter a login failure feeds: pair, IP, e-mail (in this order)."""
-    return [
-        (attempt_key(email, ip), PAIR_MAX_FAILURES),
-        (ip_key(ip), IP_MAX_FAILURES),
-        (email_key(email), EMAIL_MAX_FAILURES),
-    ]
+def throttle_keys(email: str, ip: str | None, ip_lock: bool = True) -> list[tuple[str, int]]:
+    """(key, max failures) for every counter a login failure feeds: pair, IP, e-mail (in this order).
+    Without `ip_lock` (the address is a proxy's, shared by every client) there is no IP key."""
+    keys = [(attempt_key(email, ip), PAIR_MAX_FAILURES)]
+    if ip_lock:
+        keys.append((ip_key(ip), IP_MAX_FAILURES))
+    keys.append((email_key(email), EMAIL_MAX_FAILURES))
+    return keys
 
 
 def locked_for_any(session: Session, keys: list[tuple[str, int]], now: datetime | None = None) -> int | None:
@@ -373,13 +378,20 @@ def _insert_ignore(session: Session, model: type, values: dict[str, Any]) -> Non
     session.execute(insert(model).values(**values).on_conflict_do_nothing())
 
 
+ATTEMPT_ROW_TRIES = 3
+
+
 def _attempt_row(session: Session, key: str, now: datetime) -> LoginAttempt:
     """The throttle row of `key`, created if missing and locked for the rest of the transaction
-    (`SELECT ... FOR UPDATE` on PostgreSQL; the write lock taken by the insert on SQLite)."""
-    _insert_ignore(session, LoginAttempt, {"key": key, "window_start": now, "count": 0, "lock_count": 0})
-    row = session.get(LoginAttempt, key, with_for_update=True, populate_existing=True)
-    assert row is not None
-    return row
+    (`SELECT ... FOR UPDATE` on PostgreSQL; the write lock taken by the insert on SQLite). A
+    concurrent purge can delete the row between the insert (a no-op on a conflict) and the select:
+    the pair is retried a few times."""
+    for _ in range(ATTEMPT_ROW_TRIES):
+        _insert_ignore(session, LoginAttempt, {"key": key, "window_start": now, "count": 0, "lock_count": 0})
+        row = session.get(LoginAttempt, key, with_for_update=True, populate_existing=True)
+        if row is not None:
+            return row
+    raise RuntimeError("login throttle row vanished repeatedly")
 
 
 def _count_failure(row: LoginAttempt, now: datetime, max_failures: int) -> int | None:
@@ -431,7 +443,20 @@ def remember_ip(session: Session, email: str, ip: str | None, now: datetime | No
     session.execute(update(LoginKnownIp).where(LoginKnownIp.key == key).values(last_success_at=now))
 
 
-def reserve_login_attempt(session: Session, email: str, ip: str | None, now: datetime | None = None) -> int | None:
+# Pre-reservation state of a throttle row whose lock the reservation started:
+# (count, window_start, lock_count, locked_until).
+Undo = dict[str, tuple[int, datetime, int, datetime | None]]
+
+
+def reserve_login_attempt(
+    session: Session,
+    email: str,
+    ip: str | None,
+    now: datetime | None = None,
+    *,
+    ip_lock: bool = True,
+    undo: Undo | None = None,
+) -> int | None:
     """Run BEFORE the password is verified; the caller commits right away (before argon2).
 
     Locks the attempt's throttle rows (in key order, so concurrent attempts cannot deadlock) and
@@ -444,9 +469,13 @@ def reserve_login_attempt(session: Session, email: str, ip: str | None, now: dat
     The e-mail-only lock (a distributed attack on one account) does not apply to a network the
     account logged in from successfully within `KNOWN_IP_TTL`: an attacker can lock an account for
     unknown networks, never lock its owner out of their usual one (the pair and IP locks still apply
-    there). For unknown networks the lock escalates (`LOCK_STEPS`), i.e. a progressive delay."""
+    there). For unknown networks the lock escalates (`LOCK_STEPS`), i.e. a progressive delay.
+
+    `ip_lock`: whether `ip` is the client's real address (see `throttle_keys`). `undo`, when given,
+    receives the previous state of every row whose lock this reservation started, so
+    `login_succeeded`/`release_login_attempt` can take that lock back."""
     now = now or utcnow()
-    keys = throttle_keys(email, ip)
+    keys = throttle_keys(email, ip, ip_lock)
     email_k = email_key(email)
     known = is_known_ip(session, email, ip, now)
     rows = {key: _attempt_row(session, key, now) for key, _ in sorted(keys)}
@@ -457,8 +486,11 @@ def reserve_login_attempt(session: Session, email: str, ip: str | None, now: dat
         session.flush()
         return max(waits)
     for key, limit in keys:
-        if _remaining(rows[key], now) is None:  # a locked e-mail key (known network) is not escalated
-            _count_failure(rows[key], now, limit)
+        row = rows[key]
+        if _remaining(row, now) is None:  # a locked e-mail key (known network) is not escalated
+            before = (row.count, row.window_start, row.lock_count, row.locked_until)
+            if _count_failure(row, now, limit) is not None and undo is not None:
+                undo[key] = before
     session.flush()
     return None
 
@@ -469,19 +501,47 @@ def _uncount(session: Session, key: str) -> None:
     )
 
 
-def release_login_attempt(session: Session, email: str, ip: str | None) -> None:
-    """The reserved attempt was not verified (hasher busy): take its advance count back."""
-    for key, _ in sorted(throttle_keys(email, ip)):
+def _take_back(session: Session, key: str, undo: Undo | None) -> None:
+    """Undo one reservation's advance count of `key`; when that reservation started the key's lock,
+    restore the row as it was before it (the lock and its escalation step go away)."""
+    before = (undo or {}).get(key)
+    if before is None:
         _uncount(session, key)
+        return
+    count, window_start, lock_count, locked_until = before
+    session.execute(
+        update(LoginAttempt)
+        .where(LoginAttempt.key == key)
+        .values(count=count, window_start=window_start, lock_count=lock_count, locked_until=locked_until)
+        .execution_options(synchronize_session=False)
+    )
+
+
+def release_login_attempt(
+    session: Session, email: str, ip: str | None, *, ip_lock: bool = True, undo: Undo | None = None
+) -> None:
+    """The reserved attempt was not verified (hasher busy): take its advance count back."""
+    for key, _ in sorted(throttle_keys(email, ip, ip_lock)):
+        _take_back(session, key, undo)
     session.flush()
 
 
-def login_succeeded(session: Session, email: str, ip: str | None, now: datetime | None = None) -> None:
+def login_succeeded(
+    session: Session,
+    email: str,
+    ip: str | None,
+    now: datetime | None = None,
+    *,
+    ip_lock: bool = True,
+    undo: Undo | None = None,
+) -> None:
     """Reset the pair and e-mail counters, take back the IP counter's advance count (a success
-    never resets the IP counter: an attacker could reset it with their own account) and remember
-    the network for the e-mail lock bypass."""
+    never resets the IP counter: an attacker could reset it with their own account; but when this
+    very attempt started the IP lock, that lock is taken back too) and remember the network for the
+    e-mail lock bypass."""
     clear_login_failures(session, email, ip)
-    _uncount(session, ip_key(ip))
+    if ip_lock:
+        _take_back(session, ip_key(ip), undo)
     remember_ip(session, email, ip, now)
     session.flush()
 
