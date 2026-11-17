@@ -39,7 +39,7 @@ def test_training_run_context_manager_logs_flushes_and_completes() -> None:
     client = _make_client(handler)
     assert isinstance(client.mlops, MLOpsClient)
 
-    with client.start_run("lora-sft", run_type="lora", hyperparameters={"lr": 2e-4}, flush_interval=60.0) as run:
+    with client.mlops.start_run("lora-sft", run_type="lora", hyperparameters={"lr": 2e-4}, flush_interval=60.0) as run:
         assert isinstance(run, TrainingRun)
         run.log({"loss": 1.25, "lr": 2e-4}, step=1, epoch=0.1)
         run.log({"loss": 0.95}, step=2, epoch=0.2)
@@ -73,7 +73,7 @@ def test_training_run_marks_failed_on_exception_and_rejects_non_finite() -> None
 
     with (
         pytest.raises(RuntimeError, match="oom"),
-        client.start_run("fail-test", flush_interval=60.0) as run,
+        client.mlops.start_run("fail-test", flush_interval=60.0) as run,
     ):
         with pytest.raises(ValueError, match="finite"):
             run.log({"loss": float("nan")}, step=1)
@@ -151,7 +151,7 @@ def test_log_artifact_upload_and_deduplication(tmp_path: Path) -> None:
         raise AssertionError(f"Unexpected request: {request.method} {request.url}")
 
     client = _make_client(handler)
-    with client.start_run("art-run", flush_interval=60.0) as run:
+    with client.mlops.start_run("art-run", flush_interval=60.0) as run:
         art1 = run.log_artifact(adapter_file, name="lora-v1", kind="lora_adapter", format="safetensors")
         assert art1["id"] == "art_1"
         assert art1["status"] == "committed"
@@ -291,7 +291,7 @@ def test_matrix_trainer_callback_logs_and_propagates_early_stop() -> None:
         raise AssertionError(f"Unexpected request: {request.method} {request.url}")
 
     client = _make_client(handler)
-    with client.start_run("cb-run", flush_interval=60.0) as run:
+    with client.mlops.start_run("cb-run", flush_interval=60.0) as run:
         cb = MatrixTrainerCallback(run)
         state = SimpleNamespace(global_step=10, epoch=1.0)
         control = SimpleNamespace(should_training_stop=False)
@@ -362,7 +362,7 @@ def test_protocol_relative_url_rejected_without_forwarding_auth(tmp_path: Path) 
 
     client = _make_client(handler)
     with (
-        client.start_run("sec-run", flush_interval=60.0) as run,
+        client.mlops.start_run("sec-run", flush_interval=60.0) as run,
         pytest.raises(ValueError, match="Unsupported external URL scheme"),
     ):
         run.log_artifact(adapter_file, name="evil-art")
@@ -440,7 +440,7 @@ def test_external_presigned_put_and_get_omit_authorization(
         raise AssertionError(f"Unexpected API request: {request.method} {request.url}")
 
     client = _make_client(api_handler)
-    with client.start_run("s3-run", flush_interval=60.0) as run:
+    with client.mlops.start_run("s3-run", flush_interval=60.0) as run:
         committed = run.log_artifact(adapter_file, name="s3-art")
         assert committed["status"] == "committed"
 
@@ -485,7 +485,7 @@ def test_log_classic_eval_and_create_sweep() -> None:
     with pytest.raises(ValueError, match="finite"):
         client.mlops.create_sweep("bad-sweep", search_space={"lr": float("nan")})
 
-    with client.start_run("ce-run", flush_interval=60.0) as run:
+    with client.mlops.start_run("ce-run", flush_interval=60.0) as run:
         eval_payload = {"roc_auc": 0.94, "confusion_matrix": [[10, 1], [2, 12]]}
         updated = run.log_classic_eval(eval_payload)
         assert updated["classic_eval"] == eval_payload
@@ -541,7 +541,7 @@ def test_training_run_close_and_post_finish_log_guard(caplog: pytest.LogCaptureF
         raise AssertionError(f"Unexpected request: {request.method} {request.url}")
 
     client = _make_client(handler)
-    run = client.start_run("close-run", flush_interval=60.0)
+    run = client.mlops.start_run("close-run", flush_interval=60.0)
     run.close()
     assert run.status == "completed"
     assert len(patch_calls) == 1

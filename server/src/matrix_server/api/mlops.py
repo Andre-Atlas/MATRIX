@@ -36,7 +36,6 @@ from matrix_server.mlops.sweeps import (
 from matrix_server.storage.db import as_utc, get_db, utcnow
 from matrix_server.storage.jobs import enqueue
 from matrix_server.storage.models import (
-    MlopsArtifact as Artifact,
     ArtifactLineage,
     Dataset,
     Experiment,
@@ -46,6 +45,9 @@ from matrix_server.storage.models import (
     RegisteredModel,
     SafetyScan,
     TrainingRun,
+)
+from matrix_server.storage.models import (
+    MlopsArtifact as Artifact,
 )
 
 router = APIRouter(prefix="/api/v1/mlops", tags=["mlops"])

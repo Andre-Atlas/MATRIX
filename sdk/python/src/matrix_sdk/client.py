@@ -22,7 +22,7 @@ from .prompts import Prompt
 if TYPE_CHECKING:
     from .benchmarks import BenchmarksClient
     from .datasets import DatasetsClient
-    from .mlops import MLOpsClient, TrainingRun
+    from .mlops import MLOpsClient
     from .sandboxes import SandboxesClient
 
 DEFAULT_ENDPOINT = "http://localhost:8000"

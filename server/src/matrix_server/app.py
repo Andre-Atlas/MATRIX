@@ -27,9 +27,9 @@ from matrix_server.config import Settings, get_settings
 from matrix_server.gateway.router import GatewayRouter
 from matrix_server.hooks import install_api_hooks
 from matrix_server.limits import BodyLimitMiddleware
-from matrix_server.runs.store import build_metric_store
 from matrix_server.mlops.artifact_store import build_artifact_store as build_mlops_artifact_store
 from matrix_server.mlops.metrics_store import build_training_metric_store
+from matrix_server.runs.store import build_metric_store
 from matrix_server.storage.db import init_db, make_engine, make_session_factory
 from matrix_server.storage.spans import build_span_store
 
