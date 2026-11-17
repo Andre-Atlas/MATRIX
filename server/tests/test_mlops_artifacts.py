@@ -1,244 +1,28 @@
+"""`main`'s MLOps artifacts after T4: metadata (`model_artifacts`) over the G0 blob store.
+
+Replaced on purpose (the behaviour was removed, see t4-notes.md): the tests of `main`'s own
+LocalFS/S3 store, its HMAC upload/download tokens, `MATRIX_ARTIFACT_TOKEN_SECRET`/`MATRIX_ENV`
+startup checks and the private-IP check of external URIs. What they protected is now covered by
+the G0 store (tests/test_artifacts.py: path safety, dedup, quota, verified sha256, S3 presign) and
+by the checks below on the deprecated adapter."""
+
 from __future__ import annotations
 
 import hashlib
-import hmac
-import time
-from datetime import UTC, datetime
-from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+import io
+from datetime import UTC, datetime, timedelta
 
-import httpx
 import pytest
+from fastapi.testclient import TestClient
+from rbac_helpers import api_key_headers, project_with_roles
 
+from matrix_server.app import create_app
+from matrix_server.artifacts import PresignedRequest
+from matrix_server.artifacts.local import LocalArtifactStore
+from matrix_server.artifacts.models import Artifact as Blob
 from matrix_server.config import Settings
-from matrix_server.mlops.artifact_store import (
-    LocalFSArtifactStore,
-    S3ArtifactStore,
-    build_artifact_store,
-    validate_external_uri,
-    validate_relative_path,
-    validate_safe_segment,
-)
-
-SAMPLE_SHA256 = "a" * 64
-
-
-@pytest.fixture
-def tmp_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """The MLOps local store lives at `<artifact_local_dir>/mlops`; this module's `tmp_path` is that
-    directory, so the path assertions below keep their meaning."""
-    root = tmp_path_factory.mktemp("artifacts") / "mlops"
-    root.mkdir()
-    return root
-
-
-def _local_settings(tmp_path: Path, **overrides: object) -> Settings:
-    params: dict[str, object] = {
-        "artifact_backend": "local",
-        "artifact_local_dir": str(tmp_path.parent),
-        "artifact_token_secret": "test-hmac-secret-key-0123456789abcdef",
-        "artifact_url_ttl_seconds": 600,
-    }
-    params.update(overrides)
-    return Settings(**params)  # type: ignore[arg-type]
-
-
-def _s3_settings(**overrides: object) -> Settings:
-    params: dict[str, object] = {
-        "artifact_backend": "s3",
-        "s3_endpoint": "http://minio.example.com:9000",
-        "s3_bucket": "matrix-artifacts",
-        "s3_region": "us-east-1",
-        "s3_access_key": "AKIA_TEST_KEY",
-        "s3_secret_key": "SUPER_SECRET_KEY_DO_NOT_LEAK",
-        "artifact_url_ttl_seconds": 900,
-    }
-    params.update(overrides)
-    return Settings(**params)  # type: ignore[arg-type]
-
-
-def test_local_store_presign_write_read_and_exists(tmp_path: Path) -> None:
-    store = LocalFSArtifactStore(_local_settings(tmp_path))
-    data = b"safetensors-header-and-weights"
-    sha = hashlib.sha256(data).hexdigest()
-
-    storage_uri, put_url = store.presign_put("proj-1", sha, len(data))
-    assert storage_uri == f"local://projects/proj-1/blobs/sha256/{sha}"
-    assert put_url.startswith("/api/v1/mlops/artifacts/local/")
-
-    put_token = put_url.rsplit("/", 1)[-1]
-    key = store.verify_local_token(put_token, "put", "proj-1")
-    assert key == f"projects/proj-1/blobs/sha256/{sha}"
-
-    assert store.exists_and_size(storage_uri) == (False, None)
-
-    written_path = store.write_local_blob(key, data)
-    assert written_path.is_file()
-    assert written_path.is_relative_to(tmp_path.resolve())
-    assert store.exists_and_size(storage_uri) == (True, len(data))
-
-    get_url = store.presign_get("proj-1", storage_uri)
-    get_token = get_url.rsplit("/", 1)[-1]
-    get_key = store.verify_local_token(get_token, "get", "proj-1")
-    assert get_key == key
-    assert store.read_local_blob_path(get_key).read_bytes() == data
-
-
-def test_local_store_rejects_tampered_swapped_and_expired_tokens(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = LocalFSArtifactStore(_local_settings(tmp_path, artifact_url_ttl_seconds=60))
-    now = 1_700_000_000
-    monkeypatch.setattr(time, "time", lambda: now)
-
-    storage_uri, put_url = store.presign_put("proj-1", SAMPLE_SHA256, 128)
-    put_token = put_url.rsplit("/", 1)[-1]
-    get_url = store.presign_get("proj-1", storage_uri)
-    get_token = get_url.rsplit("/", 1)[-1]
-
-    # Swapped operation
-    with pytest.raises(ValueError, match="operation mismatch"):
-        store.verify_local_token(put_token, "get", "proj-1")
-    with pytest.raises(ValueError, match="operation mismatch"):
-        store.verify_local_token(get_token, "put", "proj-1")
-
-    # Tampered signature
-    payload_b64, sig = put_token.split(".")
-    bad_sig = ("0" if sig[0] != "0" else "1") + sig[1:]
-    with pytest.raises(ValueError, match="signature"):
-        store.verify_local_token(f"{payload_b64}.{bad_sig}", "put", "proj-1")
-
-    # Tampered payload
-    tampered_payload = ("A" if payload_b64[0] != "A" else "B") + payload_b64[1:]
-    with pytest.raises(ValueError, match="signature"):
-        store.verify_local_token(f"{tampered_payload}.{sig}", "put", "proj-1")
-
-    # Malformed token
-    with pytest.raises(ValueError, match="Malformed"):
-        store.verify_local_token("no-dot-here", "put", "proj-1")
-
-    # Expired token
-    monkeypatch.setattr(time, "time", lambda: now + 61)
-    with pytest.raises(ValueError, match="expired"):
-        store.verify_local_token(put_token, "put", "proj-1")
-
-
-def test_local_store_prevents_path_traversal_and_idor(tmp_path: Path) -> None:
-    store = LocalFSArtifactStore(_local_settings(tmp_path))
-
-    with pytest.raises(ValueError):
-        store.object_key("../etc", SAMPLE_SHA256)
-    with pytest.raises(ValueError):
-        store.object_key("proj\\1", SAMPLE_SHA256)
-    with pytest.raises(ValueError):
-        store.object_key("proj\x001", SAMPLE_SHA256)
-    with pytest.raises(ValueError):
-        store.object_key("proj-1", "../" + "a" * 61)
-    with pytest.raises(ValueError):
-        store.write_local_blob("../../outside.bin", b"bad")
-    with pytest.raises(ValueError):
-        store.presign_put("proj-1", SAMPLE_SHA256, 999_999_999_999)
-
-    # Anti-IDOR on presign_get
-    with pytest.raises(ValueError, match="does not belong"):
-        store.presign_get("proj-2", f"local://projects/proj-1/blobs/sha256/{SAMPLE_SHA256}")
-
-    # Symlink escaping root
-    outside = tmp_path.parent / "outside_escape"
-    outside.mkdir(exist_ok=True)
-    escape_link = tmp_path / "projects"
-    escape_link.symlink_to(outside)
-    with pytest.raises(ValueError, match="escapes"):
-        store.write_local_blob(f"projects/proj-1/blobs/sha256/{SAMPLE_SHA256}", b"x")
-
-
-@pytest.mark.parametrize(
-    "bad_value",
-    ["../secret", "a/../../b", "dir\\file", "bad\x00name", "bad\nname", "/leading", "trailing/"],
-)
-def test_path_traversal_validators(bad_value: str) -> None:
-    with pytest.raises(ValueError):
-        validate_relative_path(bad_value)
-    with pytest.raises(ValueError):
-        validate_safe_segment(bad_value)
-
-
-def test_s3_store_sigv4_presign_and_no_secret_leak() -> None:
-    settings = _s3_settings()
-    store = S3ArtifactStore(settings)
-
-    storage_uri, put_url = store.presign_put("proj-1", SAMPLE_SHA256, 4096)
-    assert storage_uri == f"s3://matrix-artifacts/projects/proj-1/blobs/sha256/{SAMPLE_SHA256}"
-
-    parsed = urlsplit(put_url)
-    qs = parse_qs(parsed.query)
-    assert qs["X-Amz-Algorithm"] == ["AWS4-HMAC-SHA256"]
-    assert qs["X-Amz-Expires"] == ["900"]
-    assert qs["X-Amz-SignedHeaders"] == ["host"]
-    assert len(qs["X-Amz-Signature"][0]) == 64
-    assert qs["X-Amz-Credential"][0].startswith("AKIA_TEST_KEY/")
-    assert settings.s3_secret_key not in put_url
-
-    get_url = store.presign_get("proj-1", storage_uri)
-    assert settings.s3_secret_key not in get_url
-    assert parse_qs(urlsplit(get_url).query)["X-Amz-Algorithm"] == ["AWS4-HMAC-SHA256"]
-
-    # Deterministic SigV4 verification
-    fixed_ts = datetime(2026, 11, 13, 12, 0, 0, tzinfo=UTC)
-    key = store.object_key("proj-1", SAMPLE_SHA256)
-    signed_url = store._presign_url("GET", key, now=fixed_ts)
-    signed_qs = parse_qs(urlsplit(signed_url).query)
-    assert signed_qs["X-Amz-Date"] == ["20261113T120000Z"]
-    assert signed_qs["X-Amz-Credential"] == ["AKIA_TEST_KEY/20261113/us-east-1/s3/aws4_request"]
-
-    # Anti-IDOR
-    with pytest.raises(ValueError, match="does not belong"):
-        store.presign_get("other-proj", storage_uri)
-
-    # Missing credentials error must not leak anything
-    no_creds = S3ArtifactStore(_s3_settings(s3_access_key="", s3_secret_key=""))
-    with pytest.raises(ValueError, match="credentials"):
-        no_creds.presign_put("proj-1", SAMPLE_SHA256, 10)
-
-
-def test_s3_store_exists_and_size_and_error_handling() -> None:
-    secret = "SUPER_SECRET_KEY_DO_NOT_LEAK"
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.method == "HEAD"
-        assert "X-Amz-Signature=" in str(request.url)
-        if "missing" in request.url.path:
-            return httpx.Response(404)
-        if "error500" in request.url.path:
-            return httpx.Response(500)
-        if "networkerr" in request.url.path:
-            raise httpx.ConnectError("connection refused", request=request)
-        return httpx.Response(200, headers={"Content-Length": "2048"})
-
-    client = httpx.Client(transport=httpx.MockTransport(handler))
-    store = S3ArtifactStore(_s3_settings(s3_secret_key=secret), http_client=client)
-
-    ok_uri = f"s3://matrix-artifacts/projects/p1/blobs/sha256/{'b' * 64}"
-    assert store.exists_and_size(ok_uri) == (True, 2048)
-
-    missing_uri = f"s3://matrix-artifacts/projects/missing/blobs/sha256/{'c' * 64}"
-    assert store.exists_and_size(missing_uri) == (False, None)
-
-    err_uri = f"s3://matrix-artifacts/projects/error500/blobs/sha256/{'d' * 64}"
-    with pytest.raises(RuntimeError) as exc_info:
-        store.exists_and_size(err_uri)
-    assert secret not in str(exc_info.value)
-
-    net_uri = f"s3://matrix-artifacts/projects/networkerr/blobs/sha256/{'e' * 64}"
-    with pytest.raises(RuntimeError) as net_exc:
-        store.exists_and_size(net_uri)
-    assert secret not in str(net_exc.value)
-    assert "X-Amz-Signature" not in str(net_exc.value)
-
-
-def test_build_artifact_store(tmp_path: Path) -> None:
-    assert isinstance(build_artifact_store(_local_settings(tmp_path)), LocalFSArtifactStore)
-    assert isinstance(build_artifact_store(_s3_settings()), S3ArtifactStore)
+from matrix_server.mlops.compat import validate_external_uri, validate_sha256
+from matrix_server.storage.models import ModelArtifact
 
 
 @pytest.mark.parametrize(
@@ -248,6 +32,9 @@ def test_build_artifact_store(tmp_path: Path) -> None:
         "gs://ml-artifacts/runs/run-1/weights.bin",
         "hf://meta-llama/Llama-3.1-8B-Instruct",
         "lakefs://repo/main/checkpoints/step-1000",
+        # registered by reference only: never fetched, so an address-like host is just a name
+        "s3://169.254.169.254/bucket/key",
+        "s3://localhost/bucket/key",
     ],
 )
 def test_validate_external_uri_accepts_allowed_schemes(valid_uri: str) -> None:
@@ -260,148 +47,168 @@ def test_validate_external_uri_accepts_allowed_schemes(valid_uri: str) -> None:
         "",
         "file:///etc/passwd",
         "http://169.254.169.254/latest/meta-data/",
-        "http://127.0.0.1:8080/admin",
         "https://example.com/model.safetensors",
-        "s3://169.254.169.254/bucket/key",
-        "s3://127.0.0.1/bucket/key",
-        "s3://10.0.0.5/bucket/key",
-        "s3://[::1]/bucket/key",
-        "s3://localhost/bucket/key",
-        "s3://metadata.google.internal/bucket/key",
         "s3://user:pass@my-bucket/key",
+        "s3:///no-host",
         "s3://my-bucket/../../etc/passwd",
         "s3://my-bucket/path\\evil",
         "s3://my-bucket/key\n",
+        " s3://my-bucket/key",
     ],
 )
-def test_validate_external_uri_blocks_ssrf_and_invalid(blocked_uri: str) -> None:
+def test_validate_external_uri_blocks_invalid(blocked_uri: str) -> None:
     with pytest.raises(ValueError):
         validate_external_uri(blocked_uri)
 
 
-def test_hmac_helper_unused_import_guard() -> None:
-    # Sanity check that standard hmac/hashlib work as expected in environment
-    assert len(hmac.new(b"k", b"v", hashlib.sha256).hexdigest()) == 64
+def test_validate_sha256() -> None:
+    assert validate_sha256("A" * 64) == "a" * 64
+    for bad in ("", "a" * 63, "g" * 64, "a" * 65):
+        with pytest.raises(ValueError):
+            validate_sha256(bad)
 
 
-def test_local_store_cas_idempotency_corruption_and_sha_mismatch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = LocalFSArtifactStore(_local_settings(tmp_path))
-    data = b"model-weights-cas-test"
-    sha = hashlib.sha256(data).hexdigest()
-    key = store.object_key("proj-1", sha)
-
-    # Mismatch raises ValueError and leaves no file
-    with pytest.raises(ValueError, match="sha256 mismatch"):
-        store.write_local_blob(key, b"wrong-content")
-    assert not (tmp_path / key).exists()
-
-    # Valid write succeeds
-    target = store.write_local_blob(key, data)
-    assert target.read_bytes() == data
-
-    # Idempotent rewrite does not call os.replace / overwrite
-    import os
-
-    def forbid_replace(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("os.replace should not be called for idempotent CAS write")
-
-    monkeypatch.setattr(os, "replace", forbid_replace)
-    assert store.write_local_blob(key, data) == target
-    monkeypatch.undo()
-
-    # Corrupted existing file on disk raises error
-    target.write_bytes(b"corrupted-on-disk")
-    with pytest.raises(RuntimeError, match="corrupt"):
-        store.write_local_blob(key, data)
-
-
-@pytest.mark.asyncio
-async def test_local_store_write_local_blob_stream(tmp_path: Path) -> None:
-    store = LocalFSArtifactStore(_local_settings(tmp_path, max_artifact_bytes=100))
-    chunks = [b"hello-", b"streaming-", b"artifact"]
-    data = b"".join(chunks)
-    sha = hashlib.sha256(data).hexdigest()
-    key = store.object_key("proj-1", sha)
-
-    async def gen(items: list[bytes]):
-        for item in items:
-            yield item
-
-    written_path, written_size = await store.write_local_blob_stream(key, gen(chunks))
-    assert written_size == len(data)
-    assert written_path.read_bytes() == data
-
-    # Oversized stream raises ValueError and cleans up temp files
-    big_key = store.object_key("proj-1", hashlib.sha256(b"x" * 101).hexdigest())
-    with pytest.raises(ValueError, match="max_artifact_bytes"):
-        await store.write_local_blob_stream(big_key, gen([b"x" * 60, b"x" * 41]))
-    assert not (tmp_path / big_key).exists()
-    assert not list((tmp_path / "projects/proj-1/blobs/sha256").glob(".tmp_*"))
-
-
-
-def test_local_token_is_bound_to_project_and_shared_by_processes_with_same_secret(tmp_path: Path) -> None:
-    """T3: the token names its project; two stores (two workers) with the same secret agree, a
-    store with another secret does not."""
-    store = LocalFSArtifactStore(_local_settings(tmp_path))
-    _, put_url = store.presign_put("proj-1", SAMPLE_SHA256, 10)
-    token = put_url.rsplit("/", 1)[-1]
-
-    with pytest.raises(ValueError, match="project mismatch"):
-        store.verify_local_token(token, "put", "proj-2")
-
-    other_worker = LocalFSArtifactStore(_local_settings(tmp_path))
-    assert other_worker.verify_local_token(token, "put", "proj-1").startswith("projects/proj-1/")
-
-    other_secret = LocalFSArtifactStore(_local_settings(tmp_path, artifact_token_secret="x" * 40))
-    with pytest.raises(ValueError, match="signature"):
-        other_secret.verify_local_token(token, "put", "proj-1")
-
-
-def test_local_token_signature_compared_in_constant_time(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    store = LocalFSArtifactStore(_local_settings(tmp_path))
-    _, put_url = store.presign_put("proj-1", SAMPLE_SHA256, 10)
-    calls: list[tuple[object, object]] = []
-    real = hmac.compare_digest
-
-    def spy(a, b):  # type: ignore[no-untyped-def]
-        calls.append((a, b))
-        return real(a, b)
-
-    monkeypatch.setattr(hmac, "compare_digest", spy)
-    store.verify_local_token(put_url.rsplit("/", 1)[-1], "put", "proj-1")
-    assert calls, "signature must be checked with hmac.compare_digest"
-
-
-@pytest.mark.parametrize("env", ["production", "dev"])
-def test_artifact_token_secret_required_outside_tests(env: str, tmp_path: Path) -> None:
-    from matrix_server.app import create_app
-    from matrix_server.config import ConfigError
-
-    settings = Settings(env=env, database_url=f"sqlite:///{tmp_path}/x.db", artifact_token_secret=None)
-    with pytest.raises(ConfigError, match="MATRIX_ARTIFACT_TOKEN_SECRET"):
-        create_app(settings)
-    with pytest.raises(ConfigError, match="MATRIX_ARTIFACT_TOKEN_SECRET"):
-        Settings(env=env, artifact_token_secret="   ").artifact_token_key()
-
-
-def test_artifact_token_secret_rules(tmp_path: Path) -> None:
-    from matrix_server.config import ConfigError
-
-    with pytest.raises(ConfigError, match="32"):
-        Settings(env="production", artifact_token_secret="short").artifact_token_key()
-    assert Settings(env="dev", artifact_token_secret="short").artifact_token_key() == b"short"
-    assert Settings(env="production", artifact_token_secret="k" * 32).artifact_token_key() == b"k" * 32
-    assert Settings(env="test", artifact_token_secret=None).artifact_token_key() is None
-
-
-def test_worker_fails_fast_without_artifact_token_secret(monkeypatch: pytest.MonkeyPatch) -> None:
-    from matrix_server import cli
-    from matrix_server.config import ConfigError
-
-    monkeypatch.setenv("MATRIX_ENV", "production")
+def test_no_token_secret_or_env_is_required(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The HMAC tokens are gone, so is their mandatory secret: a production deployment starts
+    without MATRIX_ARTIFACT_TOKEN_SECRET (the API and the worker share no signing key any more)."""
     monkeypatch.delenv("MATRIX_ARTIFACT_TOKEN_SECRET", raising=False)
-    with pytest.raises(ConfigError, match="MATRIX_ARTIFACT_TOKEN_SECRET"):
-        cli.run_worker()
+    monkeypatch.setenv("MATRIX_ENV", "production")
+    settings = Settings(database_url=f"sqlite:///{tmp_path}/a.db", artifact_local_dir=str(tmp_path / "a"))
+    assert not hasattr(settings, "artifact_token_secret") and not hasattr(settings, "env")
+    for alias in ("artifact_store", "artifact_dir", "artifact_presign_ttl_seconds"):
+        assert not hasattr(settings, alias)
+    app = create_app(settings)
+    assert not hasattr(app.state, "mlops_artifact_store") and not hasattr(app.state, "training_metric_store")
+    app.state.db_engine.dispose()
+
+
+@pytest.fixture
+def env(tmp_path):
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path}/m.db",
+        artifact_backend="local",
+        artifact_local_dir=str(tmp_path / "blobs"),
+        project_quota_bytes=1000,
+    )
+    app = create_app(settings)
+    client = TestClient(app)
+    factory = app.state.session_factory
+    pid, roles = project_with_roles(factory, "P")
+    yield app, client, factory, pid, roles
+    app.state.db_engine.dispose()
+
+
+def _presign(client, headers, name: str, data: bytes, **extra):
+    return client.post(
+        "/api/v1/mlops/artifacts/presign-upload",
+        headers=headers,
+        json={"name": name, "sha256": hashlib.sha256(data).hexdigest(), "size_bytes": len(data), **extra},
+    )
+
+
+def test_presign_reserves_a_g0_blob_and_commit_verifies_it(env) -> None:
+    app, client, factory, pid, roles = env
+    member = roles["member"]
+    data = b"weights-v1"
+    resp = _presign(client, member, "ckpt", data)
+    assert resp.status_code == 201, resp.text
+    assert resp.headers["Deprecation"] == "true"
+    art = resp.json()
+    assert art["status"] == "pending_upload" and art["storage_backend"] == "local"
+    assert art["storage_uri"] == f"artifact:{art['artifact_id']}"
+    with factory() as s:
+        blob = s.get(Blob, art["artifact_id"])
+        assert blob.status == "pending" and blob.owner_kind == "model_artifact" and blob.owner_id == art["id"]
+
+    # commit before the upload: nothing to verify yet (G0 semantics)
+    assert client.post(f"/api/v1/mlops/artifacts/{art['id']}/commit", headers=member).status_code == 409
+    assert client.put(art["upload_url"], content=b"tampered!!", headers=member).status_code == 422
+    assert client.put(art["upload_url"], content=data, headers=member).status_code == 204
+    done = client.post(f"/api/v1/mlops/artifacts/{art['id']}/commit", headers=member)
+    assert done.status_code == 200 and done.json()["status"] == "committed"
+    with factory() as s:
+        blob = s.get(Blob, art["artifact_id"])
+        assert blob.status == "ready" and blob.verified is True
+
+    # same content again: deduplicated in the G0 store, no upload, new version
+    again = _presign(client, member, "ckpt", data).json()
+    assert again["deduplicated"] is True and again["upload_url"] is None and again["version"] == 2
+    assert again["artifact_id"] != art["artifact_id"]
+    with factory() as s:
+        assert s.get(Blob, again["artifact_id"]).sha256 == blob.sha256
+
+
+def test_presign_counts_against_the_project_quota(env) -> None:
+    _, client, _, _, roles = env
+    resp = _presign(client, roles["member"], "big", b"x" * 1001)
+    assert resp.status_code == 413
+
+
+def test_download_url_and_blob_deleted_through_g0(env) -> None:
+    app, client, factory, pid, roles = env
+    member = roles["member"]
+    data = b"adapter"
+    art = _presign(client, member, "a", data).json()
+    client.put(art["upload_url"], content=data, headers=member)
+    client.post(f"/api/v1/mlops/artifacts/{art['id']}/commit", headers=member)
+    dl = client.get(f"/api/v1/mlops/artifacts/{art['id']}/download-url", headers=roles["viewer"]).json()
+    assert dl["download_url"] == f"/api/v1/artifacts/{art['artifact_id']}/download"
+    assert client.get(dl["download_url"], headers=roles["viewer"]).content == data
+
+    # the blob is a G0 artifact: deleting it leaves the metadata without content
+    assert client.delete(f"/api/v1/artifacts/{art['artifact_id']}", headers=member).status_code == 204
+    with factory() as s:
+        assert s.get(ModelArtifact, art["id"]).artifact_id is None
+    assert client.get(f"/api/v1/mlops/artifacts/{art['id']}/download-url", headers=member).status_code == 410
+
+
+def test_external_uri_is_registered_by_reference(env) -> None:
+    _, client, _, _, roles = env
+    member = roles["member"]
+    art = _presign(client, member, "ext", b"z", external_uri="hf://org/model").json()
+    assert art["storage_backend"] == "external" and art["upload_url"] is None and art["artifact_id"] is None
+    done = client.post(f"/api/v1/mlops/artifacts/{art['id']}/commit", headers=member, json={"size_bytes": 7})
+    assert done.status_code == 200 and done.json()["size_bytes"] == 7
+    dl = client.get(f"/api/v1/mlops/artifacts/{art['id']}/download-url", headers=member).json()
+    assert dl["download_url"] == "hf://org/model"
+
+
+def test_api_key_with_write_scope_uses_the_adapter(env) -> None:
+    _, client, factory, pid, _ = env
+    key = api_key_headers(factory, pid)
+    data = b"from-sdk"
+    art = _presign(client, key, "sdk", data).json()
+    assert client.put(art["upload_url"], content=data, headers=key).status_code == 204
+    assert client.post(f"/api/v1/mlops/artifacts/{art['id']}/commit", headers=key).json()["status"] == "committed"
+
+
+class _PresigningStore(LocalArtifactStore):
+    """Local store that answers like S3: presigned PUT/GET with signed headers."""
+
+    def presign_put(self, project_id, sha256, size, ttl, *, upload_id):
+        return PresignedRequest(
+            "PUT",
+            f"https://s3.example/{upload_id}?X-Amz-Signature=sig",
+            {"Content-Length": str(size), "x-amz-checksum-sha256": "abc="},
+            datetime.now(UTC) + timedelta(seconds=ttl),
+        )
+
+    def presign_get(self, project_id, sha256, ttl, *, filename, media_type):
+        return PresignedRequest("GET", f"https://s3.example/{sha256}?X-Amz-Signature=sig")
+
+
+def test_s3_style_presign_returns_signed_headers_and_presigned_download(env, tmp_path) -> None:
+    app, client, factory, pid, roles = env
+    member = roles["member"]
+    store = _PresigningStore(tmp_path / "s3like")
+    app.state.artifact_store = store
+    data = b"s3-content"
+    art = _presign(client, member, "s3", data).json()
+    assert art["upload_url"].startswith("https://s3.example/")
+    assert art["upload_headers"]["x-amz-checksum-sha256"] == "abc="
+    # simulate the client's PUT to S3 landing in the staging key, then commit verifies it
+    store.put(pid, io.BytesIO(data), max_bytes=len(data))
+    done = client.post(f"/api/v1/mlops/artifacts/{art['id']}/commit", headers=member)
+    assert done.status_code == 200, done.text
+    dl = client.get(f"/api/v1/mlops/artifacts/{art['id']}/download-url", headers=member).json()
+    assert dl["download_url"].startswith("https://s3.example/") and dl["sha256"] == hashlib.sha256(data).hexdigest()

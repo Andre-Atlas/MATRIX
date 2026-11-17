@@ -62,18 +62,22 @@ def _ts(value: Any) -> Any:
     return value
 
 
-def points_in(points: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+def points_in(points: Iterable[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], list[tuple[int, bool]]]:
     """`main` points `{category, metric_name, step, epoch?, value, recorded_at?}` -> G1 points
-    `{key, step, value, ts?}`. An `epoch` becomes a point of the `epoch` key at the same step."""
+    `{key, step, value, ts?}` and, per G1 point, (index of the `main` point, is it the epoch). An
+    `epoch` becomes a point of the `epoch` key at the same step."""
     out: list[dict[str, Any]] = []
-    for p in points:
+    origin: list[tuple[int, bool]] = []
+    for index, p in enumerate(points):
         base: dict[str, Any] = {"step": p["step"]}
         if p.get("recorded_at") is not None:
             base["ts"] = _ts(p["recorded_at"])
         out.append({"key": metric_key(p.get("category"), p["metric_name"]), "value": p["value"], **base})
+        origin.append((index, False))
         if p.get("epoch") is not None:
             out.append({"key": EPOCH_KEY, "value": p["epoch"], **base})
-    return out
+            origin.append((index, True))
+    return out, origin
 
 
 def _is_number(value: Any) -> bool:

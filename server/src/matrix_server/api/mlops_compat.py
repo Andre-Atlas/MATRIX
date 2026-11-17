@@ -356,8 +356,14 @@ def ingest_run_metrics(
     now = utcnow()
     if not service.accepts_points(run, now):
         raise HTTPException(status_code=409, detail=f"run is {compat.status_out(run.status)}")
-    raw = compat.points_in(p.model_dump() for p in body.points)
-    kept, rejected = _ingest(request, run, raw, now)
+    raw, origin = compat.points_in(p.model_dump() for p in body.points)
+    kept, rejected_raw = _ingest(request, run, raw, now)
+    # Report in terms of `main`'s points: a point counts as accepted when its value was.
+    rejected: dict[int, str] = {}
+    for r in rejected_raw:
+        index, is_epoch = origin[r.index]
+        rejected.setdefault(index, f"epoch: {r.reason}" if is_epoch else r.reason)
+    value_rejected = {origin[r.index][0] for r in rejected_raw if not origin[r.index][1]}
 
     latest: dict[str, tuple[int, float]] = {}
     for p in kept:
@@ -403,8 +409,8 @@ def ingest_run_metrics(
                     should_stop, stop_reason = True, decision.reason
     db.flush()
     return {
-        "accepted": len(kept),
-        "rejected": [{"index": r.index, "reason": r.reason} for r in rejected],
+        "accepted": len(body.points) - len(value_rejected),
+        "rejected": [{"index": i, "reason": reason} for i, reason in sorted(rejected.items())],
         "should_stop": should_stop,
         "stop_reason": stop_reason,
     }

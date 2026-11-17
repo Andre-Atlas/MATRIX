@@ -1,4 +1,6 @@
-"""Deleting a project leaves no rows of the modules merged from `main` (T3).
+"""Deleting a project leaves no rows of the modules merged from `main` (T3), and, since T4 put
+`main`'s runs, metrics and artifacts on `runs` / `run_metrics` / `artifacts`, no metric points and
+no blobs either (the `project.purge_spans` job of the G1/G0 stores).
 
 Their tables (`mlops_*`, `dataset_branches/commits/commit_items`, `benchmark_*`, `sandbox_*`,
 `safety_scans`) have a `project_id` without a FK to `projects`, so nothing cascades: the generic
@@ -9,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import uuid
 
 import pytest
 from fastapi.testclient import TestClient
@@ -20,6 +23,8 @@ from matrix_server.config import Settings
 from matrix_server.storage.db import Base, make_engine
 
 PG_URL = os.environ.get("MATRIX_TEST_DATABASE_URL")
+CH_URL = os.environ.get("MATRIX_TEST_CLICKHOUSE_URL")
+METRIC_BACKENDS = ["memory", *(["clickhouse"] if CH_URL else [])]
 MAIN_TABLES = {
     "benchmark_runs",
     "benchmark_task_results",
@@ -27,12 +32,14 @@ MAIN_TABLES = {
     "dataset_commits",
     "dataset_commit_items",
     "mlops_artifact_lineage",
-    "mlops_artifacts",
+    "model_artifacts",
+    "artifacts",
     "mlops_model_aliases",
     "mlops_model_versions",
     "mlops_registered_models",
     "mlops_sweeps",
-    "mlops_training_runs",
+    "runs",
+    "run_reports",
     "safety_scans",
     "sandbox_runs",
     "sandbox_task_transcripts",
@@ -65,7 +72,7 @@ def _ok(resp, *codes):
 
 
 def _populate(client: TestClient, h: dict[str, str]) -> None:
-    run = _ok(client.post("/api/v1/mlops/runs", json={"name": "r"}, headers=h))
+    run = _ok(client.post("/api/v1/mlops/runs", json={"name": "r", "classic_eval": {"f1": 0.5}}, headers=h))
     model = _ok(client.post("/api/v1/mlops/models", json={"name": "m"}, headers=h))
     _ok(client.post(f"/api/v1/mlops/models/{model['id']}/versions", json={"run_id": run["id"]}, headers=h))
     _ok(client.post(f"/api/v1/mlops/models/{model['id']}/aliases", json={"alias": "candidate", "version": 1}, headers=h))
@@ -128,3 +135,77 @@ def test_delete_project_removes_rows_of_every_main_module(app):
     assert kinds == {"project.purge_spans"}
     kept = _counts(app, keep_pid)
     assert all(kept[t] > 0 for t in MAIN_TABLES), kept
+
+
+def _mlops_data(client: TestClient, h: dict[str, str]) -> tuple[list[str], str]:
+    """A run of each API with points (adapter and G1) and a committed blob; returns (run ids, sha)."""
+    run = _ok(client.post("/api/v1/mlops/runs", json={"name": "m", "hardware_info": {"gpu_count": 2}}, headers=h))
+    pts = [{"category": "train", "metric_name": "loss", "step": i, "value": 1.0 / (i + 1), "epoch": 0.1} for i in range(5)]
+    _ok(client.post(f"/api/v1/mlops/runs/{run['id']}/metrics", json={"points": pts}, headers=h))
+    g1 = _ok(client.post("/api/v1/runs", json={"name": "g"}, headers=h))
+    _ok(client.post(f"/api/v1/runs/{g1['id']}/metrics", json={"points": [{"key": "acc", "step": 0, "value": 0.9}]}, headers=h))
+    data = os.urandom(64)
+    sha = hashlib.sha256(data).hexdigest()
+    art = _ok(client.post("/api/v1/mlops/artifacts/presign-upload",
+                          json={"name": "ckpt", "sha256": sha, "size_bytes": len(data), "run_id": run["id"]}, headers=h))
+    assert client.put(art["upload_url"], content=data, headers=h).status_code == 204
+    _ok(client.post(f"/api/v1/mlops/artifacts/{art['id']}/commit", headers=h))
+    return [run["id"], g1["id"]], sha
+
+
+@pytest.mark.parametrize("metric_backend", METRIC_BACKENDS)
+def test_delete_project_purges_mlops_points_and_blobs(app, metric_backend):
+    from matrix_server.api.artifacts import get_store
+    from matrix_server.runs.store import ClickHouseMetricStore
+    from matrix_server.storage.models import Job
+    from matrix_server.workers import artifact_handlers, handlers, online_handlers, run_handlers
+
+    ch = None
+    if metric_backend == "clickhouse":
+        ch = ClickHouseMetricStore(CH_URL, f"matrix_test_t4purge_{uuid.uuid4().hex[:12]}")
+        ch.ensure_schema()
+        app.state.metric_store = ch
+    try:
+        client = TestClient(app)
+        factory = app.state.session_factory
+        pid, roles = project_with_roles(factory, "doomed")
+        keep_pid, keep_roles = project_with_roles(factory, "kept")
+        runs, sha = _mlops_data(client, roles["owner"])
+        kept_runs, kept_sha = _mlops_data(client, keep_roles["owner"])
+        metrics, blobs = app.state.metric_store, get_store(app)
+        assert all(metrics.keys(pid, r) for r in runs) and blobs.exists(pid, sha)
+
+        assert client.delete(f"/api/v1/projects/{pid}", headers=roles["owner"]).status_code == 204
+        with factory() as db:
+            job = db.scalars(select(Job).where(Job.project_id == pid, Job.kind == "project.purge_spans")).one()
+        purged: list[str] = []
+
+        class _Recording:  # the job's own call; ClickHouse waits for its lightweight delete
+            def delete_project(self, project_id: str) -> None:
+                purged.append(project_id)
+                if ch is not None:
+                    ch.delete_project(project_id, wait=True)
+                else:
+                    metrics.delete_project(project_id)
+
+        artifact_handlers.set_artifact_store(blobs)
+        run_handlers.set_metric_store(_Recording())
+        online_handlers.set_span_store(app.state.span_store)
+        try:
+            with factory() as db:
+                handlers.purge_project_spans(db, job)
+        finally:
+            artifact_handlers.set_artifact_store(None)
+            run_handlers.set_metric_store(None)
+            online_handlers.set_span_store(None)
+        assert purged == [pid]
+
+        leftovers = {t: n for t, n in _counts(app, pid).items() if n and t not in ("audit_log", "jobs")}
+        assert leftovers == {}
+        assert [metrics.keys(pid, r) for r in runs] == [[], []]
+        assert not blobs.exists(pid, sha)
+        # the other project keeps everything
+        assert all(metrics.keys(keep_pid, r) for r in kept_runs) and blobs.exists(keep_pid, kept_sha)
+    finally:
+        if ch is not None:
+            ch.drop_database()
