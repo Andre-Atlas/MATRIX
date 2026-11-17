@@ -6,21 +6,30 @@ from matrix_server.api import (
     annotations,
     artifacts,
     auth,
+    benchmarks,
     datasets,
     egress,
     experiments,
+    gateway,
     ingest,
+    mlops,
     online_evals,
     projects,
     prompts,
     query,
     rules,
     runs,
+    safety,
+    sandboxes,
+    vectors,
 )
 from matrix_server.config import Settings, get_settings
+from matrix_server.gateway.router import GatewayRouter
 from matrix_server.hooks import install_api_hooks
 from matrix_server.limits import BodyLimitMiddleware
 from matrix_server.runs.store import build_metric_store
+from matrix_server.mlops.artifact_store import build_artifact_store as build_mlops_artifact_store
+from matrix_server.mlops.metrics_store import build_training_metric_store
 from matrix_server.storage.db import init_db, make_engine, make_session_factory
 from matrix_server.storage.spans import build_span_store
 
@@ -43,6 +52,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.session_factory = make_session_factory(engine)
     app.state.span_store = build_span_store(settings)
     app.state.metric_store = build_metric_store(settings)
+    app.state.training_metric_store = build_training_metric_store(settings)
+    # main's MLOps store (local signed tokens / S3 presign); `artifact_store` is the branch's blob
+    # store (api/artifacts.py builds it lazily). Unified in T4.
+    app.state.mlops_artifact_store = build_mlops_artifact_store(settings)
+    app.state.gateway_router = GatewayRouter()
 
     install_api_hooks(app.state.session_factory, app.state.span_store)
 
@@ -50,7 +64,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    for module in (ingest, admin, query, prompts, datasets, experiments, annotations, rules, online_evals,
-                   egress, artifacts, auth, projects, runs):
+    for module in (
+        ingest,
+        admin,
+        query,
+        prompts,
+        datasets,
+        experiments,
+        annotations,
+        rules,
+        online_evals,
+        egress,
+        artifacts,
+        auth,
+        projects,
+        runs,
+        # modules merged from main (ADR-013; ported to require(...) in T3)
+        safety,
+        vectors,
+        gateway,
+        mlops,
+        benchmarks,
+        sandboxes,
+    ):
         app.include_router(module.router)
     return app

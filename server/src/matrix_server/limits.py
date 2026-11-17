@@ -17,8 +17,11 @@ from starlette.exceptions import HTTPException
 JSON_API_PREFIX = "/api/v1/"
 # Raw artifact uploads (contract G0 section 2): streamed, so exempt from the JSON limit and bounded by
 # `raw_upload_limit` (settings.max_artifact_bytes); the route also enforces it while reading.
+# The last entry is main's MLOps local upload (signed token in the path; merged by ADR-013, T4 folds
+# it into the artifact store).
 RAW_UPLOAD_ROUTES = (("POST", re.compile(r"^/api/v1/artifacts/?$")),
-                     ("PUT", re.compile(r"^/api/v1/artifacts/[A-Za-z0-9_-]{1,64}/content$")))
+                     ("PUT", re.compile(r"^/api/v1/artifacts/[A-Za-z0-9_-]{1,64}/content$")),
+                     ("PUT", re.compile(r"^/api/v1/mlops/artifacts/local/[A-Za-z0-9_.=-]{1,4096}$")))
 
 
 class BodyTooLarge(HTTPException):

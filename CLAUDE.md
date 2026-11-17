@@ -15,3 +15,8 @@ declarado e respeitar os dois gates (spec + plano, e integração).
 
 Este bloco é gerado pelo instalador do ATLAS. Edite fora dos marcadores.
 <!-- ATLAS:END -->
+
+## Perguntas Interativas (Checkbox & Multicheck)
+
+Sempre que precisar consultar o usuário para decisões de escopo, arquitetura, design ou priorização entre opções, **use obrigatoriamente a ferramenta interativa de perguntas com opções/checkbox (`ask_question`)** (equivalente ao estilo *checkbox with options / multicheck*), usando `is_multi_select: true` quando múltiplas seleções forem válidas. Evite listas de perguntas em texto simples.
+

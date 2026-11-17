@@ -1,6 +1,8 @@
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -65,6 +67,25 @@ class Settings(BaseSettings):
     project_quota_bytes: int = 50 * 1024**3
     verify_hash_max_bytes: int = 256 * 1024**2
     artifact_url_ttl_seconds: int = 3600
+    # HMAC key of the signed upload/download tokens of main's MLOps local store (ADR-013 §3: no
+    # `jwt_secret`, no public default). Unset: a random key per process (tokens die on restart and
+    # are not shared between workers), which is safe; set it for multi-worker deployments.
+    artifact_token_secret: SecretStr | None = None
+
+    # --- TEMPORARY compat for main's code (removed by T3/T4): read-only aliases onto the branch's
+    # artifact settings. There is one set of artifact settings; these names are not configurable.
+    @property
+    def artifact_store(self) -> str:
+        return self.artifact_backend
+
+    @property
+    def artifact_dir(self) -> str:
+        # main's MLOps blobs live in their own subtree so their object keys never meet the branch's.
+        return str(Path(self.artifact_local_dir) / "mlops")
+
+    @property
+    def artifact_presign_ttl_seconds(self) -> int:
+        return self.artifact_url_ttl_seconds
 
 
 @lru_cache

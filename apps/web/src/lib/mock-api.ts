@@ -1,11 +1,34 @@
 // In-memory implementation of the API, used only when MATRIX_MOCK=1.
 import { ApiError } from "./api-error";
 import { authGet, authSend, mockGate, MEMBER_ACCEPTED, NO_CONTENT, type MockCtx } from "./mock-auth";
-import { mockDb } from "./mock-data";
+import {
+  createMockSafetyScan,
+  getMockGatewayLogs,
+  getMockGatewayProviders,
+  getMockGatewayRules,
+  getMockGatewayStats,
+  getMockSafetyReport,
+  getMockSafetyScans,
+  MOCK_SAFETY_CATEGORIES,
+  mockDb,
+  mockVectorDrift,
+  mockVectorProjection,
+} from "./mock-data";
 import { evalExportJsonl, evalGet, evalSend } from "./mock-evals";
+import { mlopsGet, mlopsSend } from "./mock-mlops";
 import { dpoExportJsonl, opsGet, opsSend } from "./mock-ops";
 import { runArtifactDownload, runsGet, runsSend } from "./mock-runs";
 import type { ListResponse, OverviewStats, Score, SessionDetail, TraceDetail, TraceSummary } from "./types";
+import { sotaGet, sotaSend } from "./sota-mocks";
+import type {
+  CreateSafetyScanRequest,
+  GatewayLogsResponse,
+  GatewayProvidersResponse,
+  GatewayRulesResponse,
+  GatewayStatsResponse,
+  SafetyCategoriesResponse,
+  SafetyScansResponse,
+} from "./types";
 
 type Params = Record<string, string | number | undefined>;
 
@@ -124,6 +147,81 @@ export async function mockGet<T>(path: string, params: Params = {}, ctx?: MockCt
     return detail as T;
   }
 
+  if (p === "/api/v1/vectors/projection") {
+    return mockVectorProjection(params) as T;
+  }
+
+  if (p === "/api/v1/vectors/drift") {
+    return mockVectorDrift(params) as T;
+  }
+
+  if (p === "/api/v1/safety/categories") {
+    const resp: SafetyCategoriesResponse = { categories: MOCK_SAFETY_CATEGORIES };
+    return resp as T;
+  }
+
+  if (p === "/api/v1/safety/scans") {
+    const scans = getMockSafetyScans();
+    const resp: SafetyScansResponse = { scans, total: scans.length };
+    return resp as T;
+  }
+
+  if ((m = /^\/api\/v1\/safety\/scans\/([^/]+)$/.exec(p))) {
+    const report = getMockSafetyReport(m[1]);
+    if (!report) throw new ApiError(404, "safety scan not found");
+    return report as T;
+  }
+
+  // ── AI Gateway routes (Trilha D) ──
+  if (p === "/api/v1/gateway/stats") {
+    const stats: GatewayStatsResponse = getMockGatewayStats();
+    return stats as T;
+  }
+
+  if (p === "/api/v1/gateway/providers") {
+    const providers = getMockGatewayProviders();
+    const resp: GatewayProvidersResponse = { providers, total: providers.length };
+    return resp as T;
+  }
+
+  if (p === "/api/v1/gateway/logs") {
+    const resp: GatewayLogsResponse = getMockGatewayLogs(params);
+    return resp as T;
+  }
+
+  if (p === "/api/v1/gateway/rules") {
+    const rules = getMockGatewayRules();
+    const resp: GatewayRulesResponse = { rules, total: rules.length };
+    return resp as T;
+  }
+
+
+  if (p === "/api/v1/auth/me") {
+    return {
+      is_api_key: false,
+      user: {
+        id: "user-admin-01",
+        email: "admin@matrix.local",
+        name: "Matrix Admin",
+      },
+      current_project: {
+        id: "proj-default",
+        name: "default",
+        role: "admin",
+      },
+      projects: [
+        {
+          id: "proj-default",
+          name: "default",
+          role: "admin",
+        },
+      ],
+    } as T;
+  }
+
+  const sotaResult = sotaGet(p, params);
+  if (sotaResult !== undefined) return sotaResult as T;
+
   const evalResult = evalGet(p);
   if (evalResult !== undefined) return evalResult as T;
 
@@ -132,6 +230,9 @@ export async function mockGet<T>(path: string, params: Params = {}, ctx?: MockCt
 
   const opsResult = opsGet(p, params);
   if (opsResult !== undefined) return opsResult as T;
+
+  const mlopsResult = mlopsGet(p, params);
+  if (mlopsResult !== undefined) return mlopsResult as T;
 
   throw new ApiError(404, `mock: no handler for GET ${path}`);
 }
@@ -144,7 +245,15 @@ export async function mockSend<T>(method: string, path: string, body?: unknown, 
     const authed = authSend(ctx, m, p, body);
     if (authed !== undefined) return authed as T;
   }
-  const out = evalSend(m, p, body) ?? opsSend(m, p, body) ?? runsSend(m, p, body);
+  if (m === "POST" && p === "/api/v1/safety/scans") {
+    return createMockSafetyScan(body as CreateSafetyScanRequest) as T;
+  }
+  const out =
+    evalSend(m, p, body) ??
+    opsSend(m, p, body) ??
+    runsSend(m, p, body) ??
+    sotaSend(m, p, body) ??
+    mlopsSend(m, p, body);
   if (out === undefined) throw new ApiError(404, `mock: no handler for ${method} ${path}`);
   return out as T;
 }

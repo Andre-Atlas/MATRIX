@@ -3,6 +3,7 @@
 import { ApiError } from "./api-error";
 import { cellKey, summarizeMatrix, toSummaryRecord } from "./eval-matrix";
 import { MOCK_RAG_TRACE_ID, mockDb } from "./mock-data";
+import { MOCK_DATASET_VERSIONED_ITEMS } from "./sota-mocks";
 import {
   METRIC_TYPES,
   MODEL_PROVIDERS,
@@ -440,6 +441,12 @@ function seed(now: number): Store {
       description: "Failed support-agent runs promoted from the annotation queue",
       created_at: iso(now - 2 * day),
     },
+    {
+      id: "ds-sota-multimodal",
+      name: "sota-multimodal",
+      description: "Zero-copy LakeFS branched multimodal dataset with images, audio, PDF and diffs",
+      created_at: iso(now - 1 * day),
+    },
   );
 
   const db = mockDb(now);
@@ -452,6 +459,7 @@ function seed(now: number): Store {
     const src = s.source !== undefined ? ragTraces[s.source] : undefined;
     const gen = src?.spans.find((x) => x.name === "generate") ?? src?.spans[0];
     const id = `item_${String(i + 1).padStart(2, "0")}`;
+    const sampleMedia = MOCK_DATASET_VERSIONED_ITEMS[i]?.media;
     store.items.push({
       id,
       dataset_id: MOCK_DATASET_ID,
@@ -461,9 +469,25 @@ function seed(now: number): Store {
       metadata: { topic: ["latency", "gateway", "sdk", "evals", "evals", "flywheel"][i] },
       source_trace_id: src && gen ? src.summary.trace_id : null,
       source_span_id: src && gen ? gen.span_id : null,
+      media: sampleMedia,
       created_at: iso(now - 6 * day + i * 3_600_000),
     });
     store.scripts.set(id, s.script);
+  });
+
+  MOCK_DATASET_VERSIONED_ITEMS.forEach((it) => {
+    store.items.push({
+      id: it.id,
+      dataset_id: "ds-sota-multimodal",
+      input: it.input,
+      expected_output: it.expected_output,
+      context: it.context,
+      metadata: it.metadata,
+      source_trace_id: null,
+      source_span_id: null,
+      media: it.media,
+      created_at: it.created_at,
+    });
   });
 
   const items = store.items.filter((x) => x.dataset_id === MOCK_DATASET_ID);

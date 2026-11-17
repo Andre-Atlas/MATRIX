@@ -58,9 +58,18 @@ class Document(BaseModel):
 
 
 class Media(BaseModel):
-    kind: Literal["image", "audio", "file"]
+    kind: Literal["image", "audio", "pdf", "bbox", "mask", "text_diff", "file"]
     url: str
     mime: str | None = None
+    artifact_id: str | None = None
+    sha256: str | None = None
+    width: int | None = None
+    height: int | None = None
+    page: int | None = None
+    duration_ms: float | None = None
+    boxes: list[dict[str, Any]] | None = None
+    mask_uri: str | None = None
+    diff: dict[str, Any] | None = None
 
 
 class ToolInfo(BaseModel):

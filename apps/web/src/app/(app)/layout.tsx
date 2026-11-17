@@ -16,6 +16,14 @@ const NAV = [
   { href: "/datasets", label: "Datasets" },
   { href: "/experiments", label: "Experiments" },
   { href: "/runs", label: "Runs" },
+  // Modules merged from main (ADR-013): integration in progress (T3/T4/T9).
+  { href: "/training", label: "Training" },
+  { href: "/models", label: "Models" },
+  { href: "/benchmarks", label: "Benchmarks" },
+  { href: "/sandboxes", label: "Sandboxes" },
+  { href: "/vectors", label: "Vector Space" },
+  { href: "/safety", label: "Safety & OWASP" },
+  { href: "/gateway", label: "AI Gateway" },
   { href: "/annotations", label: "Annotations" },
   { href: "/alerts", label: "Alerts" },
 ];

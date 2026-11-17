@@ -6,7 +6,7 @@ import logging
 import os
 import threading
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
 import httpx
@@ -18,6 +18,12 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcess
 
 from . import tracing
 from .prompts import Prompt
+
+if TYPE_CHECKING:
+    from .benchmarks import BenchmarksClient
+    from .datasets import DatasetsClient
+    from .mlops import MLOpsClient, TrainingRun
+    from .sandboxes import SandboxesClient
 
 DEFAULT_ENDPOINT = "http://localhost:8000"
 
@@ -35,6 +41,13 @@ def _seg(value: Any) -> str:
     return quote(str(value), safe="")
 
 
+def _clean_no_proxy() -> None:
+    for var in ("NO_PROXY", "no_proxy"):
+        val = os.environ.get(var)
+        if val and "[::1]" in val:
+            os.environ[var] = ",".join(p.strip() for p in val.split(",") if p.strip() != "[::1]")
+
+
 class MatrixClient:
     def __init__(
         self,
@@ -48,6 +61,7 @@ class MatrixClient:
         owns_provider: bool = True,
         span_processors: list[SpanProcessor] | None = None,
     ) -> None:
+        _clean_no_proxy()
         self.api_key = api_key
         self.endpoint = endpoint.rstrip("/")
         self.project_name = project_name
@@ -65,6 +79,10 @@ class MatrixClient:
         self._refreshing: set[tuple] = set()
         self._threads: list[threading.Thread] = []
         self._lock = threading.Lock()
+        self._mlops: MLOpsClient | None = None
+        self._benchmarks: BenchmarksClient | None = None
+        self._sandboxes: SandboxesClient | None = None
+        self._datasets: DatasetsClient | None = None
 
     # -- lifecycle
     def shutdown(self) -> None:
@@ -167,6 +185,7 @@ class MatrixClient:
         input: dict | Any,
         expected_output: str | None = None,
         context: list[str] | None = None,
+        media: list[dict[str, Any]] | None = None,
         metadata: dict | None = None,
     ) -> dict:
         body: dict[str, Any] = {"input": input}
@@ -174,6 +193,8 @@ class MatrixClient:
             body["expected_output"] = expected_output
         if context is not None:
             body["context"] = context
+        if media is not None:
+            body["media"] = media
         if metadata is not None:
             body["metadata"] = metadata
         return self._request("POST", f"/api/v1/datasets/{_seg(dataset_id)}/items", json=body)
@@ -184,6 +205,53 @@ class MatrixClient:
         from .tracking import start_run
 
         return start_run(*args, client=self, **kwargs)
+
+    # -- datasets (versioning, from main)
+    @property
+    def datasets(self) -> DatasetsClient:
+        if self._datasets is None:
+            with self._lock:
+                if self._datasets is None:
+                    from .datasets import DatasetsClient
+
+                    self._datasets = DatasetsClient(self)
+        return self._datasets
+
+    # -- benchmarks
+    @property
+    def benchmarks(self) -> BenchmarksClient:
+        if self._benchmarks is None:
+            with self._lock:
+                if self._benchmarks is None:
+                    from .benchmarks import BenchmarksClient
+
+                    self._benchmarks = BenchmarksClient(self)
+        return self._benchmarks
+
+    # -- sandboxes
+    @property
+    def sandboxes(self) -> SandboxesClient:
+        if self._sandboxes is None:
+            with self._lock:
+                if self._sandboxes is None:
+                    from .sandboxes import SandboxesClient
+
+                    self._sandboxes = SandboxesClient(self)
+        return self._sandboxes
+
+    # -- mlops
+    @property
+    def mlops(self) -> MLOpsClient:
+        if self._mlops is None:
+            with self._lock:
+                if self._mlops is None:
+                    from .mlops import MLOpsClient
+
+                    self._mlops = MLOpsClient(self)
+        return self._mlops
+
+    def register_model(self, name: str, **kwargs: Any) -> dict[str, Any]:
+        return self.mlops.register_model(name, **kwargs)
 
     @staticmethod
     def current_trace_id() -> str | None:

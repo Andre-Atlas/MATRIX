@@ -48,7 +48,11 @@ function sessionExpired() {
   window.location.assign(`/api/auth/expired?next=${encodeURIComponent(here)}`);
 }
 
-export async function proxy<T>(method: "GET" | "POST" | "PATCH" | "DELETE", path: string, body?: unknown): Promise<T> {
+export async function proxy<T>(
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE",
+  path: string,
+  body?: unknown,
+): Promise<T> {
   let res: Response;
   try {
     res = await fetch(`/api/proxy/${path.replace(/^\/+/, "")}`, {
