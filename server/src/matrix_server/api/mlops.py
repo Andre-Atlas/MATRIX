@@ -1244,8 +1244,15 @@ def presign_artifact_upload(
     return out
 
 
+def _token_key_in_project(key: str, project_id: str) -> None:
+    """T2 hardening: the signed token alone is not enough; the caller must also be authenticated in
+    the project that owns the object key (keys are `projects/<project_id>/blobs/...`)."""
+    if not key.startswith(f"projects/{project_id}/"):
+        raise HTTPException(status_code=404, detail="artifact blob not found")
+
+
 @router.put("/artifacts/local/{token}")
-async def upload_local_artifact(token: str, request: Request) -> dict[str, Any]:
+async def upload_local_artifact(token: str, request: Request, ctx: MemberAuth) -> dict[str, Any]:
     artifact_store = request.app.state.mlops_artifact_store
     if not isinstance(artifact_store, LocalFSArtifactStore):
         raise HTTPException(status_code=404, detail="local artifact store not enabled")
@@ -1254,6 +1261,7 @@ async def upload_local_artifact(token: str, request: Request) -> dict[str, Any]:
         key = artifact_store.verify_local_token(token, expected_op="put")
     except ValueError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    _token_key_in_project(key, ctx.project_id)
 
     max_bytes = request.app.state.settings.max_artifact_bytes
 
@@ -1280,7 +1288,7 @@ async def upload_local_artifact(token: str, request: Request) -> dict[str, Any]:
 
 
 @router.get("/artifacts/local/{token}")
-def download_local_artifact(token: str, request: Request) -> FileResponse:
+def download_local_artifact(token: str, request: Request, ctx: ViewerAuth) -> FileResponse:
     artifact_store = request.app.state.mlops_artifact_store
     if not isinstance(artifact_store, LocalFSArtifactStore):
         raise HTTPException(status_code=404, detail="local artifact store not enabled")
@@ -1289,6 +1297,7 @@ def download_local_artifact(token: str, request: Request) -> FileResponse:
         key = artifact_store.verify_local_token(token, expected_op="get")
     except ValueError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    _token_key_in_project(key, ctx.project_id)
 
     try:
         path = artifact_store.read_local_blob_path(key)
