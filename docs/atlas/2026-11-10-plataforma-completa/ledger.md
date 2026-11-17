@@ -61,3 +61,10 @@ Formato: `T<n> · [tag] · C<n> → modelo/esforço (papel)`.
 ## Reconciliação com o main (2026-11-17)
 
 - Decisões do usuário após `docs/atlas/2026-11-17-reconciliacao/analise.md`: (1) **branch como base**, módulos do `main` portados sobre ele com correções de segurança obrigatórias; (2) **simulação rotulada agora, motores reais depois** (`simulated=true`; sandbox só com Docker, falha fechada). Plano e tabela de custo em `docs/atlas/2026-11-17-reconciliacao/plan.md` — aguardando Gate 1.
+
+## E0 — gate do Docker (2026-11-17), plano de integração aprovado
+
+- Aprovação do usuário: "o docker não estava aberto antes, teste agr; caso passe, está aprovado".
+- Resultado: `dockerd` iniciado manualmente (Docker 29.9.2, overlayfs, cgroup v1) responde. **Provado:** container simples roda; com as flags do sandbox (`--network none --read-only --user 65534:65534 --cap-drop ALL --no-new-privileges --pids-limit 128 --memory 256m --cpus 1 --tmpfs /tmp`) o processo roda como uid 65534, **escrita em `/etc` bloqueada**, `/tmp` (tmpfs) permitido, estourar 256 MB **mata o processo (exit 137)**, `--network none` deixa só a interface `lo`; sem as flags o mesmo código roda como root e escreve em `/etc` (controle). `docker compose config` com `deploy/.env.example` renderiza os 5 serviços. Imagens `server` e `web` **constroem**; a do servidor roda como uid 10001 e tem `matrix-api`, `matrix-worker`, `matrix-admin` e `alembic` (head 0004).
+- Ressalvas: (1) neste ambiente o TLS é interceptado por proxy; os builds só passam com a CA do proxy injetada numa cópia do Dockerfile (feito no rascunho, o repositório não muda) — em CI/host normal não é necessário; (2) o teste de rede do sandbox só é conclusivo pela lista de interfaces (`lo` vs `lo, eth0`), porque a saída direta é bloqueada aqui mesmo sem flags; (3) `docker pull` esbarrou uma vez em 429 do Docker Hub (transitório).
+- Ruling: Docker passa a ser usado de verdade neste ciclo: sandbox real (T7), `compose up` e builds (T11), RustFS como S3 de teste (pendência S3 do G0). Continua não validado: GPU/NVML e os motores reais.
