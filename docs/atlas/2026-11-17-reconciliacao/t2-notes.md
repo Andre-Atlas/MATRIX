@@ -37,7 +37,7 @@ Merge: `0883369` (`merge: origin/main (4d05086) no branch, branch como base (ADR
 - Sem nenhuma autenticação no `main`: `PUT` e `GET /api/v1/mlops/artifacts/local/{token}` (só o token HMAC, assinado com `jwt_secret` público). Agora exigem MEMBER/VIEWER e que a chave do objeto pertença ao projeto do chamador (o SDK já manda o `Authorization` nas URLs internas).
 - Inventário (script sobre `app.routes`): 65 rotas dos routers do `main`, todas com `require(...)`; nenhuma de escrita com VIEWER. `tests/test_rbac.py::test_every_mutating_route_declares_rbac` passa sem exceções novas.
 
-## Testes do `main` que falham (não apagados, não marcados skip)
+## Testes do `main` que falham (não apagados, não marcados skip) — resolvido na T3, ver abaixo
 
 Suíte com Postgres+ClickHouse: rodar com `--continue-on-collection-errors`, porque 4 módulos do `main` não importam (abaixo). Total do `main`: 149 coletados → 131 passam, 10 falham, 8 erros de fixture, + 4 módulos com erro de importação.
 
@@ -62,3 +62,18 @@ Web: nenhum teste do `main` depende de JWT/cookie por JS (o único código assim
 - Tabelas do `main` (`safety_scans`, `mlops_*`, `benchmark_*`, `sandbox_*`) têm `project_id` sem FK para `projects`: o purge de projeto do branch não as apaga (órfãos) — T3/T4.
 - `evals/providers.py` do `main` (auto-merge) muda `NO_PROXY` do processo em cada chamada (`_clean_no_proxy`): rever em T8/T12.
 - Sandbox `local_sandbox` (RCE no host) e demais riscos da análise §3 seguem no código, só atrás de `require(MEMBER)`: T7/T8. Nada disso deve ir a produção antes do Gate 2.
+
+## Resolvido na T3
+
+- **Compat removida:** `AuthContext`, `require_role`, `current_auth_context`, `COMPAT_ROLE_NAMES` (auth.py) e `ProjectMember` (models.py) apagados. `api/{benchmarks,datasets,gateway,mlops,safety,sandboxes,vectors}.py` usam `Depends(require(Role.X))` e `Principal`; autoria (`created_by`, autor de commit) = `principal.actor_id`. `mlops._require_admin` → `ensure_role(principal, Role.ADMIN)` (owner também passa; chave de API nunca). Arquivar versão de modelo passou a exigir ADMIN, como promover a `production` (`ADMIN_ONLY_STAGES`).
+- **Sandbox:** a rede é aprovada pelo `Principal` ADMIN; a API grava `sandbox_policy.network_approved_by` (id do aprovador) e recusa com 422 as chaves `is_admin`/`network_approved_by` vindas do cliente; o worker deriva `is_admin` só de `network_approved_by` (antes lia `sandbox_policy["is_admin"]`, que o cliente podia mandar).
+- **Testes do `main`:** todos reescritos sobre `tests/rbac_helpers.py` (`project_with_roles`, `api_key_headers`), sem skip: `test_benchmarks_api`, `test_mlops_api`, `test_sandboxes_api`, `test_ai_gateway`, `test_safety_scanner`, `test_dataset_versioning` (registro → 404/405), `test_mlops_artifacts` (`Settings` com os nomes do branch). `test_auth_rbac.py` reescrito: testava PBKDF2/JWT/`register`/`project_members` do `main` (descartados; login, sessões e membros já estão em `test_rbac.py`); agora cobre a matriz de papéis dos módulos do `main`, estágios/aliases/delete de modelo, rede de sandbox e a ausência dos fluxos antigos. `test_rbac.py` ganhou `test_every_route_is_authenticated_except_the_public_ones`.
+- **Tokens de artefato do MLOps:** `MATRIX_ARTIFACT_TOKEN_SECRET` obrigatório fora de `MATRIX_ENV=test` (novo `Settings.env`, padrão `production`; ≥ 32 caracteres em produção): `create_app` e `matrix-worker` falham na partida com `ConfigError`. Token amarrado a projeto (`pid`), objeto e operação, com `exp`; HMAC comparado com `hmac.compare_digest`. `tests/conftest.py` define `MATRIX_ENV=test`; `make dev-api` e `scripts/verify_mvp.py` usam `dev` + segredo aleatório; compose (api e worker, via âncora) exige o segredo.
+- **Órfãos:** o sweep genérico de `projects.delete_project` já cobre todas as tabelas do `main` (todas têm `project_id`; só `users`, `web_sessions`, `login_*` e `projects` não têm). Teste `test_project_delete_main_modules.py` (SQLite e PostgreSQL).
+- **`_clean_no_proxy`:** removido do servidor e do SDK; `matrix_server/net.py` (cópia em `matrix_sdk/_net.py`) lê o ambiente de proxy, ignora entradas inválidas (o `[::1]` que quebra o httpx 0.28) e passa `mounts` explícitos com `trust_env=False`, sem tocar em `os.environ`.
+
+## Ainda aberto (T4 ou depois)
+
+- Fora do banco, o purge de projeto não apaga os pontos do `training_metric_store` nem os blobs de `artifact_local_dir/mlops` (o `mlops_artifact_store`): somem quando T4 fundir mlops em `runs`/`metric_store`/`artifacts`. Logs e cache do gateway ficam em memória por processo; `GET /gateway/stats|providers|rules` são globais, não por projeto.
+- Aliases de leitura em `config.py` (`artifact_store`, `artifact_dir`, `artifact_presign_ttl_seconds`) e `Artifact = MlopsArtifact` ficam para T4 (somem com o store do `main`).
+- Outros `httpx.Client` sem `client_kwargs` (benchmarks runner, S3 HEAD do mlops, SDK mlops S3/externo) continuam sujeitos ao bug do `[::1]` no `NO_PROXY` (falham, não mutam o ambiente).
