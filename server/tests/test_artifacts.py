@@ -1021,14 +1021,14 @@ def test_s11_local_put_refuses_a_file_changed_before_rename(tmp_path, monkeypatc
     from matrix_server.artifacts import local as local_mod
 
     store = LocalArtifactStore(tmp_path / "blobs")
-    real_replace = os.replace
+    real_link = os.link  # the blob is published with an atomic, non-overwriting hard link (T3)
 
-    def tampering_replace(src, dst):
+    def tampering_link(src, dst):
         with open(src, "r+b") as f:  # another writer changes the temp file after it was hashed
             f.write(b"forged!!")
-        real_replace(src, dst)
+        real_link(src, dst)
 
-    monkeypatch.setattr(local_mod.os, "replace", tampering_replace)
+    monkeypatch.setattr(local_mod.os, "link", tampering_link)
     data = os.urandom(4000)
     with pytest.raises(ArtifactStoreError):
         store.put("p1", io.BytesIO(data), max_bytes=10_000)

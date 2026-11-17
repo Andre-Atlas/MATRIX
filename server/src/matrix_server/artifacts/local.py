@@ -38,6 +38,14 @@ from matrix_server.artifacts import (
 TMP_DIR = ".tmp"
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while chunk := fh.read(1 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _same_file(st: os.stat_result, written: os.stat_result, size: int) -> bool:
     return (
         st.st_ino == written.st_ino
@@ -117,9 +125,21 @@ class LocalArtifactStore:
             before = tmp.stat()
             if not _same_file(before, written, size):
                 raise ArtifactStoreError("temporary file changed while it was being stored")
-            os.replace(tmp, final)
+            # Hard link instead of replace: atomic and never overwrites, so a concurrent upload of the
+            # same blob (same sha, same key) cannot swap the file under us; the loser keeps the winner's.
+            try:
+                os.link(tmp, final)
+            except FileExistsError:
+                tmp.unlink(missing_ok=True)
+                os.utime(final)
+                return BlobInfo(sha, size, created=False)
+            tmp.unlink(missing_ok=True)
             after = final.stat()
-            if not _same_file(after, written, size):
+            if not _same_file(after, written, size) and not (
+                # A concurrent dedup upload of the same blob touches its mtime (GC grace); that is
+                # fine as long as the published file still has exactly the hashed content.
+                after.st_ino == written.st_ino and after.st_size == size and _file_sha256(final) == sha
+            ):
                 final.unlink(missing_ok=True)
                 raise ArtifactStoreError("blob changed while it was being stored")
             return BlobInfo(sha, size, created=True)
