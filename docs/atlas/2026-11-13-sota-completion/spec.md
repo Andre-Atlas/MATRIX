@@ -1,6 +1,6 @@
 # Especificação Técnica: SOTA Completion (Benchmarks, Inspect AI Sandboxes, Zero-Copy Data Versioning & Multimodal Tables)
 
-- **ADR:** `docs/adr/007-benchmarks-sandboxes-e-data-versioning.md`
+- **ADR:** `docs/adr/015-benchmarks-sandboxes-e-data-versioning.md`
 - **Migration:** `0006_sota_completion.py` (revises `0005`)
 - **Compatibilidade:** SQLite 3.x (dev/tests) + PostgreSQL 14+ (produção)
 

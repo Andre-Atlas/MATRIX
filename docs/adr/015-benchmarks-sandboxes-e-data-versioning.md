@@ -1,4 +1,4 @@
-# ADR-007: Pluggable Benchmarks, Inspect AI Sandboxes, Zero-Copy Data Versioning e Multimodal Tables
+# ADR-015: Pluggable Benchmarks, Inspect AI Sandboxes, Zero-Copy Data Versioning e Multimodal Tables
 
 - **Status:** Proposed
 - **Data:** 2026-11-14

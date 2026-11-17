@@ -1,6 +1,6 @@
 # MATRIX — Plano de Implementação: MLOps Studio + Higiene Alembic
 
-Spec: [spec.md](spec.md) · Design Brief: [design-brief.md](design-brief.md) · ADR: [docs/adr/006-mlops-tracking-e-model-registry.md](../../adr/006-mlops-tracking-e-model-registry.md) · Ledger: [ledger.md](ledger.md)
+Spec: [spec.md](spec.md) · Design Brief: [design-brief.md](design-brief.md) · ADR: [docs/adr/014-mlops-tracking-e-model-registry.md](../../adr/014-mlops-tracking-e-model-registry.md) · Ledger: [ledger.md](ledger.md)
 
 Classificação: `ATLAS · feature · arquitetura+dados+design+produto · large → pesquisa, descoberta, plano (+ADR), G1, SDD, revisão (+adversarial+segurança), verificação, G2, aprendizado · lanes: design, arquitetura`
 

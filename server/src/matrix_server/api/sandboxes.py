@@ -1,4 +1,4 @@
-"""Inspect AI Sandboxes API (ADR-007).
+"""Inspect AI Sandboxes API (ADR-015).
 
 Provides endpoints for creating, monitoring, inspecting transcripts, and cancelling
 Inspect AI agent sandbox runs with strict multi-tenant isolation, RBAC, anti-NaN

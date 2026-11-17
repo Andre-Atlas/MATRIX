@@ -11,6 +11,20 @@ Spec do MVP: [docs/atlas/2026-11-09-plataforma-mvp/spec.md](docs/atlas/2026-11-0
 - `apps/web/` — interface Next.js (App Router, Tailwind).
 - `deploy/compose.yaml` — ClickHouse, PostgreSQL, API, worker e web (sem S3: artefatos no volume local; veja `deploy/.env.example`).
 
+## Módulos vindos do `main` (integração em andamento)
+
+O `main` foi integrado neste branch com o branch como base ([ADR-013](docs/adr/013-reconciliacao-main-branch.md)). Os módulos abaixo já estão no código, mas **ainda não foram portados** para o RBAC (`require(...)`), para `runs`/`run_metrics`/`artifacts` nem para as correções de segurança obrigatórias; não use em produção até o fim do ciclo de integração ([plano](docs/atlas/2026-11-17-reconciliacao/plan.md)).
+
+| Módulo | API | Web | Situação |
+|---|---|---|---|
+| MLOps (treino, sweeps, artefatos, linhagem, registry) — [ADR-014](docs/adr/014-mlops-tracking-e-model-registry.md) | `/api/v1/mlops/*` | `/training`, `/models` | integração em andamento (T3, T4, T5, T6) |
+| Versionamento de datasets (branches, commits, diff, merge) — [ADR-015](docs/adr/015-benchmarks-sandboxes-e-data-versioning.md) | `/api/v1/datasets/{id}/branches…` | `/datasets` | integração em andamento (T6) |
+| Benchmarks (`local_sim` simulado) | `/api/v1/benchmarks/*` | `/benchmarks` | integração em andamento (T7) |
+| Sandboxes | `/api/v1/sandboxes/*` | `/sandboxes` | integração em andamento (T7: Docker obrigatório, falha fechada) |
+| Vetores e drift (embedding por hash, simulado) | `/api/v1/vectors/*` | `/vectors` | integração em andamento (T8) |
+| Safety / red-team heurístico | `/api/v1/safety/*` | `/safety` | integração em andamento (T8) |
+| AI Gateway | `/api/v1/gateway/*` | `/gateway` | integração em andamento (T8) |
+
 ## Execução
 
 > **Não validado nesta rodada:** o store S3 real (`MATRIX_ARTIFACT_BACKEND=s3`, `MATRIX_S3_*`) e o

@@ -1,4 +1,4 @@
-# ADR-006: Arquitetura do Módulo MLOps Studio (Tracking de Treino, Sweeps e Model/LoRA Registry)
+# ADR-014: Arquitetura do Módulo MLOps Studio (Tracking de Treino, Sweeps e Model/LoRA Registry)
 
 Status: proposto · 2026-11-13
 

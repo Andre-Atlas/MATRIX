@@ -1,6 +1,6 @@
 # MATRIX — Plano de Implementação: SOTA Completion (Benchmarks, Inspect AI Sandboxes, Zero-Copy Data Versioning & Multimodal Tables)
 
-Spec: [spec.md](spec.md) · Design Brief: [design-brief.md](design-brief.md) · ADR: [docs/adr/007-benchmarks-sandboxes-e-data-versioning.md](../../adr/007-benchmarks-sandboxes-e-data-versioning.md) · Ledger: [ledger.md](ledger.md)
+Spec: [spec.md](spec.md) · Design Brief: [design-brief.md](design-brief.md) · ADR: [docs/adr/015-benchmarks-sandboxes-e-data-versioning.md](../../adr/015-benchmarks-sandboxes-e-data-versioning.md) · Ledger: [ledger.md](ledger.md)
 
 Classificação: `ATLAS · feature · arquitetura+dados+design+produto · large → pesquisa, descoberta, plano (+ADR), G1, SDD, revisão (+adversarial+segurança), verificação, G2, aprendizado · lanes: design, arquitetura`
 

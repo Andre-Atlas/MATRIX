@@ -11,6 +11,25 @@ export { ApiError, isNotFound } from "./api-error";
 
 const base = apiBase;
 
+/** Normalises an API base URL (from `main`): trims, drops trailing slashes and a trailing
+ * `/api/v1` or `/api`. Pure helper; the requests below still use `apiBase` (T9 reconciles). */
+export function cleanBaseUrl(raw?: string): string {
+  let b = (raw ?? process.env.MATRIX_API_URL ?? "http://localhost:8000").trim();
+  b = b.replace(/\/+$/, "");
+  b = b.replace(/\/api\/v1$/, "").replace(/\/api$/, "");
+  return b;
+}
+
+/** `${cleanBaseUrl()}${path}` with the defined, non-empty params as query string (from `main`). */
+export function buildApiUrl(path: string, params?: Record<string, string | number | undefined>): URL {
+  const cleanPath = path.startsWith("/") ? path : `/${path}`;
+  const url = new URL(`${cleanBaseUrl()}${cleanPath}`);
+  for (const [k, v] of Object.entries(params ?? {})) {
+    if (v !== undefined && v !== "") url.searchParams.set(k, String(v));
+  }
+  return url;
+}
+
 /** Routes that work without a project (`/auth/*`, `/projects`): the project header is not sent. */
 const NO_PROJECT = /^\/api\/v1\/(auth\/|projects$)/;
 
