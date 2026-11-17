@@ -96,6 +96,10 @@ class MetricStore(Protocol):
         """Value at the last step of every non-`sys/` key (first `max_keys` keys by name) per run."""
         ...
 
+    def last_steps(self, project_id: str, run_ids: Sequence[str]) -> dict[str, int]:
+        """Highest step of any non-`sys/` key per run (runs without such points are absent)."""
+        ...
+
     def delete_run(self, project_id: str, run_id: str) -> None: ...
 
     def delete_project(self, project_id: str) -> None:
@@ -256,6 +260,15 @@ class MemoryMetricStore:
                 names = sorted(k for k, v in run.items() if v and not k.startswith(SYS_PREFIX))[:max_keys]
                 if names:
                     out[run_id] = {k: finite_or_none(run[k][max(run[k])][0]) for k in names}
+        return out
+
+    def last_steps(self, project_id: str, run_ids: Sequence[str]) -> dict[str, int]:
+        out: dict[str, int] = {}
+        with self._lock:
+            for run_id in dict.fromkeys(run_ids):
+                steps = [max(v) for k, v in self._run(project_id, run_id).items() if v and not k.startswith(SYS_PREFIX)]
+                if steps:
+                    out[run_id] = max(steps)
         return out
 
     def delete_run(self, project_id: str, run_id: str) -> None:
@@ -537,6 +550,20 @@ SETTINGS index_granularity = 8192
         for run_id, key, value in rows:
             out.setdefault(run_id, {})[key] = finite_or_none(value)
         return out
+
+    def last_steps(self, project_id: str, run_ids: Sequence[str]) -> dict[str, int]:
+        if not run_ids:
+            return {}
+        rows = self._rows(  # max(step) needs no dedup: a replaced point keeps its step
+            f"""
+            SELECT run_id, max(step) FROM {self.table}
+            WHERE project_id = {{project_id:String}} AND run_id IN {{run_ids:Array(String)}}
+              AND NOT startsWith(key, {{sys:String}})
+            GROUP BY run_id
+            """,
+            {"project_id": project_id, "run_ids": list(dict.fromkeys(run_ids)), "sys": SYS_PREFIX},
+        )
+        return {run_id: int(step) for run_id, step in rows}
 
 
 def build_metric_store(settings: Settings) -> MetricStore:

@@ -45,6 +45,10 @@ class Run(Base):
     git: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     env: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     dataset_version_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Kind of training (sft, lora, dpo, classic_ml, ...) and base model: free metadata from `main`'s
+    # MLOps runs (migration 0008); null for runs created by the G1 API.
+    run_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    base_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
     sweep_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     parent_run_id: Mapped[str | None] = mapped_column(
         String(32), ForeignKey("runs.id", ondelete="SET NULL"), nullable=True

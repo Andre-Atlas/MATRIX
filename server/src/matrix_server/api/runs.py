@@ -247,6 +247,11 @@ def _parse(model: type[BaseModel], payload: Any) -> Any:
         ) from exc
 
 
+def capacity_http(exc: service.CapacityError) -> HTTPException:
+    headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after else None
+    return HTTPException(status_code=exc.status_code, detail=exc.detail, headers=headers)
+
+
 def _store(request: Request) -> MetricStore:
     return request.app.state.metric_store
 
@@ -356,36 +361,20 @@ def create_run(
 ) -> RunOut:
     body: RunCreate = _parse(RunCreate, payload if payload is not None else {})
     project_id = principal.project_id
-    settings = request.app.state.settings
-    total = db.scalar(select(func.count()).select_from(Run).where(Run.project_id == project_id)) or 0
-    if total >= settings.max_runs_per_project:
-        raise HTTPException(
-            status_code=409,
-            detail=f"project reached its limit of {settings.max_runs_per_project} runs; delete runs to create more",
-        )
-    active = db.scalar(
-        select(func.count()).select_from(Run).where(Run.project_id == project_id, Run.status == "running")
-    ) or 0
-    if active >= settings.max_active_runs_per_project:
-        raise HTTPException(
-            status_code=429,
-            detail=f"project has {active} running runs (limit {settings.max_active_runs_per_project})",
-            headers={"Retry-After": "60"},
-        )
+    try:
+        total = service.check_capacity(db, request.app.state.settings, project_id)
+    except service.CapacityError as exc:
+        raise capacity_http(exc) from None
     if body.parent_run_id is not None and db.scalar(
         select(Run.id).where(Run.id == body.parent_run_id, Run.project_id == project_id)
     ) is None:
         raise HTTPException(status_code=422, detail="parent run not found")
-    name = body.name
-    if name is None:
-        name = generate_name(total + 1)
-    now = utcnow()
-    run = Run(
-        project_id=project_id,
-        name=name,
-        status="running",
+    run = service.new_run(
+        db,
+        project_id,
+        name=body.name if body.name is not None else generate_name(total + 1),
+        tags=body.tags or [],
         group=body.group,
-        tags=[],
         params=body.params or {},
         git=body.git.model_dump() if body.git else None,
         env=body.env.model_dump() if body.env else None,
@@ -393,16 +382,7 @@ def create_run(
         sweep_id=body.sweep_id,
         parent_run_id=body.parent_run_id,
         created_by=principal.user_id,
-        started_at=now,
-        heartbeat_at=now,
-        point_count=0,
-        key_counts={},
     )
-    db.add(run)
-    db.flush()
-    _set_tags(db, run, body.tags or [])
-    # Runs need the reaper; the worker keeps it rescheduled from then on.
-    service.ensure_reaper_scheduled(db)
     db.commit()
     return _run_out(run)
 
@@ -603,20 +583,8 @@ def log_metrics(
     now = utcnow()
     if not service.accepts_points(run, now):
         raise HTTPException(status_code=409, detail=f"run is {run.status}")
-    parsed, rejected = service.parse_points(body.points, now)
-    settings = request.app.state.settings
-    kept, capped = service.apply_point_caps(
-        run,
-        parsed,
-        max_per_run=settings.max_points_per_run,
-        max_per_key=settings.max_points_per_key,
-    )
-    if kept:
-        _store(request).insert(project_id, run.id, kept)
-        if run.status == "running":
-            run.heartbeat_at = now
+    kept, rejected = service.ingest_points(run, body.points, _store(request), request.app.state.settings, now)
     db.commit()
-    rejected = sorted(rejected + capped, key=lambda r: r.index)
     return {"accepted": len(kept), "rejected": [{"index": r.index, "reason": r.reason} for r in rejected]}
 
 

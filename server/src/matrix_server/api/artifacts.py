@@ -223,24 +223,33 @@ class UploadCreate(BaseModel):
     owner_id: str | None = None
 
 
-@router.post("/artifacts/uploads", status_code=201)
-def create_upload(body: UploadCreate, request: Request, principal: Member, db: DbSession) -> dict[str, Any]:
-    app = request.app
-    limits = _limits(app)
-    sha = body.sha256.lower()
-    try:
-        name = normalize_filename(body.filename)
-        media_type = normalize_media_type(body.media_type)
-        owner_kind, owner_id = normalize_owner(body.owner_kind, body.owner_id)
-        lock_quota(db, principal.project_id)  # held until get_db commits the reservation
-        check_quota_for(db, principal.project_id, sha, body.size, limits)
-    except ArtifactError as exc:
-        raise _http(exc) from None
+def reserve_upload(
+    db: Session,
+    app: Any,
+    principal: Principal,
+    *,
+    filename: str,
+    size: int,
+    sha256: str,
+    media_type: str | None = None,
+    owner_kind: str | None = None,
+    owner_id: str | None = None,
+    base_url: str,
+) -> tuple[Artifact, dict[str, Any]]:
+    """Reserve quota for a presigned upload: add a `pending` artifact (the caller commits) and
+    return it with the upload instructions (S3 presigned PUT, or the authenticated content route
+    `{base_url}/api/v1/artifacts/{id}/content` of the local backend). Raises `ArtifactError`."""
+    sha = sha256.lower()
+    name = normalize_filename(filename)
+    media_type = normalize_media_type(media_type)
+    owner_kind, owner_id = normalize_owner(owner_kind, owner_id)
+    lock_quota(db, principal.project_id)  # held until the caller commits the reservation
+    check_quota_for(db, principal.project_id, sha, size, _limits(app))
     artifact = Artifact(
         project_id=principal.project_id,
         name=name,
         media_type=media_type,
-        size=body.size,
+        size=size,
         sha256=sha,
         verified=False,
         status="pending",
@@ -252,11 +261,11 @@ def create_upload(body: UploadCreate, request: Request, principal: Member, db: D
     db.add(artifact)
     db.flush()
     ttl = min(app.state.settings.artifact_url_ttl_seconds, int(PENDING_TTL.total_seconds()))
-    presigned = get_store(app).presign_put(principal.project_id, sha, body.size, ttl, upload_id=artifact.id)
+    presigned = get_store(app).presign_put(principal.project_id, sha, size, ttl, upload_id=artifact.id)
     if presigned is None:
         upload = {
             "method": "PUT",
-            "url": f"{str(request.base_url).rstrip('/')}/api/v1/artifacts/{artifact.id}/content",
+            "url": f"{base_url}/api/v1/artifacts/{artifact.id}/content",
             "headers": {"Content-Type": "application/octet-stream"},
             "expires_at": iso(as_utc(artifact.created_at) + PENDING_TTL),
         }
@@ -267,6 +276,26 @@ def create_upload(body: UploadCreate, request: Request, principal: Member, db: D
             "headers": presigned.headers,
             "expires_at": iso(presigned.expires_at),
         }
+    return artifact, upload
+
+
+@router.post("/artifacts/uploads", status_code=201)
+def create_upload(body: UploadCreate, request: Request, principal: Member, db: DbSession) -> dict[str, Any]:
+    try:
+        artifact, upload = reserve_upload(
+            db,
+            request.app,
+            principal,
+            filename=body.filename,
+            size=body.size,
+            sha256=body.sha256,
+            media_type=body.media_type,
+            owner_kind=body.owner_kind,
+            owner_id=body.owner_id,
+            base_url=str(request.base_url).rstrip("/"),
+        )
+    except ArtifactError as exc:
+        raise _http(exc) from None
     return {"artifact": artifact_out(artifact), "upload": upload}
 
 

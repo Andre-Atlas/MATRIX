@@ -470,8 +470,8 @@ class SafetyScan(Base):
 class MLOpsSweep(Base):
     """Hyperparameter sweep configuration and status.
 
-    `best_run_id` intentionally has no FK to `mlops_training_runs` to avoid a circular FK
-    with `TrainingRun.sweep_id` and keep Alembic downgrades cleanly reversible.
+    `best_run_id` is a plain reference to `runs.id` (no FK, like `runs.sweep_id`), so a sweep and
+    its runs never form a circular FK.
     """
 
     __tablename__ = "mlops_sweeps"
@@ -494,60 +494,33 @@ class MLOpsSweep(Base):
     stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-class TrainingRun(Base):
-    """Training / fine-tuning / classic ML run metadata."""
+class ModelArtifact(Base):
+    """Versioned checkpoint / adapter / model metadata (`main`'s MLOps artifacts, T4).
 
-    __tablename__ = "mlops_training_runs"
+    Unique `name` + `version` per project, `pending_upload` -> `committed`, produced by a `runs`
+    row. The bytes are NOT here: `artifact_id` points at the G0 `artifacts` row whose blob the
+    artifact store holds (dedup, quota, verified sha256); an artifact registered by reference has
+    `external_uri` (s3/gs/hf/lakefs, never fetched) instead. `sha256`/`size_bytes` are the declared
+    values for an external URI and the verified ones once a blob upload is committed. A blob row
+    deleted through `DELETE /api/v1/artifacts/{id}` leaves `artifact_id` null (the metadata stays)."""
+
+    __tablename__ = "model_artifacts"
     __table_args__ = (
-        Index("ix_mlops_training_runs_project_status", "project_id", "status"),
-        Index("ix_mlops_training_runs_project_created", "project_id", "created_at"),
-    )
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
-    project_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
-    name: Mapped[str] = mapped_column(String(200), nullable=False)
-    run_type: Mapped[str] = mapped_column(String(32), nullable=False, default="sft")
-    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
-    base_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
-    dataset_id: Mapped[str | None] = mapped_column(
-        String(32), ForeignKey("datasets.id", ondelete="SET NULL"), nullable=True, index=True
-    )
-    sweep_id: Mapped[str | None] = mapped_column(
-        String(32), ForeignKey("mlops_sweeps.id", ondelete="SET NULL"), nullable=True, index=True
-    )
-    parent_run_id: Mapped[str | None] = mapped_column(
-        String(32), ForeignKey("mlops_training_runs.id", ondelete="SET NULL"), nullable=True, index=True
-    )
-    hyperparams: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
-    summary_metrics: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
-    hardware_info: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
-    classic_eval: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
-    tags: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
-    total_steps: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
-    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-
-
-class MlopsArtifact(Base):
-    """Versioned binary artifact (checkpoint, LoRA adapter, dataset, model) backed by S3/LocalFS/external."""
-
-    __tablename__ = "mlops_artifacts"
-    __table_args__ = (
-        UniqueConstraint("project_id", "name", "version", name="uq_mlops_artifacts_name_version"),
+        UniqueConstraint("project_id", "name", "version", name="uq_model_artifacts_name_version"),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     run_id: Mapped[str | None] = mapped_column(
-        String(32), ForeignKey("mlops_training_runs.id", ondelete="SET NULL"), nullable=True, index=True
+        String(32), ForeignKey("runs.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    artifact_id: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("artifacts.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    external_uri: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     kind: Mapped[str] = mapped_column(String(32), nullable=False, default="checkpoint")
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
-    storage_backend: Mapped[str] = mapped_column(String(16), nullable=False, default="local")
-    storage_uri: Mapped[str] = mapped_column(String(1000), nullable=False)
     sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     content_type: Mapped[str | None] = mapped_column(String(200), nullable=True)
@@ -555,10 +528,6 @@ class MlopsArtifact(Base):
     metadata_: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     committed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-
-
-# TEMPORARY compat for main's code — removed by T4 (`artifacts.models.Artifact` is the blob store).
-Artifact = MlopsArtifact
 
 
 class ArtifactLineage(Base):
@@ -629,10 +598,10 @@ class ModelVersion(Base):
     )
     version: Mapped[int] = mapped_column(Integer, nullable=False)
     artifact_id: Mapped[str | None] = mapped_column(
-        String(32), ForeignKey("mlops_artifacts.id", ondelete="SET NULL"), nullable=True, index=True
+        String(32), ForeignKey("model_artifacts.id", ondelete="SET NULL"), nullable=True, index=True
     )
     run_id: Mapped[str | None] = mapped_column(
-        String(32), ForeignKey("mlops_training_runs.id", ondelete="SET NULL"), nullable=True, index=True
+        String(32), ForeignKey("runs.id", ondelete="SET NULL"), nullable=True, index=True
     )
     eval_experiment_id: Mapped[str | None] = mapped_column(
         String(32), ForeignKey("experiments.id", ondelete="SET NULL"), nullable=True

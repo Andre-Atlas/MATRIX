@@ -5,6 +5,8 @@
 - `merge_params`: immutable params (equal value is a no-op, a different one is a conflict).
 - `artifact_exists` / `load_artifacts`: the only code that reads the G0 `artifacts` table.
 - `reap_stale_runs` and `ensure_reaper_scheduled`: the `runs.reaper` job and its self-rescheduling.
+- `check_capacity`, `new_run` and `ingest_points`: run creation and point ingestion shared by the
+  G1 API and the deprecated `/api/v1/mlops/runs*` adapters (one path, one set of caps).
 """
 
 from __future__ import annotations
@@ -34,8 +36,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Session
 
-from matrix_server.runs.models import Run
-from matrix_server.runs.store import MetricPoint
+from matrix_server.runs.models import Run, RunTag
+from matrix_server.runs.store import MetricPoint, MetricStore
 from matrix_server.storage import jobs
 from matrix_server.storage.db import as_utc, utcnow
 from matrix_server.storage.models import Job
@@ -176,6 +178,71 @@ def accepts_points(run: Run, now: datetime) -> bool:
         return True
     ended = as_utc(run.ended_at)
     return ended is not None and now - ended <= CLOSED_GRACE
+
+
+def ingest_points(
+    run: Run, raw: Sequence[Any], store: MetricStore, settings: Any, now: datetime
+) -> tuple[list[MetricPoint], list[Rejected]]:
+    """Validate a batch, apply the run's caps, write the kept points and refresh the heartbeat.
+    The caller holds the run's row lock, has checked `accepts_points` and commits. Returns (kept,
+    rejected sorted by index)."""
+    parsed, rejected = parse_points(raw, now)
+    kept, capped = apply_point_caps(
+        run, parsed, max_per_run=settings.max_points_per_run, max_per_key=settings.max_points_per_key
+    )
+    if kept:
+        store.insert(run.project_id, run.id, kept)
+        if run.status == "running":
+            run.heartbeat_at = now
+    return kept, sorted(rejected + capped, key=lambda r: r.index)
+
+
+# --------------------------------------------------------------------------- run creation
+
+
+class CapacityError(Exception):
+    def __init__(self, status_code: int, detail: str, retry_after: int | None = None) -> None:
+        super().__init__(detail)
+        self.status_code, self.detail, self.retry_after = status_code, detail, retry_after
+
+
+def check_capacity(session: Session, settings: Any, project_id: str) -> int:
+    """Raise `CapacityError` (409 total runs, 429 running runs) or return the project's run count."""
+    total = session.scalar(select(func.count()).select_from(Run).where(Run.project_id == project_id)) or 0
+    if total >= settings.max_runs_per_project:
+        raise CapacityError(
+            409, f"project reached its limit of {settings.max_runs_per_project} runs; delete runs to create more"
+        )
+    active = session.scalar(
+        select(func.count()).select_from(Run).where(Run.project_id == project_id, Run.status == "running")
+    ) or 0
+    if active >= settings.max_active_runs_per_project:
+        raise CapacityError(
+            429, f"project has {active} running runs (limit {settings.max_active_runs_per_project})", 60
+        )
+    return int(total)
+
+
+def new_run(session: Session, project_id: str, *, name: str, tags: Sequence[str] = (), **fields: Any) -> Run:
+    """Add a `running` run with its `run_tags` rows and make sure the reaper is scheduled (the
+    caller checked `check_capacity` and commits). `fields` are other `Run` columns."""
+    now = utcnow()
+    values: dict[str, Any] = {"status": "running", "started_at": now, "heartbeat_at": now, **fields}
+    run = Run(
+        project_id=project_id,
+        name=name,
+        tags=list(tags),
+        params=values.pop("params", None) or {},
+        point_count=0,
+        key_counts={},
+        **values,
+    )
+    session.add(run)
+    session.flush()
+    for tag in tags:
+        session.add(RunTag(run_id=run.id, project_id=project_id, tag=tag))
+    ensure_reaper_scheduled(session)
+    return run
 
 
 # --------------------------------------------------------------------------- params

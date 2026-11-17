@@ -2,7 +2,8 @@
 
 Alembic only loads `migrations/versions/`; the 0003 revision (generated once every cycle-2 model
 has landed) calls `upgrade()` / `downgrade()` from here. Matches `matrix_server.runs.models`
-(checked by `tests/test_runs_migration.py`). Requires `projects` (0001).
+(checked by `tests/test_runs_migration.py`), including the `runs` columns revision 0008 added.
+Requires `projects` (0001).
 """
 
 import sqlalchemy as sa
@@ -33,6 +34,9 @@ def upgrade() -> None:
         sa.Column("error", sa.Text(), nullable=True),
         sa.Column("point_count", sa.BigInteger(), nullable=False),
         sa.Column("key_counts", sa.JSON(), nullable=False),
+        # Added by revision 0008 (T4: main's MLOps runs merged into `runs`).
+        sa.Column("run_type", sa.String(length=32), nullable=True),
+        sa.Column("base_model", sa.String(length=200), nullable=True),
         sa.ForeignKeyConstraint(["project_id"], ["projects.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["parent_run_id"], ["runs.id"], ondelete="SET NULL"),
         sa.PrimaryKeyConstraint("id"),
