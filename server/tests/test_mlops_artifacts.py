@@ -23,12 +23,21 @@ from matrix_server.mlops.artifact_store import (
 SAMPLE_SHA256 = "a" * 64
 
 
+@pytest.fixture
+def tmp_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The MLOps local store lives at `<artifact_local_dir>/mlops`; this module's `tmp_path` is that
+    directory, so the path assertions below keep their meaning."""
+    root = tmp_path_factory.mktemp("artifacts") / "mlops"
+    root.mkdir()
+    return root
+
+
 def _local_settings(tmp_path: Path, **overrides: object) -> Settings:
     params: dict[str, object] = {
-        "artifact_store": "local",
-        "artifact_dir": str(tmp_path),
-        "jwt_secret": "test-hmac-secret-key",
-        "artifact_presign_ttl_seconds": 600,
+        "artifact_backend": "local",
+        "artifact_local_dir": str(tmp_path.parent),
+        "artifact_token_secret": "test-hmac-secret-key-0123456789abcdef",
+        "artifact_url_ttl_seconds": 600,
     }
     params.update(overrides)
     return Settings(**params)  # type: ignore[arg-type]
@@ -36,13 +45,13 @@ def _local_settings(tmp_path: Path, **overrides: object) -> Settings:
 
 def _s3_settings(**overrides: object) -> Settings:
     params: dict[str, object] = {
-        "artifact_store": "s3",
+        "artifact_backend": "s3",
         "s3_endpoint": "http://minio.example.com:9000",
         "s3_bucket": "matrix-artifacts",
         "s3_region": "us-east-1",
         "s3_access_key": "AKIA_TEST_KEY",
         "s3_secret_key": "SUPER_SECRET_KEY_DO_NOT_LEAK",
-        "artifact_presign_ttl_seconds": 900,
+        "artifact_url_ttl_seconds": 900,
     }
     params.update(overrides)
     return Settings(**params)  # type: ignore[arg-type]
@@ -58,7 +67,7 @@ def test_local_store_presign_write_read_and_exists(tmp_path: Path) -> None:
     assert put_url.startswith("/api/v1/mlops/artifacts/local/")
 
     put_token = put_url.rsplit("/", 1)[-1]
-    key = store.verify_local_token(put_token, "put")
+    key = store.verify_local_token(put_token, "put", "proj-1")
     assert key == f"projects/proj-1/blobs/sha256/{sha}"
 
     assert store.exists_and_size(storage_uri) == (False, None)
@@ -70,7 +79,7 @@ def test_local_store_presign_write_read_and_exists(tmp_path: Path) -> None:
 
     get_url = store.presign_get("proj-1", storage_uri)
     get_token = get_url.rsplit("/", 1)[-1]
-    get_key = store.verify_local_token(get_token, "get")
+    get_key = store.verify_local_token(get_token, "get", "proj-1")
     assert get_key == key
     assert store.read_local_blob_path(get_key).read_bytes() == data
 
@@ -78,7 +87,7 @@ def test_local_store_presign_write_read_and_exists(tmp_path: Path) -> None:
 def test_local_store_rejects_tampered_swapped_and_expired_tokens(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    store = LocalFSArtifactStore(_local_settings(tmp_path, artifact_presign_ttl_seconds=60))
+    store = LocalFSArtifactStore(_local_settings(tmp_path, artifact_url_ttl_seconds=60))
     now = 1_700_000_000
     monkeypatch.setattr(time, "time", lambda: now)
 
@@ -89,29 +98,29 @@ def test_local_store_rejects_tampered_swapped_and_expired_tokens(
 
     # Swapped operation
     with pytest.raises(ValueError, match="operation mismatch"):
-        store.verify_local_token(put_token, "get")
+        store.verify_local_token(put_token, "get", "proj-1")
     with pytest.raises(ValueError, match="operation mismatch"):
-        store.verify_local_token(get_token, "put")
+        store.verify_local_token(get_token, "put", "proj-1")
 
     # Tampered signature
     payload_b64, sig = put_token.split(".")
     bad_sig = ("0" if sig[0] != "0" else "1") + sig[1:]
     with pytest.raises(ValueError, match="signature"):
-        store.verify_local_token(f"{payload_b64}.{bad_sig}", "put")
+        store.verify_local_token(f"{payload_b64}.{bad_sig}", "put", "proj-1")
 
     # Tampered payload
     tampered_payload = ("A" if payload_b64[0] != "A" else "B") + payload_b64[1:]
     with pytest.raises(ValueError, match="signature"):
-        store.verify_local_token(f"{tampered_payload}.{sig}", "put")
+        store.verify_local_token(f"{tampered_payload}.{sig}", "put", "proj-1")
 
     # Malformed token
     with pytest.raises(ValueError, match="Malformed"):
-        store.verify_local_token("no-dot-here", "put")
+        store.verify_local_token("no-dot-here", "put", "proj-1")
 
     # Expired token
     monkeypatch.setattr(time, "time", lambda: now + 61)
     with pytest.raises(ValueError, match="expired"):
-        store.verify_local_token(put_token, "put")
+        store.verify_local_token(put_token, "put", "proj-1")
 
 
 def test_local_store_prevents_path_traversal_and_idor(tmp_path: Path) -> None:
@@ -331,3 +340,68 @@ async def test_local_store_write_local_blob_stream(tmp_path: Path) -> None:
     assert not (tmp_path / big_key).exists()
     assert not list((tmp_path / "projects/proj-1/blobs/sha256").glob(".tmp_*"))
 
+
+
+def test_local_token_is_bound_to_project_and_shared_by_processes_with_same_secret(tmp_path: Path) -> None:
+    """T3: the token names its project; two stores (two workers) with the same secret agree, a
+    store with another secret does not."""
+    store = LocalFSArtifactStore(_local_settings(tmp_path))
+    _, put_url = store.presign_put("proj-1", SAMPLE_SHA256, 10)
+    token = put_url.rsplit("/", 1)[-1]
+
+    with pytest.raises(ValueError, match="project mismatch"):
+        store.verify_local_token(token, "put", "proj-2")
+
+    other_worker = LocalFSArtifactStore(_local_settings(tmp_path))
+    assert other_worker.verify_local_token(token, "put", "proj-1").startswith("projects/proj-1/")
+
+    other_secret = LocalFSArtifactStore(_local_settings(tmp_path, artifact_token_secret="x" * 40))
+    with pytest.raises(ValueError, match="signature"):
+        other_secret.verify_local_token(token, "put", "proj-1")
+
+
+def test_local_token_signature_compared_in_constant_time(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = LocalFSArtifactStore(_local_settings(tmp_path))
+    _, put_url = store.presign_put("proj-1", SAMPLE_SHA256, 10)
+    calls: list[tuple[object, object]] = []
+    real = hmac.compare_digest
+
+    def spy(a, b):  # type: ignore[no-untyped-def]
+        calls.append((a, b))
+        return real(a, b)
+
+    monkeypatch.setattr(hmac, "compare_digest", spy)
+    store.verify_local_token(put_url.rsplit("/", 1)[-1], "put", "proj-1")
+    assert calls, "signature must be checked with hmac.compare_digest"
+
+
+@pytest.mark.parametrize("env", ["production", "dev"])
+def test_artifact_token_secret_required_outside_tests(env: str, tmp_path: Path) -> None:
+    from matrix_server.app import create_app
+    from matrix_server.config import ConfigError
+
+    settings = Settings(env=env, database_url=f"sqlite:///{tmp_path}/x.db", artifact_token_secret=None)
+    with pytest.raises(ConfigError, match="MATRIX_ARTIFACT_TOKEN_SECRET"):
+        create_app(settings)
+    with pytest.raises(ConfigError, match="MATRIX_ARTIFACT_TOKEN_SECRET"):
+        Settings(env=env, artifact_token_secret="   ").artifact_token_key()
+
+
+def test_artifact_token_secret_rules(tmp_path: Path) -> None:
+    from matrix_server.config import ConfigError
+
+    with pytest.raises(ConfigError, match="32"):
+        Settings(env="production", artifact_token_secret="short").artifact_token_key()
+    assert Settings(env="dev", artifact_token_secret="short").artifact_token_key() == b"short"
+    assert Settings(env="production", artifact_token_secret="k" * 32).artifact_token_key() == b"k" * 32
+    assert Settings(env="test", artifact_token_secret=None).artifact_token_key() is None
+
+
+def test_worker_fails_fast_without_artifact_token_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    from matrix_server import cli
+    from matrix_server.config import ConfigError
+
+    monkeypatch.setenv("MATRIX_ENV", "production")
+    monkeypatch.delenv("MATRIX_ARTIFACT_TOKEN_SECRET", raising=False)
+    with pytest.raises(ConfigError, match="MATRIX_ARTIFACT_TOKEN_SECRET"):
+        cli.run_worker()
