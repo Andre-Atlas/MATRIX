@@ -119,7 +119,7 @@ function llmKeys(total: number, dpo: boolean, seedLoss: number, peakLr: number):
 
 function visionKeys(lr: number, diverge?: number): KeySpec[] {
   const q = Math.min(1, Math.abs(Math.log10(lr / 3e-4)) / 1.2); // 0 = best lr
-  const nan = (s: number, v: number) => (diverge !== undefined && s >= diverge ? NaN : diverge !== undefined && s > diverge - 400 ? v * Math.exp((s - diverge + 400) / 60) : v);
+  const nan = (s: number, v: number) => (diverge !== undefined && s >= diverge ? NaN : diverge !== undefined && s > diverge - 400 ? v * (1 + 4 * ((s - diverge + 400) / 400) ** 2) : v);
   return [
     { key: "train/loss", gen: (s, r) => nan(s, decay(s, 6.9, 0.55 + 0.6 * q, 2500) + 0.08 * gauss(r)) },
     { key: "train/acc", gen: (s, r) => Math.min(1, Math.max(0, decay(s, 0.001, 0.86 - 0.12 * q, 3000) + 0.02 * gauss(r))) },

@@ -278,7 +278,8 @@ export function mockGate(method: string, path: string, ctx: MockCtx): void {
   const a = authenticate(ctx);
   if (AUTH_OR_PROJECTS.test(p)) return;
   if (!ctx.projectId) throw new ApiError(400, JSON.stringify({ detail: "X-Matrix-Project header required" }));
-  const min: Role = method === "GET" ? "viewer" : ADMIN_DATA.test(p) ? "admin" : "member";
+  const runDelete = method === "DELETE" && /^\/api\/v1\/runs\/[^/]+$/.test(p);
+  const min: Role = method === "GET" ? "viewer" : ADMIN_DATA.test(p) || runDelete ? "admin" : "member";
   requireRole(a, ctx.projectId, min);
 }
 

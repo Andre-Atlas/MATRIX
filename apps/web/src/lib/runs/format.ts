@@ -3,6 +3,7 @@
 /** Seconds as a compact duration: `850 ms`, `42s`, `3m 05s`, `2h 14m`, `3d 4h`. */
 export function formatSeconds(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return "—";
+  if (seconds === 0) return "0s";
   if (seconds < 1) return `${Math.round(seconds * 1000)} ms`;
   if (seconds < 60) return `${Math.floor(seconds)}s`;
   const s = Math.floor(seconds);

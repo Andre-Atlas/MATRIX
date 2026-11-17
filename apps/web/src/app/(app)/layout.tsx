@@ -15,6 +15,7 @@ const NAV = [
   { href: "/prompts", label: "Prompts" },
   { href: "/datasets", label: "Datasets" },
   { href: "/experiments", label: "Experiments" },
+  { href: "/runs", label: "Runs" },
   { href: "/annotations", label: "Annotations" },
   { href: "/alerts", label: "Alerts" },
 ];

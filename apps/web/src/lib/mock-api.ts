@@ -4,6 +4,7 @@ import { authGet, authSend, mockGate, NO_CONTENT, type MockCtx } from "./mock-au
 import { mockDb } from "./mock-data";
 import { evalExportJsonl, evalGet, evalSend } from "./mock-evals";
 import { dpoExportJsonl, opsGet, opsSend } from "./mock-ops";
+import { runArtifactDownload, runsGet, runsSend } from "./mock-runs";
 import type { ListResponse, OverviewStats, Score, SessionDetail, TraceDetail, TraceSummary } from "./types";
 
 type Params = Record<string, string | number | undefined>;
@@ -126,6 +127,9 @@ export async function mockGet<T>(path: string, params: Params = {}, ctx?: MockCt
   const evalResult = evalGet(p);
   if (evalResult !== undefined) return evalResult as T;
 
+  const runsResult = runsGet(p, params);
+  if (runsResult !== undefined) return runsResult as T;
+
   const opsResult = opsGet(p, params);
   if (opsResult !== undefined) return opsResult as T;
 
@@ -140,7 +144,7 @@ export async function mockSend<T>(method: string, path: string, body?: unknown, 
     const authed = authSend(ctx, m, p, body);
     if (authed !== undefined) return authed as T;
   }
-  const out = evalSend(m, p, body) ?? opsSend(m, p, body);
+  const out = evalSend(m, p, body) ?? opsSend(m, p, body) ?? runsSend(m, p, body);
   if (out === undefined) throw new ApiError(404, `mock: no handler for ${method} ${path}`);
   return out as T;
 }
@@ -156,6 +160,8 @@ export async function mockFetch(
   try {
     if (method === "GET") {
       if (ctx) mockGate("GET", path.replace(/\/+$/, ""), ctx);
+      const download = runArtifactDownload(path);
+      if (download) return download;
       const text = evalExportJsonl(path) ?? dpoExportJsonl(path);
       if (text !== undefined) {
         return new Response(text, {

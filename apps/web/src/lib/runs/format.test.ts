@@ -3,6 +3,7 @@ import { formatBytes, formatMegabytes, formatMetric, formatPower, formatSeconds,
 
 describe("durations", () => {
   it("formatSeconds", () => {
+    expect(formatSeconds(0)).toBe("0s");
     expect(formatSeconds(0.25)).toBe("250 ms");
     expect(formatSeconds(42.7)).toBe("42s");
     expect(formatSeconds(185)).toBe("3m 05s");
