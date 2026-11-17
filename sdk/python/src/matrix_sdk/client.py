@@ -17,6 +17,7 @@ from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor
 
 from . import tracing
+from ._net import client_kwargs
 from .prompts import Prompt
 
 if TYPE_CHECKING:
@@ -41,13 +42,6 @@ def _seg(value: Any) -> str:
     return quote(str(value), safe="")
 
 
-def _clean_no_proxy() -> None:
-    for var in ("NO_PROXY", "no_proxy"):
-        val = os.environ.get(var)
-        if val and "[::1]" in val:
-            os.environ[var] = ",".join(p.strip() for p in val.split(",") if p.strip() != "[::1]")
-
-
 class MatrixClient:
     def __init__(
         self,
@@ -61,7 +55,6 @@ class MatrixClient:
         owns_provider: bool = True,
         span_processors: list[SpanProcessor] | None = None,
     ) -> None:
-        _clean_no_proxy()
         self.api_key = api_key
         self.endpoint = endpoint.rstrip("/")
         self.project_name = project_name
@@ -72,8 +65,9 @@ class MatrixClient:
         self._http = httpx.Client(
             base_url=self.endpoint,
             headers={"Authorization": f"Bearer {api_key}"},
-            transport=transport,
             timeout=timeout,
+            # proxy env honoured without rewriting NO_PROXY in the caller's process (see _net)
+            **client_kwargs(transport),
         )
         self._cache: dict[tuple, tuple[Prompt, float]] = {}
         self._refreshing: set[tuple] = set()
