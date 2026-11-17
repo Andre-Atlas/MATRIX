@@ -15,8 +15,10 @@ import time
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from rbac_helpers import add_membership, api_key_headers, make_user, session_token
 
 from matrix_server.app import create_app
+from matrix_server.auth import Role, create_project
 from matrix_server.config import Settings
 from matrix_server.gateway.cache import GatewayCache, compute_cache_key
 from matrix_server.gateway.circuit_breaker import CircuitBreaker, CircuitBreakerOpenError, CircuitState
@@ -37,68 +39,25 @@ def client(app):
 
 @pytest.fixture
 def auth_setup(client):
-    """Sets up an admin, a member, and a viewer in the same project."""
-    # 1. Register admin
-    admin_res = client.post(
-        "/api/v1/auth/register",
-        json={
-            "email": "admin@matrix.local",
-            "password": "Password123!",
-            "name": "Admin Operator",
-            "project_name": "Gateway Test Project",
-        },
-    ).json()
-    admin_token = admin_res["token"]
-    project_id = admin_res["project"]["id"]
-
-    # 2. Register and add member
-    client.post(
-        "/api/v1/auth/register",
-        json={
-            "email": "member@matrix.local",
-            "password": "Password123!",
-            "name": "Member Engineer",
-            "project_name": "Member Alt Project",
-        },
-    )
-    client.post(
-        f"/api/v1/projects/{project_id}/members",
-        headers={"Authorization": f"Bearer {admin_token}"},
-        json={"email": "member@matrix.local", "role": "member"},
-    )
-    member_login = client.post(
-        "/api/v1/auth/login",
-        json={"email": "member@matrix.local", "password": "Password123!"},
-    ).json()
-    member_token = member_login["token"]
-
-    # 3. Register and add viewer
-    client.post(
-        "/api/v1/auth/register",
-        json={
-            "email": "viewer@matrix.local",
-            "password": "Password123!",
-            "name": "Viewer Auditor",
-            "project_name": "Viewer Alt Project",
-        },
-    )
-    client.post(
-        f"/api/v1/projects/{project_id}/members",
-        headers={"Authorization": f"Bearer {admin_token}"},
-        json={"email": "viewer@matrix.local", "role": "viewer"},
-    )
-    viewer_login = client.post(
-        "/api/v1/auth/login",
-        json={"email": "viewer@matrix.local", "password": "Password123!"},
-    ).json()
-    viewer_token = viewer_login["token"]
-
-    return {
+    """An admin, a member and a viewer in the same project (sessions of the branch's RBAC, G0)."""
+    factory = client.app.state.session_factory
+    with factory() as db:
+        project, _ = create_project(db, "Test Project", with_key=False)
+        db.commit()
+        project_id = project.id
+    tokens = {}
+    for role in (Role.ADMIN, Role.MEMBER, Role.VIEWER):
+        user_id = make_user(factory)
+        add_membership(factory, user_id, project_id, role)
+        tokens[role.label] = session_token(factory, user_id)
+    result = {
         "project_id": project_id,
-        "admin_token": admin_token,
-        "member_token": member_token,
-        "viewer_token": viewer_token,
+        "admin_token": tokens["admin"],
+        "member_token": tokens["member"],
+        "viewer_token": tokens["viewer"],
+        "key_headers": api_key_headers(factory, project_id),
     }
+    return result
 
 
 # ============================================================================
@@ -452,11 +411,11 @@ def test_gateway_api_auth_rbac(app, auth_setup):
 
     headers_viewer = {
         "Authorization": f"Bearer {auth_setup['viewer_token']}",
-        "x-matrix-project-id": project_id,
+        "X-Matrix-Project": project_id,
     }
     headers_member = {
         "Authorization": f"Bearer {auth_setup['member_token']}",
-        "x-matrix-project-id": project_id,
+        "X-Matrix-Project": project_id,
     }
 
     payload = {
@@ -494,7 +453,7 @@ def test_gateway_api_chat_completions_caching(app, auth_setup):
     project_id = auth_setup["project_id"]
     headers_member = {
         "Authorization": f"Bearer {auth_setup['member_token']}",
-        "x-matrix-project-id": project_id,
+        "X-Matrix-Project": project_id,
     }
     payload = {
         "model": "gpt-4o",
@@ -522,7 +481,7 @@ def test_gateway_api_rate_limiting(app, auth_setup):
     project_id = auth_setup["project_id"]
     headers_member = {
         "Authorization": f"Bearer {auth_setup['member_token']}",
-        "x-matrix-project-id": project_id,
+        "X-Matrix-Project": project_id,
     }
 
     # Configure tight rate limit: 1 RPM for this project
@@ -552,11 +511,11 @@ def test_gateway_api_stats_providers_and_logs(app, auth_setup):
     project_id = auth_setup["project_id"]
     headers_viewer = {
         "Authorization": f"Bearer {auth_setup['viewer_token']}",
-        "x-matrix-project-id": project_id,
+        "X-Matrix-Project": project_id,
     }
     headers_member = {
         "Authorization": f"Bearer {auth_setup['member_token']}",
-        "x-matrix-project-id": project_id,
+        "X-Matrix-Project": project_id,
     }
 
     # Reset router state for clean metrics
@@ -607,11 +566,11 @@ def test_gateway_api_cascading_fallback(app, auth_setup):
     project_id = auth_setup["project_id"]
     headers_member = {
         "Authorization": f"Bearer {auth_setup['member_token']}",
-        "x-matrix-project-id": project_id,
+        "X-Matrix-Project": project_id,
     }
     headers_viewer = {
         "Authorization": f"Bearer {auth_setup['viewer_token']}",
-        "x-matrix-project-id": project_id,
+        "X-Matrix-Project": project_id,
     }
 
     # Configure custom providers in app router to test API fallback

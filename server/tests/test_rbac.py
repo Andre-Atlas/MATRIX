@@ -183,6 +183,31 @@ def test_every_mutating_route_declares_rbac(tmp_path):
     assert seen > 40
 
 
+def test_every_route_is_authenticated_except_the_public_ones(tmp_path):
+    """T3: ALL mounted routes, every method and prefix (`main`'s routers included), carry a guard:
+    `require(...)`, `require_user` or the platform `require_admin`. Public: health and login only
+    (FastAPI's /docs and /openapi.json are plain Starlette routes, not APIRoutes)."""
+    app, _ = _make(f"sqlite:///{tmp_path}/m.db")
+    public = {("GET", "/health"), ("POST", "/api/v1/auth/login")}
+    unguarded = []
+    for route in _routes(app):
+        guards = _guards(route.dependant)
+        for method in route.methods:
+            if (method, route.path) in public:
+                assert not guards, (method, route.path)
+                continue
+            if not guards:
+                unguarded.append((method, route.path))
+            elif method in MUTATING and route.path.startswith("/api/v1/") and not route.path.startswith(
+                ("/api/v1/admin/", "/api/v1/auth/")
+            ):
+                specs = [g for g in guards if g != "platform"]
+                assert specs and all(s.project_from == "none" or s.min_role > auth.Role.VIEWER or s.scope in ("write", "ingest") for s in specs), (method, route.path)
+    assert unguarded == []
+    main_prefixes = ("benchmarks", "datasets", "gateway", "mlops", "safety", "sandboxes", "vectors")
+    assert {p for p in main_prefixes if any(r.path.startswith(f"/api/v1/{p}") for r in _routes(app))} == set(main_prefixes)
+
+
 # --- RBAC on every route family ------------------------------------------------------------------------
 
 

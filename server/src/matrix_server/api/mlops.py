@@ -66,6 +66,8 @@ VALID_RUN_STATUSES = {"queued", "running", "completed", "failed", "cancelled", "
 TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled", "stopped"}
 VALID_MODEL_STAGES = {"none", "staging", "production", "archived"}
 ADMIN_ONLY_ALIASES = {"production", "champion"}
+# Promoting to production and archiving are ADMIN decisions (an API key is never ADMIN).
+ADMIN_ONLY_STAGES = {"production", "archived"}
 
 
 # ---------------------------------------------------------------------------
@@ -1520,7 +1522,7 @@ def create_model_version(
     model = _get_model_or_404(db, principal.project_id, model_id)
     body: ModelVersionCreate = _parse_body(ModelVersionCreate, payload)
 
-    if body.stage == "production":
+    if body.stage in ADMIN_ONLY_STAGES:
         ensure_role(principal, Role.ADMIN)
 
     if body.artifact_id is not None:
@@ -1592,7 +1594,7 @@ def update_model_version_stage(
 ) -> dict[str, Any]:
     model = _get_model_or_404(db, principal.project_id, model_id)
     body: ModelStagePatch = _parse_body(ModelStagePatch, payload)
-    if body.stage == "production":
+    if body.stage in ADMIN_ONLY_STAGES:
         ensure_role(principal, Role.ADMIN)
     mv = _get_model_version_or_404(db, principal.project_id, model.id, version)
     if mv.stage == "production":
