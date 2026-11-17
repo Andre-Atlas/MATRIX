@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -24,8 +25,9 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from matrix_server.artifacts import ArtifactStore
+from matrix_server.artifacts.service import Limits, store_bytes
 from matrix_server.config import get_settings
-from matrix_server.mlops.artifact_store import ArtifactStore, build_artifact_store
 from matrix_server.storage.db import utcnow
 from matrix_server.storage.models import (
     DatasetCommitItem,
@@ -576,7 +578,7 @@ def evaluate_scorer(
     task: SandboxTask,
     scorer_config: dict[str, Any],
     steps: list[dict[str, Any]],
-    artifact_store: ArtifactStore | None = None,
+    save_blob: Callable[[str, bytes], str | None] | None = None,
     project_id: str = "default",
     task_timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> tuple[str, float, dict[str, Any], list[dict[str, Any]], str | None]:
@@ -713,12 +715,10 @@ def evaluate_scorer(
             size_bytes = len(data)
             storage_uri = None
 
-            if artifact_store is not None and hasattr(artifact_store, "write_local_blob"):
+            if save_blob is not None:
                 try:
-                    obj_key = artifact_store.object_key(project_id, file_sha)
-                    artifact_store.write_local_blob(obj_key, data, expected_sha256=file_sha)
-                    storage_uri = f"local://{obj_key}"
-                except Exception as store_err:  # noqa: BLE001
+                    storage_uri = save_blob(rel_path, data)
+                except Exception as store_err:  # noqa: BLE001 - e.g. quota exceeded: recorded unstored
                     log.debug("Artifact store write skipped/failed: %s", store_err)
 
             verified_artifacts.append({
@@ -737,6 +737,26 @@ def evaluate_scorer(
 # --- Orchestration: run_sandbox_job ----------------------------------------
 
 
+def _blob_saver(
+    session_factory: sessionmaker[Session], store: ArtifactStore | None, project_id: str, sandbox_run_id: str
+) -> Callable[[str, bytes], str | None] | None:
+    """Store a task's output file through the G0 artifact store (an `artifacts` row owned by the
+    sandbox run: deduplicated, within the project quota, removed with the project)."""
+    if store is None:
+        return None
+    limits = Limits.from_settings(get_settings())
+
+    def save(rel_path: str, data: bytes) -> str | None:
+        with session_factory() as session, session.begin():
+            art = store_bytes(
+                session, store, project_id, rel_path, data,
+                owner_kind="sandbox_run", owner_id=sandbox_run_id, limits=limits,
+            )
+            return f"artifact:{art.id}"
+
+    return save
+
+
 def run_sandbox_job(
     session_factory: sessionmaker[Session],
     sandbox_run_id: str,
@@ -745,7 +765,9 @@ def run_sandbox_job(
     """Execute a complete SandboxRun job against the database."""
     if artifact_store is None:
         try:
-            artifact_store = build_artifact_store(get_settings())
+            from matrix_server.workers.artifact_handlers import get_artifact_store
+
+            artifact_store = get_artifact_store()
         except Exception as exc:  # noqa: BLE001
             log.debug("Could not build default artifact store: %s", exc)
 
@@ -911,7 +933,7 @@ def run_sandbox_job(
                     task=task,
                     scorer_config=scorer_config,
                     steps=steps,
-                    artifact_store=artifact_store,
+                    save_blob=_blob_saver(session_factory, artifact_store, project_id, sandbox_run_id),
                     project_id=project_id,
                     task_timeout=task_timeout,
                 )

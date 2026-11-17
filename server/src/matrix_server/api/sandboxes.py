@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
+from matrix_server.api.artifacts import get_store
 from matrix_server.auth import Principal, Role, ensure_role, require
 from matrix_server.sandboxes.runner import (
     FORBIDDEN_SOCKET_PATTERNS,
@@ -288,7 +289,7 @@ def create_sandbox_run(
         run_sandbox_job(
             request.app.state.session_factory,
             run.id,
-            getattr(request.app.state, "mlops_artifact_store", None),
+            get_store(request.app),
         )
         db.refresh(run)
 

@@ -40,7 +40,6 @@ def run_worker() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     settings = Settings()
-    settings.artifact_token_key()  # fail fast, like the API: the worker signs/reads the same tokens
     engine = make_engine(settings.database_url)
     init_db(engine)
     runner.load_handler_modules()

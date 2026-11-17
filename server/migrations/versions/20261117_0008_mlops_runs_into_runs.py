@@ -143,7 +143,7 @@ def _parse_ts(value: Any) -> datetime | None:
     if not isinstance(value, str):
         return None
     try:
-        ts = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        ts = datetime.fromisoformat(value)
     except ValueError:
         return None
     return ts if ts.tzinfo else ts.replace(tzinfo=UTC)

@@ -13,6 +13,7 @@ from matrix_server.api import (
     gateway,
     ingest,
     mlops,
+    mlops_compat,
     online_evals,
     projects,
     prompts,
@@ -27,8 +28,6 @@ from matrix_server.config import Settings, get_settings
 from matrix_server.gateway.router import GatewayRouter
 from matrix_server.hooks import install_api_hooks
 from matrix_server.limits import BodyLimitMiddleware
-from matrix_server.mlops.artifact_store import build_artifact_store as build_mlops_artifact_store
-from matrix_server.mlops.metrics_store import build_training_metric_store
 from matrix_server.runs.store import build_metric_store
 from matrix_server.storage.db import init_db, make_engine, make_session_factory
 from matrix_server.storage.spans import build_span_store
@@ -37,8 +36,6 @@ from matrix_server.storage.spans import build_span_store
 def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="MATRIX")
     settings = settings or get_settings()
-    # Fail fast (ConfigError) on a deployment without MATRIX_ARTIFACT_TOKEN_SECRET (MATRIX_ENV != test).
-    settings.artifact_token_key()
     app.state.settings = settings
     users.configure_hash_concurrency(settings.password_hash_concurrency)
     app.add_middleware(
@@ -54,10 +51,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.session_factory = make_session_factory(engine)
     app.state.span_store = build_span_store(settings)
     app.state.metric_store = build_metric_store(settings)
-    app.state.training_metric_store = build_training_metric_store(settings)
-    # main's MLOps store (local signed tokens / S3 presign); `artifact_store` is the branch's blob
-    # store (api/artifacts.py builds it lazily). Unified in T4.
-    app.state.mlops_artifact_store = build_mlops_artifact_store(settings)
     app.state.gateway_router = GatewayRouter()
 
     install_api_hooks(app.state.session_factory, app.state.span_store)
@@ -86,6 +79,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         vectors,
         gateway,
         mlops,
+        mlops_compat,  # deprecated /mlops/runs* and /mlops/artifacts* adapters over runs/artifacts (T4)
         benchmarks,
         sandboxes,
     ):
