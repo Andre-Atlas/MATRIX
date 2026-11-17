@@ -46,3 +46,8 @@ Formato: `T<n> · [tag] · C<n> → modelo/esforço (papel)`.
 - Ruling: `source` do score online continua `"llm"` com `label="heuristic"` e prefixo `[heuristic judge]` no comentário, em vez de acrescentar `heuristic` ao enum do contrato — mantém `api/query.py` compatível — custo: filtros por origem precisam olhar o label.
 - Ruling: artefatos presigned grandes sem hash comprovável são recusados em vez de guardados como `verified=false` (S11); `MATRIX_S3_TRUST_CHECKSUM=1` permite confiar no checksum do servidor S3 — custo: uploads grandes por presigned exigem esse ajuste ou upload direto.
 - Pendência registrada: S3 real (RustFS) sem revalidar depois de S10/S11 (Docker não foi autorizado); `run_worker` deve chamar `service.ensure_reaper_scheduled` (cli.py era do T21).
+
+## Fechamento do G0 + G1 (plano aprovado em 2026-11-17)
+
+- E1 verificada: servidor com Postgres e ClickHouse reais = **1100 passed, 0 failed, 88 skipped** (os pulados são o backend S3 real, sem Docker); ruff limpo; migração 0004 sobe, `alembic check` limpo, desce a 0003, sobe e desce à base sem erro. Isso confirma o commit `2d68c14` (rotulado `wip`) como a correção definitiva da revisão de segurança do servidor.
+- E2 retomada: correção de segurança da web (opus/medium, C4) e T29 telas de runs (opus/medium, C4), arquivos disjuntos.
