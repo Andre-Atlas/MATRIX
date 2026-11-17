@@ -107,7 +107,7 @@ def _presign(client, headers, name: str, data: bytes, **extra):
 
 
 def test_presign_reserves_a_g0_blob_and_commit_verifies_it(env) -> None:
-    app, client, factory, pid, roles = env
+    _app, client, factory, _pid, roles = env
     member = roles["member"]
     data = b"weights-v1"
     resp = _presign(client, member, "ckpt", data)
@@ -145,7 +145,7 @@ def test_presign_counts_against_the_project_quota(env) -> None:
 
 
 def test_download_url_and_blob_deleted_through_g0(env) -> None:
-    app, client, factory, pid, roles = env
+    _app, client, factory, _pid, roles = env
     member = roles["member"]
     data = b"adapter"
     art = _presign(client, member, "a", data).json()
@@ -198,7 +198,7 @@ class _PresigningStore(LocalArtifactStore):
 
 
 def test_s3_style_presign_returns_signed_headers_and_presigned_download(env, tmp_path) -> None:
-    app, client, factory, pid, roles = env
+    app, client, _factory, pid, roles = env
     member = roles["member"]
     store = _PresigningStore(tmp_path / "s3like")
     app.state.artifact_store = store

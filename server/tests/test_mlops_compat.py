@@ -174,7 +174,7 @@ def test_classic_eval_that_does_not_validate_is_kept_as_custom():
 
 
 def test_deprecated_routes_are_marked_in_openapi(env):
-    client, roles = env
+    client, _roles = env
     spec = client.app.openapi()
     for path, ops in spec["paths"].items():
         for op in ops.values():

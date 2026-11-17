@@ -7,14 +7,6 @@ Servidor da MATRIX (FastAPI + SQLAlchemy). Comandos: `matrix-api`, `matrix-worke
 > bootstrap (`matrix-admin create-user`, `create-project --owner-email`, login pela web) e a tabela
 > completa das variáveis `MATRIX_*`: [README da raiz, seção Execução](../README.md#execução).
 
-## Configuração obrigatória
-
-- `MATRIX_ARTIFACT_TOKEN_SECRET`: chave HMAC dos tokens de upload/download de artefatos do MLOps
-  (amarrados a projeto, objeto e operação, com expiração; comparação em tempo constante). Sem ela,
-  `matrix-api` e `matrix-worker` falham na partida (`ConfigError`), exceto com `MATRIX_ENV=test`
-  (a suíte define isso em `tests/conftest.py`). Use o mesmo valor em todos os processos.
-- `MATRIX_ENV`: `production` (padrão), `dev` (`make dev-api`, `scripts/verify_mvp.py`) ou `test`.
-
 ## IP do cliente e trava de login
 
 - `MATRIX_TRUSTED_PROXY_HEADER` (ex. `X-Real-IP`) só é lido quando o peer da conexão está em

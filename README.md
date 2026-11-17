@@ -95,8 +95,6 @@ G0/G1 em andamento.
 | `MATRIX_CLICKHOUSE_URL` | `http://localhost:8123` | ClickHouse dos spans; credenciais na URL (`http://usuario:senha@host:8123`) |
 | `MATRIX_CLICKHOUSE_DATABASE` | `matrix` | Banco do ClickHouse |
 | `MATRIX_ADMIN_TOKEN` | — | Token das rotas `/api/v1/admin/*`; vazio = 403 nelas |
-| `MATRIX_ENV` | `production` | `production`, `dev` ou `test` (só a suíte de testes). Fora de `test`, API e worker não sobem sem `MATRIX_ARTIFACT_TOKEN_SECRET` |
-| `MATRIX_ARTIFACT_TOKEN_SECRET` | — (obrigatória fora de `test`) | Chave HMAC dos tokens de upload/download de artefatos do MLOps; o mesmo valor em todos os processos `matrix-api`/`matrix-worker` (≥ 32 caracteres em `production`: `openssl rand -hex 32`) |
 | `MATRIX_HOST`, `MATRIX_PORT` | `0.0.0.0`, `8000` | Endereço do `matrix-api` |
 | `MATRIX_MAX_BODY_BYTES` | `10000000` | Corpo máximo de qualquer requisição (413 acima) |
 | `MATRIX_MAX_JSON_BODY_BYTES` | `2000000` | Corpo máximo em `/api/v1/*` |
@@ -140,7 +138,7 @@ Web (`apps/web`):
 | `MATRIX_WEB_TRUST_FORWARDED_FOR` | — | `1` = há um proxy reverso confiável na frente do Next: usa o último `X-Forwarded-For` como IP do cliente e o `X-Forwarded-Proto` como esquema |
 | `MATRIX_INSECURE_COOKIES` | — | `1` = cookies sem `Secure` em produção (só HTTP local). Com Secure os cookies se chamam `__Host-matrix_session` e `__Host-matrix_project`; sem, `matrix_session` e `matrix_project` |
 
-Compose: `POSTGRES_PASSWORD`, `CLICKHOUSE_PASSWORD`, `MATRIX_WEB_ORIGIN` e `MATRIX_ARTIFACT_TOKEN_SECRET` (obrigatórias);
+Compose: `POSTGRES_PASSWORD`, `CLICKHOUSE_PASSWORD` e `MATRIX_WEB_ORIGIN` (obrigatórias);
 `MATRIX_DATABASE_URL` e `MATRIX_CLICKHOUSE_URL` são montadas a partir das senhas. Exemplo completo em
 [`deploy/.env.example`](deploy/.env.example). `make demo` usa PostgreSQL e ClickHouse locais
 (`matrix_demo`) e não depende de nenhuma chave de API da web.

@@ -11,8 +11,7 @@ lint:
 	cd apps/web && npx tsc --noEmit
 
 dev-api:
-	cd server && MATRIX_ENV=dev MATRIX_ARTIFACT_TOKEN_SECRET=$${MATRIX_ARTIFACT_TOKEN_SECRET:-$$(openssl rand -hex 32)} \
-		MATRIX_SPAN_STORE=memory MATRIX_DATABASE_URL=sqlite:///./matrix.db uv run matrix-api
+	cd server && MATRIX_SPAN_STORE=memory MATRIX_DATABASE_URL=sqlite:///./matrix.db uv run matrix-api
 
 dev-web:
 	cd apps/web && npm run dev

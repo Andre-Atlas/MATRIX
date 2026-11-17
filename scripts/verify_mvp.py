@@ -14,7 +14,6 @@ Variáveis opcionais: MATRIX_DATABASE_URL, MATRIX_CLICKHOUSE_URL, MATRIX_CLICKHO
 from __future__ import annotations
 
 import os
-import secrets
 import signal
 import subprocess
 import sys
@@ -85,9 +84,6 @@ def main() -> int:
             "MATRIX_DATABASE_URL", "postgresql+psycopg://matrix:matrix@localhost:5432/matrix"
         ),
         "MATRIX_ADMIN_TOKEN": ADMIN_TOKEN,
-        # dev run: API and worker share one throwaway artifact-token key
-        "MATRIX_ENV": "dev",
-        "MATRIX_ARTIFACT_TOKEN_SECRET": secrets.token_hex(32),
         "MATRIX_JUDGE_PROVIDER": "fake",
         "MATRIX_HOST": "127.0.0.1",
         "MATRIX_PORT": str(PORT),
