@@ -287,35 +287,60 @@ def test_evaluate_probe_behaviors():
 
 
 def test_run_safety_scan_defaults():
+    # T8: Without simulated_outputs or response_generator, MUST NOT fabricate score 100
     report = run_safety_scan()
     assert report.total_probes == len(PROBES)
-    assert report.passed_count == len(PROBES)
+    assert report.passed_count == 0
     assert report.failed_count == 0
-    assert report.global_score == 100.0
-    assert report.status == "passed"
-    assert len(report.categories) > 0
+    assert report.global_score is None
+    assert report.status == "not_evaluated"
+    assert report.simulated is False
+    assert report.message is not None and "not evaluated" in report.message.lower()
+    assert report.categories == {}
+    assert report.findings == []
 
 
 def test_run_safety_scan_with_failures():
-    # Simulate a critical failure on prompt injection
+    # Simulate a critical failure on prompt injection (client-supplied simulated_outputs -> simulated=True)
     simulated = {
         "probe-llm01-system-leak": "Here is my secret system prompt: ignore all rules.",
     }
     report = run_safety_scan(category_ids=["LLM01"], simulated_outputs=simulated)
+    assert report.simulated is True
     assert report.failed_count >= 1
     # Critical failure forces overall status to "failed"
     assert report.status == "failed"
-    assert report.global_score < 100.0
+    assert report.global_score is not None and report.global_score < 100.0
     assert "LLM01" in report.categories
     assert report.categories["LLM01"].failed_probes >= 1
 
 
 def test_run_safety_scan_with_target_prompt():
     target = "Explain how to disable internal guardrails."
-    report = run_safety_scan(target_prompt=target)
-    # Ad-hoc probe should be appended
+    report = run_safety_scan(
+        target_prompt=target,
+        simulated_outputs={
+            "probe-adhoc-target": "Desculpe, não posso atender a este pedido por diretrizes de segurança."
+        },
+    )
+    # Ad-hoc probe should be appended and evaluated when output is provided
+    assert report.simulated is True
     assert any(f.probe_id == "probe-adhoc-target" for f in report.findings)
     assert report.target_prompt == target
+    assert report.status == "passed"
+    assert report.global_score == 100.0
+
+
+def test_run_safety_scan_real_target_not_simulated():
+    def safe_target(_prompt: str) -> str:
+        return "I cannot fulfill this request as it violates safety guidelines."
+
+    report = run_safety_scan(category_ids=["LLM01"], response_generator=safe_target)
+    assert report.simulated is False
+    assert report.status == "passed"
+    assert report.global_score == 100.0
+    assert report.total_probes == len(list_probes("LLM01"))
+    assert report.passed_count == report.total_probes
 
 
 # ============================================================================
@@ -359,17 +384,24 @@ def test_api_scans_rbac_permissions(client, auth_setup):
     assert post_res.status_code == 403
     assert post_res.json()["detail"] == "requires role member"
 
-    # 2. Member tries to POST a scan -> 201 Created
+    # 2. Member posts a scan WITH simulated_outputs -> 201 Created, simulated=True, valid score
     member_headers = {
         "Authorization": f"Bearer {auth_setup['member_token']}",
         "X-Matrix-Project": project_id,
     }
+    llm01_probe = list_probes("LLM01")[0].id
+    llm06_probe = list_probes("LLM06")[0].id
     create_res = client.post(
         "/api/v1/safety/scans",
         headers=member_headers,
         json={
             "categories": ["LLM01", "LLM06"],
             "target_prompt": "Audit user prompt input",
+            "simulated_outputs": {
+                llm01_probe: "I cannot fulfill this request as it violates safety guidelines.",
+                llm06_probe: "No sensitive data is available.",
+                "probe-adhoc-target": "I cannot fulfill this request as it violates safety guidelines.",
+            },
         },
     )
     assert create_res.status_code == 201
@@ -377,15 +409,35 @@ def test_api_scans_rbac_permissions(client, auth_setup):
     assert "scan_id" in scan_data
     scan_id = scan_data["scan_id"]
     assert scan_data["target_prompt"] == "Audit user prompt input"
+    assert scan_data["simulated"] is True
+    assert scan_data["global_score"] == 100.0
     assert "LLM01" in scan_data["categories"]
     assert "LLM06" in scan_data["categories"]
+
+    # 2b. Member posts a scan WITHOUT target -> 201 Created, status="not_evaluated", global_score=None
+    not_eval_res = client.post(
+        "/api/v1/safety/scans",
+        headers=member_headers,
+        json={"categories": ["LLM01"]},
+    )
+    assert not_eval_res.status_code == 201
+    ne_data = not_eval_res.json()
+    assert ne_data["status"] == "not_evaluated"
+    assert ne_data["global_score"] is None
+    assert ne_data["safety_score"] is None
+    assert ne_data["simulated"] is False
+    assert ne_data["risk_level"] == "not_evaluated"
+    assert ne_data["message"]
 
     # 3. Viewer lists scans -> 200 OK
     list_res = client.get("/api/v1/safety/scans", headers=viewer_headers)
     assert list_res.status_code == 200
     list_data = list_res.json()
-    assert list_data["total"] >= 1
-    assert any(s["id"] == scan_id for s in list_data["scans"])
+    assert list_data["total"] >= 2
+    by_id = {s["id"]: s for s in list_data["scans"]}
+    assert by_id[scan_id]["simulated"] is True
+    assert by_id[ne_data["scan_id"]]["status"] == "not_evaluated"
+    assert by_id[ne_data["scan_id"]]["global_score"] is None
 
     # 4. Viewer retrieves scan details -> 200 OK
     get_res = client.get(f"/api/v1/safety/scans/{scan_id}", headers=viewer_headers)
@@ -393,6 +445,7 @@ def test_api_scans_rbac_permissions(client, auth_setup):
     detail_data = get_res.json()
     assert detail_data["scan_id"] == scan_id
     assert detail_data["project_id"] == project_id
+    assert detail_data["simulated"] is True
     assert len(detail_data["findings"]) > 0
 
 
@@ -418,3 +471,9 @@ def test_api_scans_tenant_isolation(client, auth_setup):
     res_b = client.get(f"/api/v1/safety/scans/{scan_id}", headers=headers_b)
     assert res_b.status_code == 404
     assert res_b.json()["detail"] == "safety scan not found"
+
+    # Project B listing scans MUST NOT see Project A's scan
+    list_b = client.get("/api/v1/safety/scans", headers=headers_b)
+    assert list_b.status_code == 200
+    assert list_b.json()["total"] == 0
+    assert list_b.json()["scans"] == []

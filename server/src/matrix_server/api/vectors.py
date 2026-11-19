@@ -42,12 +42,18 @@ class VectorProjectionMetadata(BaseModel):
     total_documents: int
     total_gaps: int
     gap_ratio: float
+    engine: str = "pca-lite"
+    embedding: str = "hash-3gram (demo)"
+    simulated: bool = True
 
 
 class VectorProjectionResponse(BaseModel):
     points: list[VectorPoint]
     clusters: list[ClusterSummary]
     metadata: VectorProjectionMetadata
+    engine: str = "pca-lite"
+    embedding: str = "hash-3gram (demo)"
+    simulated: bool = True
 
 
 # --- Helpers for Span Extraction and Synthetic Fallbacks ---
@@ -323,6 +329,9 @@ def get_vector_drift(
 
     return DriftReport(
         status=status,
+        engine="pca-lite",
+        embedding="hash-3gram (demo)",
+        simulated=True,
         metrics={
             "jsd": jsd,
             "psi": psi,
@@ -339,6 +348,9 @@ def get_vector_drift(
             "reference_window_days": reference_window_days,
             "production_window_days": production_window_days,
             "num_clusters": num_clusters,
-            "mode": "computed",
+            "engine": "pca-lite",
+            "embedding": "hash-3gram (demo)",
+            "simulated": True,
+            "mode": "demo",
         },
     )

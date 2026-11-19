@@ -22,8 +22,13 @@ from matrix_server.auth import Role, create_project
 from matrix_server.config import Settings
 from matrix_server.gateway.cache import GatewayCache, compute_cache_key
 from matrix_server.gateway.circuit_breaker import CircuitBreaker, CircuitBreakerOpenError, CircuitState
+from matrix_server.gateway.models import GatewayRateWindow, GatewayRequest
 from matrix_server.gateway.rate_limiter import GatewayRateLimiter
-from matrix_server.gateway.router import GatewayRouter, MockProvider
+from matrix_server.gateway.router import (
+    GatewayRouter,
+    MockProvider,
+    sanitize_provider_error,
+)
 
 
 @pytest.fixture
@@ -39,23 +44,30 @@ def client(app):
 
 @pytest.fixture
 def auth_setup(client):
-    """An admin, a member and a viewer in the same project (sessions of the branch's RBAC, G0)."""
+    """An admin, a member and a viewer in project A, plus a member/viewer in isolated project B."""
     factory = client.app.state.session_factory
     with factory() as db:
         project, _ = create_project(db, "Test Project", with_key=False)
+        other_project, _ = create_project(db, "Other Project", with_key=False)
         db.commit()
         project_id = project.id
+        other_project_id = other_project.id
     tokens = {}
     for role in (Role.ADMIN, Role.MEMBER, Role.VIEWER):
         user_id = make_user(factory)
         add_membership(factory, user_id, project_id, role)
         tokens[role.label] = session_token(factory, user_id)
+    other_member = make_user(factory)
+    add_membership(factory, other_member, other_project_id, Role.MEMBER)
+    other_token = session_token(factory, other_member)
     result = {
         "project_id": project_id,
         "admin_token": tokens["admin"],
         "member_token": tokens["member"],
         "viewer_token": tokens["viewer"],
         "key_headers": api_key_headers(factory, project_id),
+        "other_project_id": other_project_id,
+        "other_member_token": other_token,
     }
     return result
 
@@ -420,6 +432,7 @@ def test_gateway_api_auth_rbac(app, auth_setup):
 
     payload = {
         "model": "gpt-4o",
+        "provider": "mock",
         "messages": [{"role": "user", "content": "Hello Matrix Gateway"}],
     }
 
@@ -435,7 +448,7 @@ def test_gateway_api_auth_rbac(app, auth_setup):
     )
     assert resp_viewer_post.status_code == 403
 
-    # 3. Member role can post completions -> 200
+    # 3. Member role can post completions with explicit provider="mock" -> 200 (labeled simulated)
     resp_member_post = client.post(
         "/api/v1/gateway/chat/completions",
         headers=headers_member,
@@ -445,7 +458,9 @@ def test_gateway_api_auth_rbac(app, auth_setup):
     data = resp_member_post.json()
     assert "choices" in data
     assert "usage" in data
+    assert data["x_matrix"]["simulated"] is True
     assert resp_member_post.headers["x-matrix-cache"] == "MISS"
+    assert resp_member_post.headers["x-matrix-simulated"] == "true"
 
 
 def test_gateway_api_chat_completions_caching(app, auth_setup):
@@ -457,6 +472,7 @@ def test_gateway_api_chat_completions_caching(app, auth_setup):
     }
     payload = {
         "model": "gpt-4o",
+        "provider": "mock",
         "messages": [{"role": "user", "content": "Explain quantum computing in one sentence."}],
         "temperature": 0.5,
     }
@@ -465,13 +481,16 @@ def test_gateway_api_chat_completions_caching(app, auth_setup):
     resp1 = client.post("/api/v1/gateway/chat/completions", headers=headers_member, json=payload)
     assert resp1.status_code == 200
     assert resp1.headers["x-matrix-cache"] == "MISS"
+    assert resp1.headers["x-matrix-simulated"] == "true"
     content1 = resp1.json()["choices"][0]["message"]["content"]
 
-    # Second identical call -> HIT
+    # Second identical call -> HIT (still labeled simulated=true)
     resp2 = client.post("/api/v1/gateway/chat/completions", headers=headers_member, json=payload)
     assert resp2.status_code == 200
     assert resp2.headers["x-matrix-cache"] == "HIT"
     assert resp2.headers["x-matrix-provider"] == "cache"
+    assert resp2.headers["x-matrix-simulated"] == "true"
+    assert resp2.json()["x_matrix"]["simulated"] is True
     content2 = resp2.json()["choices"][0]["message"]["content"]
     assert content1 == content2
 
@@ -489,6 +508,7 @@ def test_gateway_api_rate_limiting(app, auth_setup):
 
     payload = {
         "model": "gpt-4o",
+        "provider": "mock",
         "messages": [{"role": "user", "content": f"Rate limit check {time.time()}"}],
     }
 
@@ -499,6 +519,7 @@ def test_gateway_api_rate_limiting(app, auth_setup):
     # Second call within 60s blocked with 429
     payload2 = {
         "model": "gpt-4o",
+        "provider": "mock",
         "messages": [{"role": "user", "content": f"Rate limit check second {time.time()}"}],
     }
     r2 = client.post("/api/v1/gateway/chat/completions", headers=headers_member, json=payload2)
@@ -521,9 +542,10 @@ def test_gateway_api_stats_providers_and_logs(app, auth_setup):
     # Reset router state for clean metrics
     app.state.gateway_router.reset()
 
-    # Trigger a request
+    # Trigger a request using explicit mock provider
     payload = {
         "model": "gpt-4o",
+        "provider": "mock",
         "messages": [{"role": "user", "content": "Telemetry audit test query"}],
     }
     res = client.post("/api/v1/gateway/chat/completions", headers=headers_member, json=payload)
@@ -557,6 +579,7 @@ def test_gateway_api_stats_providers_and_logs(app, auth_setup):
     recent_log = logs_data["logs"][0]
     assert recent_log["model"] == "gpt-4o"
     assert recent_log["status"] in ("DIRECT", "FALLBACK")
+    assert recent_log["simulated"] is True
     assert "tokens" in recent_log
     assert "latency_ms" in recent_log
 
@@ -598,3 +621,323 @@ def test_gateway_api_cascading_fallback(app, auth_setup):
     logs = logs_res.json()["logs"]
     assert logs[0]["status"] == "FALLBACK"
     assert logs[0]["provider"] == "custom_fallback"
+
+
+# ============================================================================
+# 6. T8 Hardening: No Silent Mock, Streaming 422, Allowlist/Caps, Isolation,
+#    Shared DB Rate Limit Across 2 Apps, Error Sanitization & Retention
+# ============================================================================
+
+
+def test_gateway_no_silent_mock_returns_503_provider_not_configured(app, auth_setup, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    client = TestClient(app)
+    headers_member = {
+        "Authorization": f"Bearer {auth_setup['member_token']}",
+        "X-Matrix-Project": auth_setup["project_id"],
+    }
+
+    resp = client.post(
+        "/api/v1/gateway/chat/completions",
+        headers=headers_member,
+        json={
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Should not silently mock"}],
+        },
+    )
+    assert resp.status_code == 503
+    detail = resp.json()["detail"]
+    assert detail["code"] == "provider_not_configured"
+    assert "OPENAI_API_KEY" in detail["missing_env_vars"]
+    assert "ANTHROPIC_API_KEY" in detail["missing_env_vars"]
+
+    # Error row recorded in DB logs with sanitized error
+    logs_res = client.get("/api/v1/gateway/logs", headers=headers_member)
+    assert logs_res.status_code == 200
+    assert logs_res.json()["logs"][0]["status"] == "ERROR"
+    assert "provider_not_configured" in (logs_res.json()["logs"][0]["error_sanitized"] or "")
+
+
+def test_gateway_stream_true_returns_422(app, auth_setup):
+    client = TestClient(app)
+    headers_member = {
+        "Authorization": f"Bearer {auth_setup['member_token']}",
+        "X-Matrix-Project": auth_setup["project_id"],
+    }
+    resp = client.post(
+        "/api/v1/gateway/chat/completions",
+        headers=headers_member,
+        json={
+            "model": "gpt-4o",
+            "provider": "mock",
+            "stream": True,
+            "messages": [{"role": "user", "content": "Stream me"}],
+        },
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["code"] == "stream_not_supported"
+
+
+def test_gateway_param_allowlist_and_caps(app, auth_setup):
+    client = TestClient(app)
+    headers_member = {
+        "Authorization": f"Bearer {auth_setup['member_token']}",
+        "X-Matrix-Project": auth_setup["project_id"],
+    }
+
+    # Unknown params (including base_url/api_key injection attempts) are dropped and reported in x-matrix-warnings
+    resp = client.post(
+        "/api/v1/gateway/chat/completions",
+        headers=headers_member,
+        json={
+            "model": "gpt-4o",
+            "provider": "mock",
+            "messages": [{"role": "user", "content": "Allowlist test"}],
+            "base_url": "https://evil.example.com/v1",
+            "api_key": "sk-injected-secret-12345",
+            "unknown_flag": True,
+        },
+    )
+    assert resp.status_code == 200
+    warnings_hdr = resp.headers.get("x-matrix-warnings", "")
+    assert "dropped_param:base_url" in warnings_hdr
+    assert "dropped_param:api_key" in warnings_hdr
+    assert "dropped_param:unknown_flag" in warnings_hdr
+
+    # max_tokens cap -> 422
+    resp_cap_tokens = client.post(
+        "/api/v1/gateway/chat/completions",
+        headers=headers_member,
+        json={
+            "model": "gpt-4o",
+            "provider": "mock",
+            "max_tokens": 999_999,
+            "messages": [{"role": "user", "content": "Too many tokens"}],
+        },
+    )
+    assert resp_cap_tokens.status_code == 422
+    assert resp_cap_tokens.json()["detail"]["code"] == "max_tokens_cap_exceeded"
+
+    # n cap -> 422
+    resp_cap_n = client.post(
+        "/api/v1/gateway/chat/completions",
+        headers=headers_member,
+        json={
+            "model": "gpt-4o",
+            "provider": "mock",
+            "n": 25,
+            "messages": [{"role": "user", "content": "Too many choices"}],
+        },
+    )
+    assert resp_cap_n.status_code == 422
+    assert resp_cap_n.json()["detail"]["code"] == "n_cap_exceeded"
+
+
+def test_gateway_error_sanitization():
+    import httpx
+
+    secret = "sk-supersecretkey1234567890"
+    long_body = f"upstream failure for Bearer {secret} at https://api.openai.com/v1/chat/completions " + ("x" * 400)
+    req = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    resp = httpx.Response(500, text=long_body, request=req)
+    exc = httpx.HTTPStatusError("err", request=req, response=resp)
+
+    sanitized = sanitize_provider_error(exc, secret_values=[secret], max_body_chars=200)
+    assert secret not in sanitized
+    assert "https://api.openai.com" not in sanitized
+    assert "[redacted-secret]" in sanitized
+    assert "[redacted-url]" in sanitized
+    # Body portion bounded to <= 200 chars (+ "HTTP 500: " + "...")
+    assert len(sanitized) <= 220
+
+
+def test_gateway_project_isolation_all_endpoints(app, auth_setup):
+    client = TestClient(app)
+    proj_a = auth_setup["project_id"]
+    proj_b = auth_setup["other_project_id"]
+    headers_a = {
+        "Authorization": f"Bearer {auth_setup['member_token']}",
+        "X-Matrix-Project": proj_a,
+    }
+    headers_b = {
+        "Authorization": f"Bearer {auth_setup['other_member_token']}",
+        "X-Matrix-Project": proj_b,
+    }
+
+    app.state.gateway_router.rate_limiter.set_project_limits(proj_a, rpm=12, tpm=50_000)
+    app.state.gateway_router.rate_limiter.set_project_limits(proj_b, rpm=34, tpm=50_000)
+
+    shared_payload = {
+        "model": "gpt-4o",
+        "provider": "mock",
+        "messages": [{"role": "user", "content": "Confidential prompt for tenant A"}],
+        "temperature": 0.0,
+    }
+
+    # Project A calls twice -> MISS then HIT
+    r_a1 = client.post("/api/v1/gateway/chat/completions", headers=headers_a, json=shared_payload)
+    assert r_a1.status_code == 200
+    assert r_a1.headers["x-matrix-cache"] == "MISS"
+
+    r_a2 = client.post("/api/v1/gateway/chat/completions", headers=headers_a, json=shared_payload)
+    assert r_a2.status_code == 200
+    assert r_a2.headers["x-matrix-cache"] == "HIT"
+
+    # Project B calls identical payload -> MUST BE MISS (cache key includes project_id)
+    r_b1 = client.post("/api/v1/gateway/chat/completions", headers=headers_b, json=shared_payload)
+    assert r_b1.status_code == 200
+    assert r_b1.headers["x-matrix-cache"] == "MISS"
+
+    # Stats isolated per project
+    stats_a = client.get("/api/v1/gateway/stats", headers=headers_a).json()
+    stats_b = client.get("/api/v1/gateway/stats", headers=headers_b).json()
+    assert stats_a["total_requests"] == 2
+    assert stats_a["cache_hits"] == 1
+    assert stats_b["total_requests"] == 1
+    assert stats_b["cache_hits"] == 0
+
+    # Logs isolated per project
+    logs_a = client.get("/api/v1/gateway/logs", headers=headers_a).json()["logs"]
+    logs_b = client.get("/api/v1/gateway/logs", headers=headers_b).json()["logs"]
+    assert all(row["project_id"] == proj_a for row in logs_a)
+    assert all(row["project_id"] == proj_b for row in logs_b)
+    assert len(logs_a) == 2
+    assert len(logs_b) == 1
+
+    # Providers metrics isolated per project
+    prov_a = {p["name"]: p for p in client.get("/api/v1/gateway/providers", headers=headers_a).json()["providers"]}
+    prov_b = {p["name"]: p for p in client.get("/api/v1/gateway/providers", headers=headers_b).json()["providers"]}
+    assert prov_a["mock"]["total_requests"] == 1
+    assert prov_b["mock"]["total_requests"] == 1
+
+    # Rules reflect per-project rate limit and do not include mock in production fallback
+    rules_a = client.get("/api/v1/gateway/rules", headers=headers_a).json()["rules"]
+    rules_b = client.get("/api/v1/gateway/rules", headers=headers_b).json()["rules"]
+    assert rules_a[0]["rate_limit_rpm"] == 12
+    assert rules_b[0]["rate_limit_rpm"] == 34
+    assert all("mock" not in fb for r in rules_a for fb in r["fallback_chain"])
+
+
+def test_gateway_shared_rate_limit_across_two_app_instances(tmp_path):
+    """Proves 2 separate FastAPI app instances sharing the same DB enforce a shared rate limit."""
+    db_url = f"sqlite:///{tmp_path}/shared_gw.db"
+    app1 = create_app(Settings(database_url=db_url, span_store="memory"))
+    app2 = create_app(Settings(database_url=db_url, span_store="memory"))
+
+    factory = app1.state.session_factory
+    with factory() as db:
+        project, _ = create_project(db, "Shared RL Project", with_key=False)
+        db.commit()
+        project_id = project.id
+    user_id = make_user(factory)
+    add_membership(factory, user_id, project_id, Role.MEMBER)
+    token = session_token(factory, user_id)
+    headers = {"Authorization": f"Bearer {token}", "X-Matrix-Project": project_id}
+
+    # Both workers have the same RPM=2 limit for this project
+    app1.state.gateway_router.rate_limiter.set_project_limits(project_id, rpm=2, tpm=50_000)
+    app2.state.gateway_router.rate_limiter.set_project_limits(project_id, rpm=2, tpm=50_000)
+
+    client1 = TestClient(app1)
+    client2 = TestClient(app2)
+
+    # Request 1 on worker 1 -> 200
+    r1 = client1.post(
+        "/api/v1/gateway/chat/completions",
+        headers=headers,
+        json={"model": "gpt-4o", "provider": "mock", "messages": [{"role": "user", "content": "w1 req1"}]},
+    )
+    assert r1.status_code == 200
+
+    # Request 2 on worker 2 -> 200
+    r2 = client2.post(
+        "/api/v1/gateway/chat/completions",
+        headers=headers,
+        json={"model": "gpt-4o", "provider": "mock", "messages": [{"role": "user", "content": "w2 req2"}]},
+    )
+    assert r2.status_code == 200
+
+    # Request 3 on worker 1 -> 429 (shared counter is already at 2!)
+    r3 = client1.post(
+        "/api/v1/gateway/chat/completions",
+        headers=headers,
+        json={"model": "gpt-4o", "provider": "mock", "messages": [{"role": "user", "content": "w1 req3"}]},
+    )
+    assert r3.status_code == 429
+
+    # Request 4 on worker 2 -> 429 as well
+    r4 = client2.post(
+        "/api/v1/gateway/chat/completions",
+        headers=headers,
+        json={"model": "gpt-4o", "provider": "mock", "messages": [{"role": "user", "content": "w2 req4"}]},
+    )
+    assert r4.status_code == 429
+
+    # Shared DB stats: worker 2 sees both requests logged across worker 1 & worker 2
+    stats2 = client2.get("/api/v1/gateway/stats", headers=headers).json()
+    assert stats2["total_requests"] == 2
+
+
+def test_gateway_retention_cleanup(app, auth_setup):
+    from datetime import UTC, datetime, timedelta
+
+    factory = app.state.session_factory
+    router = app.state.gateway_router
+    router.bind_session_factory(factory)
+
+    old_ts = datetime.now(UTC) - timedelta(days=45)
+    recent_ts = datetime.now(UTC)
+    with factory() as db:
+        db.add(
+            GatewayRequest(
+                id="gw-old",
+                project_id=auth_setup["project_id"],
+                ts=old_ts,
+                route="/api/v1/gateway/chat/completions",
+                model="gpt-4o",
+                provider="mock",
+                status="DIRECT",
+                latency_ms=1.0,
+                input_tokens=5,
+                output_tokens=5,
+                cost_usd=0.0,
+                cache_hit=False,
+                simulated=True,
+            )
+        )
+        db.add(
+            GatewayRequest(
+                id="gw-new",
+                project_id=auth_setup["project_id"],
+                ts=recent_ts,
+                route="/api/v1/gateway/chat/completions",
+                model="gpt-4o",
+                provider="mock",
+                status="DIRECT",
+                latency_ms=1.0,
+                input_tokens=5,
+                output_tokens=5,
+                cost_usd=0.0,
+                cache_hit=False,
+                simulated=True,
+            )
+        )
+        db.add(
+            GatewayRateWindow(
+                project_id=auth_setup["project_id"],
+                scope="default",
+                window_start=1000,
+                request_count=5,
+                token_count=100,
+            )
+        )
+        db.commit()
+
+    deleted_reqs = router.cleanup_expired_requests()
+    deleted_wins = router.rate_limiter.cleanup_expired_windows()
+    assert deleted_reqs == 1
+    assert deleted_wins == 1
+
+    logs = router.get_logs(limit=10, project_id=auth_setup["project_id"])
+    assert [row["id"] for row in logs] == ["gw-new"]

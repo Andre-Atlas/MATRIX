@@ -89,7 +89,7 @@ def test_member_writes_viewer_and_read_key_cannot(env):
         ("/api/v1/mlops/models", {"name": "m1"}),
         ("/api/v1/safety/scans", {"categories": ["LLM01"]}),
         ("/api/v1/sandboxes/runs", {"name": "s1"}),
-        ("/api/v1/gateway/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}),
+        ("/api/v1/gateway/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "provider": "mock"}),
     ]
     for path, body in writes:
         for denied in (roles["viewer"], env["read_key"]):
@@ -140,12 +140,10 @@ def test_protected_alias_and_model_delete_are_admin_only(env):
     assert client.delete(f"/api/v1/mlops/models/{model_id}?force=true", headers=roles["owner"]).status_code == 200
 
 
-def test_sandbox_network_needs_an_admin_principal(env):
+def test_sandbox_network_is_rejected_until_egress_proxy_exists(env):
     client, roles = env["client"], env["roles"]
     policy = {"network_mode": "bridge"}
-    for denied in (roles["member"], env["key"]):
-        resp = client.post("/api/v1/sandboxes/runs", json={"name": "n", "sandbox_policy": policy}, headers=denied)
-        assert resp.status_code == 403
-    resp = client.post("/api/v1/sandboxes/runs", json={"name": "n", "sandbox_policy": policy}, headers=roles["admin"])
-    assert resp.status_code == 201, resp.text
-    assert resp.json()["sandbox_policy"]["network_approved_by"]
+    for principal in (roles["member"], env["key"], roles["admin"]):
+        resp = client.post("/api/v1/sandboxes/runs", json={"name": "n", "sandbox_policy": policy}, headers=principal)
+        assert resp.status_code == 422, resp.text
+        assert "egress proxy" in resp.json()["detail"]

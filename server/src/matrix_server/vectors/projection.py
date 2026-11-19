@@ -2,12 +2,41 @@
 
 from __future__ import annotations
 
+import importlib.util
 import math
 import random
 import re
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field
+
+DEFAULT_PROJECTION_ENGINE = "pca-lite"
+DEFAULT_EMBEDDING_LABEL = "hash-3gram (demo)"
+
+
+class EngineUnavailable(RuntimeError):
+    """Raised when an optional analytics projection/clustering engine is not installed (ADR-009)."""
+
+
+class ProjectionEngine(Protocol):
+    """Interface for dimensional projection and clustering engines (ADR-009)."""
+
+    name: str
+    simulated: bool
+
+    def project(
+        self,
+        embeddings: list[list[float]],
+        n_components: int = 3,
+        seed: int = 42,
+    ) -> list[list[float]]: ...
+
+    def cluster(
+        self,
+        embeddings: list[list[float]],
+        k: int = 4,
+        seed: int = 42,
+    ) -> tuple[list[int], list[list[float]]]: ...
 
 
 class VectorPoint(BaseModel):
@@ -440,3 +469,110 @@ def build_vector_projection(
         )
 
     return points, clusters
+
+
+# --- Projection Engine Implementations & Optional Analytics Stubs (ADR-009) ---
+
+
+class PCALiteEngine:
+    """Pure-Python deterministic PCA-lite projection & k-means clustering engine (demo/simulated)."""
+
+    name: str = DEFAULT_PROJECTION_ENGINE
+    simulated: bool = True
+
+    def project(
+        self,
+        embeddings: list[list[float]],
+        n_components: int = 3,
+        seed: int = 42,
+    ) -> list[list[float]]:
+        return project_embeddings(embeddings, n_components=n_components, seed=seed)
+
+    def cluster(
+        self,
+        embeddings: list[list[float]],
+        k: int = 4,
+        seed: int = 42,
+    ) -> tuple[list[int], list[list[float]]]:
+        return cluster_embeddings(embeddings, k=k, seed=seed)
+
+
+class UMAPProjectionEngine:
+    """Stub for UMAP projection engine (requires optional worker 'analytics' extra, ADR-009)."""
+
+    name: str = "umap"
+    simulated: bool = False
+
+    def _ensure_installed(self) -> None:
+        if importlib.util.find_spec("umap") is None:
+            raise EngineUnavailable(
+                "UMAP projection engine is unavailable: install optional extra 'analytics' (umap-learn)."
+            )
+        raise EngineUnavailable(
+            "UMAP projection runs asynchronously in the analytics worker (ADR-009), not inline in the API."
+        )
+
+    def project(
+        self,
+        embeddings: list[list[float]],
+        n_components: int = 3,
+        seed: int = 42,
+    ) -> list[list[float]]:
+        self._ensure_installed()
+        return []  # pragma: no cover
+
+    def cluster(
+        self,
+        embeddings: list[list[float]],
+        k: int = 4,
+        seed: int = 42,
+    ) -> tuple[list[int], list[list[float]]]:
+        self._ensure_installed()
+        return [], []  # pragma: no cover
+
+
+class HDBSCANClusterEngine:
+    """Stub for HDBSCAN clustering engine (requires optional worker 'analytics' extra, ADR-009)."""
+
+    name: str = "hdbscan"
+    simulated: bool = False
+
+    def _ensure_installed(self) -> None:
+        if importlib.util.find_spec("hdbscan") is None:
+            raise EngineUnavailable(
+                "HDBSCAN clustering engine is unavailable: install optional extra 'analytics' (hdbscan)."
+            )
+        raise EngineUnavailable(
+            "HDBSCAN clustering runs asynchronously in the analytics worker (ADR-009), not inline in the API."
+        )
+
+    def project(
+        self,
+        embeddings: list[list[float]],
+        n_components: int = 3,
+        seed: int = 42,
+    ) -> list[list[float]]:
+        self._ensure_installed()
+        return []  # pragma: no cover
+
+    def cluster(
+        self,
+        embeddings: list[list[float]],
+        k: int = 4,
+        seed: int = 42,
+    ) -> tuple[list[int], list[list[float]]]:
+        self._ensure_installed()
+        return [], []  # pragma: no cover
+
+
+def get_projection_engine(name: str = DEFAULT_PROJECTION_ENGINE) -> ProjectionEngine:
+    """Returns a ProjectionEngine instance by name ('pca-lite', 'umap', 'hdbscan')."""
+    norm = name.strip().lower()
+    if norm in ("pca-lite", "pca", "default"):
+        return PCALiteEngine()
+    if norm == "umap":
+        return UMAPProjectionEngine()
+    if norm == "hdbscan":
+        return HDBSCANClusterEngine()
+    raise EngineUnavailable(f"Unknown projection engine '{name}'. Supported: pca-lite, umap, hdbscan.")
+

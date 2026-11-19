@@ -38,6 +38,9 @@ class TemporalDriftPoint(BaseModel):
 
 class DriftReport(BaseModel):
     status: DriftLevel
+    engine: str = "pca-lite"
+    embedding: str = "hash-3gram (demo)"
+    simulated: bool = True
     metrics: DriftMetrics
     thresholds: dict[str, float] = Field(
         default_factory=lambda: {
@@ -221,6 +224,9 @@ def compute_drift_report(
 
     return DriftReport(
         status=status,
+        engine="pca-lite",
+        embedding="hash-3gram (demo)",
+        simulated=True,
         metrics=metrics,
         cluster_distribution=cluster_dist_map,
         history=history_points or [],
@@ -228,5 +234,8 @@ def compute_drift_report(
             "reference_sample_count": len(reference_embeddings),
             "production_sample_count": len(production_embeddings),
             "num_clusters": num_clusters,
+            "engine": "pca-lite",
+            "embedding": "hash-3gram (demo)",
+            "simulated": True,
         },
     )

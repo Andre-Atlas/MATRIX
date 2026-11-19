@@ -1,4 +1,4 @@
-"""API endpoints for OWASP Top 10 for LLMs Defensive Security & Compliance (MATRIX Track C)."""
+"""API endpoints for OWASP Top 10 for LLMs Defensive Security & Compliance (MATRIX Track C / T8)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, null, select
 from sqlalchemy.orm import Session
 
 from matrix_server.auth import Principal, Role, require
@@ -19,6 +19,7 @@ from matrix_server.safety import (
     list_probes,
     run_safety_scan,
 )
+from matrix_server.safety.runner import NOT_EVALUATED_NO_TARGET_MESSAGE
 from matrix_server.storage.db import as_utc, get_db
 from matrix_server.storage.models import SafetyScan
 
@@ -36,7 +37,9 @@ def _iso_utc(dt: datetime | None) -> str | None:
     return utc_dt.isoformat().replace("+00:00", "Z") if utc_dt else None
 
 
-def _compute_risk_level(global_score: float) -> str:
+def _compute_risk_level(global_score: float | None) -> str:
+    if global_score is None:
+        return "not_evaluated"
     if global_score >= 85.0:
         return "low"
     if global_score >= 70.0:
@@ -58,7 +61,11 @@ def _enrich_finding(
     probe = get_probe(probe_id)
     cat = get_category(category_id)
 
-    probe_name = probe.name if probe else f.get("probe_name") or ("Custom Target Prompt Audit" if probe_id == "probe-adhoc-target" else probe_id)
+    probe_name = (
+        probe.name
+        if probe
+        else f.get("probe_name") or ("Custom Target Prompt Audit" if probe_id == "probe-adhoc-target" else probe_id)
+    )
     attack_prompt = probe.prompt if probe else f.get("attack_prompt") or (target_prompt or "")
     cat_name = cat.name if cat else f.get("category_name") or category_id
 
@@ -127,7 +134,9 @@ def create_safety_scan(
     principal: MemberAuth,
 ) -> dict[str, Any]:
     """Execute a defensive security audit scan and record the compliance report."""
-    effective_prompt = payload.target_prompt if payload.target_prompt is not None else payload.target_system_prompt
+    effective_prompt = (
+        payload.target_prompt if payload.target_prompt is not None else payload.target_system_prompt
+    )
     report = run_safety_scan(
         category_ids=payload.categories,
         target_prompt=effective_prompt,
@@ -147,7 +156,8 @@ def create_safety_scan(
         target_prompt=report.target_prompt,
         target_model=report.target_model,
         status=report.status,
-        global_score=report.global_score,
+        global_score=null() if report.global_score is None else report.global_score,
+        simulated=report.simulated,
         total_probes=report.total_probes,
         passed_count=report.passed_count,
         failed_count=report.failed_count,
@@ -159,6 +169,7 @@ def create_safety_scan(
 
     scan_name = payload.name or f"Audit {report.scan_id[:8]}"
     categories_tested = list(categories_dump.keys())
+    safety_score = round(report.global_score, 1) if report.global_score is not None else None
 
     return {
         **report.model_dump(),
@@ -166,7 +177,9 @@ def create_safety_scan(
         "scan_id": report.scan_id,
         "project_id": principal.project_id,
         "name": scan_name,
-        "safety_score": round(report.global_score, 1),
+        "safety_score": safety_score,
+        "simulated": report.simulated,
+        "message": report.message,
         "probes_passed": report.passed_count,
         "probes_failed": report.failed_count,
         "risk_level": _compute_risk_level(report.global_score),
@@ -194,10 +207,14 @@ def list_safety_scans(
 
     items = []
     for s in scans:
-        pass_rate = round(s.passed_count / s.total_probes, 4) if s.total_probes > 0 else 1.0
+        if s.status == "not_evaluated" or s.total_probes <= 0:
+            pass_rate = 0.0
+        else:
+            pass_rate = round(s.passed_count / s.total_probes, 4)
         cats_summary = s.categories_summary or {}
         categories_tested = list(cats_summary.keys())
         created_iso = _iso_utc(s.created_at)
+        safety_score = round(s.global_score, 1) if s.global_score is not None else None
         items.append(
             {
                 "id": s.id,
@@ -208,7 +225,9 @@ def list_safety_scans(
                 "target_model": s.target_model,
                 "status": s.status,
                 "global_score": s.global_score,
-                "safety_score": round(s.global_score, 1),
+                "safety_score": safety_score,
+                "simulated": bool(s.simulated),
+                "message": NOT_EVALUATED_NO_TARGET_MESSAGE if s.status == "not_evaluated" else None,
                 "total_probes": s.total_probes,
                 "passed_count": s.passed_count,
                 "failed_count": s.failed_count,
@@ -247,7 +266,10 @@ def get_safety_scan(
     if scan is None:
         raise HTTPException(status_code=404, detail="safety scan not found")
 
-    pass_rate = round(scan.passed_count / scan.total_probes, 4) if scan.total_probes > 0 else 1.0
+    if scan.status == "not_evaluated" or scan.total_probes <= 0:
+        pass_rate = 0.0
+    else:
+        pass_rate = round(scan.passed_count / scan.total_probes, 4)
     created_iso = _iso_utc(scan.created_at)
     cats_summary = scan.categories_summary or {}
     categories_tested = list(cats_summary.keys())
@@ -255,6 +277,7 @@ def get_safety_scan(
         _enrich_finding(f, scan.id, created_iso, scan.target_prompt)
         for f in (scan.findings or [])
     ]
+    safety_score = round(scan.global_score, 1) if scan.global_score is not None else None
 
     return {
         "id": scan.id,
@@ -265,7 +288,9 @@ def get_safety_scan(
         "target_model": scan.target_model,
         "status": scan.status,
         "global_score": scan.global_score,
-        "safety_score": round(scan.global_score, 1),
+        "safety_score": safety_score,
+        "simulated": bool(scan.simulated),
+        "message": NOT_EVALUATED_NO_TARGET_MESSAGE if scan.status == "not_evaluated" else None,
         "total_probes": scan.total_probes,
         "passed_count": scan.passed_count,
         "failed_count": scan.failed_count,
@@ -279,4 +304,3 @@ def get_safety_scan(
         "findings": enriched_findings,
         "created_at": created_iso,
     }
-

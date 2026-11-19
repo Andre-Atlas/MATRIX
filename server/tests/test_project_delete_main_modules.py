@@ -37,7 +37,9 @@ MAIN_TABLES = {
     "mlops_model_aliases",
     "mlops_model_versions",
     "mlops_registered_models",
-    "mlops_sweeps",
+    "sweeps",
+    "gateway_requests",
+    "gateway_rate_windows",
     "runs",
     "run_reports",
     "safety_scans",
@@ -95,10 +97,13 @@ def _populate(client: TestClient, h: dict[str, str]) -> None:
         "name": "b", "suite": "lm_eval", "tasks": ["gsm8k"], "runner_backend": "local_sim", "target_model": "m", "sync_exec": True,
     }, headers=h))
     _ok(client.post("/api/v1/sandboxes/runs", json={
-        "name": "sb", "runner_backend": "local_sandbox",
+        "name": "sb", "runner_backend": "fake",
         "solver_config": {"steps": [{"tool_name": "file_edit", "tool_args": {"path": "a.txt", "content": "x"}}]},
         "scorer_config": {"name": "file_exists", "path": "a.txt"},
         "sync_exec": True,
+    }, headers=h))
+    _ok(client.post("/api/v1/gateway/chat/completions", json={
+        "messages": [{"role": "user", "content": "hi"}], "provider": "mock",
     }, headers=h))
 
 
@@ -111,7 +116,8 @@ def _counts(app, project_id: str) -> dict[str, int]:
         }
 
 
-def test_delete_project_removes_rows_of_every_main_module(app):
+def test_delete_project_removes_rows_of_every_main_module(app, monkeypatch):
+    monkeypatch.setenv("MATRIX_ENV", "test")
     client = TestClient(app)
     factory = app.state.session_factory
     pid, roles = project_with_roles(factory, "doomed")

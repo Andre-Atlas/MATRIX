@@ -454,8 +454,9 @@ class SafetyScan(Base):
     project_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     target_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
     target_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
-    status: Mapped[str] = mapped_column(String(16), nullable=False, default="passed")
-    global_score: Mapped[float] = mapped_column(Float, nullable=False, default=100.0)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="passed")
+    global_score: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
+    simulated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     total_probes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     passed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -752,6 +753,7 @@ class BenchmarkRun(Base):
     )
     dataset_commit_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="queued")
+    simulated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     summary_metrics: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     job_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -784,6 +786,7 @@ class BenchmarkTaskResult(Base):
     sample_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     primary_metric: Mapped[str] = mapped_column(String(100), nullable=False)
     primary_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    simulated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     metrics: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     latency_ms_p50: Mapped[float | None] = mapped_column(Float, nullable=True)
     latency_ms_p95: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -807,7 +810,7 @@ class SandboxRun(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
-    runner_backend: Mapped[str] = mapped_column(String(32), nullable=False, default="local_sandbox")
+    runner_backend: Mapped[str] = mapped_column(String(32), nullable=False, default="docker")
     dataset_id: Mapped[str | None] = mapped_column(
         String(32), ForeignKey("datasets.id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -815,7 +818,8 @@ class SandboxRun(Base):
     solver_config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     scorer_config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     sandbox_policy: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
-    status: Mapped[str] = mapped_column(String(16), nullable=False, default="queued")
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="queued")
+    simulated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     pass_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
     total_tasks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     passed_tasks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -847,6 +851,7 @@ class SandboxTaskTranscript(Base):
     )
     task_key: Mapped[str] = mapped_column(String(200), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="passed")
+    simulated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     scorer_details: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     steps: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
@@ -864,4 +869,6 @@ class SandboxTaskTranscript(Base):
 # Keeps Base.metadata complete for Alembic and create_all without every task editing this file.
 import matrix_server.artifacts.models
 import matrix_server.egress.models
-import matrix_server.runs.models  # noqa: F401  (all of these only register tables)
+import matrix_server.gateway.models
+import matrix_server.runs.models
+import matrix_server.sweeps.models  # noqa: F401  (all of these only register tables)
