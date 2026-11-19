@@ -66,11 +66,24 @@ def upgrade() -> None:
             existing_type=sa.Float(),
             nullable=True,
         )
+        batch_op.alter_column(
+            "status",
+            existing_type=sa.String(length=16),
+            type_=sa.String(length=24),
+            existing_nullable=False,
+        )
 
 
 def downgrade() -> None:
     op.execute(sa.text("UPDATE safety_scans SET global_score = 0.0 WHERE global_score IS NULL"))
+    op.execute(sa.text("UPDATE safety_scans SET status = substr(status, 1, 16) WHERE length(status) > 16"))
     with op.batch_alter_table("safety_scans") as batch_op:
+        batch_op.alter_column(
+            "status",
+            existing_type=sa.String(length=24),
+            type_=sa.String(length=16),
+            existing_nullable=False,
+        )
         batch_op.alter_column(
             "global_score",
             existing_type=sa.Float(),

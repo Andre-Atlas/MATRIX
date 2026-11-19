@@ -599,6 +599,8 @@ class ModelVersion(Base):
             sqlite_where=text("stage = 'production'"),
             postgresql_where=text("stage = 'production'"),
         ),
+        Index("ix_mlops_mv_project_eval_exp", "project_id", "eval_experiment_id"),
+        Index("ix_mlops_mv_project_safety_scan", "project_id", "safety_scan_id"),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
@@ -742,6 +744,7 @@ class BenchmarkRun(Base):
     __table_args__ = (
         Index("ix_benchmark_runs_project_created", "project_id", "created_at"),
         Index("ix_benchmark_runs_project_status", "project_id", "status"),
+        Index("ix_benchmark_runs_project_ds_commit", "project_id", "dataset_commit_id"),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
