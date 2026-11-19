@@ -1,27 +1,38 @@
-"""Comprehensive tests for Inspect AI Sandboxes runner, API, security, and RBAC."""
+"""Comprehensive tests for Inspect AI Sandboxes runner, API, security, and RBAC (T7)."""
+
+from __future__ import annotations
 
 import hashlib
+import os
+import subprocess
 
 import pytest
 from fastapi.testclient import TestClient
 from rbac_helpers import api_key_headers, project_with_roles
 
+import matrix_server.sandboxes as sandboxes_pkg
+import matrix_server.sandboxes.runner as runner_mod
 from matrix_server.app import create_app
 from matrix_server.config import Settings
 from matrix_server.sandboxes.runner import (
     DockerSandbox,
-    LocalSandbox,
+    FakeSandbox,
     SandboxPolicyError,
+    SandboxUnavailableError,
     build_docker_run_args,
     execute_step,
+    is_docker_available,
     validate_sandbox_path,
 )
-from matrix_server.storage.models import SandboxRun
+
+
+def _require_docker() -> None:
+    if not is_docker_available():
+        pytest.skip("Docker daemon not available")
 
 
 @pytest.fixture
 def env(tmp_path):
-    # Users, memberships and sessions of the branch's RBAC (G0); `main`'s JWT/register flow is gone.
     settings = Settings(
         database_url=f"sqlite:///{tmp_path}/sandboxes_test.db",
         span_store="memory",
@@ -51,59 +62,90 @@ def env(tmp_path):
     }
 
 
-def test_local_sandbox_step_execution_and_truncation(tmp_path):
-    sandbox = LocalSandbox(workdir=tmp_path / "box", timeout_seconds=10.0)
+# ---------------------------------------------------------------------------
+# 1. Host Execution Removed & Fail-Closed Tests
+# ---------------------------------------------------------------------------
 
-    # 1. file_edit step
-    res_edit = execute_step(
-        sandbox=sandbox,
-        step_idx=1,
-        tool_name="file_edit",
-        tool_args={"path": "src/code.py", "content": "print('hello from code.py')\n"},
-        thought="Write initial source file",
-    )
-    assert res_edit["exit_code"] == 0
-    assert "written successfully" in res_edit["stdout"]
-    assert sandbox.file_exists("src/code.py")
-    assert "hello from code.py" in sandbox.read_file("src/code.py")
 
-    # 2. python step
-    res_py = execute_step(
-        sandbox=sandbox,
-        step_idx=2,
-        tool_name="python",
-        tool_args={"code": "import sys; sys.stdout.write('py_output'); sys.stderr.write('py_err')"},
-        thought="Run python snippet",
-    )
-    assert res_py["exit_code"] == 0
-    assert res_py["stdout"] == "py_output"
-    assert res_py["stderr"] == "py_err"
-    assert res_py["duration_ms"] > 0
-    assert res_py["input_tokens"] > 0
+def test_local_sandbox_is_completely_removed():
+    assert not hasattr(sandboxes_pkg, "LocalSandbox")
+    assert not hasattr(runner_mod, "LocalSandbox")
 
-    # 3. bash step
-    res_bash = execute_step(
-        sandbox=sandbox,
-        step_idx=3,
-        tool_name="bash",
-        tool_args={"cmd": "echo 'bash_ok'"},
-        thought="Run bash command",
-    )
+
+def test_fake_sandbox_requires_explicit_test_or_dev_env(tmp_path, monkeypatch):
+    monkeypatch.delenv("MATRIX_ENV", raising=False)
+    with pytest.raises(SandboxPolicyError, match="MATRIX_ENV"):
+        FakeSandbox(workdir=tmp_path / "box")
+
+    monkeypatch.setenv("MATRIX_ENV", "production")
+    with pytest.raises(SandboxPolicyError, match="MATRIX_ENV"):
+        FakeSandbox(workdir=tmp_path / "box")
+
+    monkeypatch.setenv("MATRIX_ENV", "test")
+    sb = FakeSandbox(workdir=tmp_path / "box")
+    assert sb.simulated is True
+    assert sb.backend == "fake"
+
+
+def test_fake_sandbox_never_executes_on_host(tmp_path, monkeypatch):
+    monkeypatch.setenv("MATRIX_ENV", "test")
+
+    def _forbid(*args, **kwargs):
+        raise AssertionError("Host execution must NEVER be invoked by FakeSandbox")
+
+    monkeypatch.setattr(subprocess, "run", _forbid)
+    monkeypatch.setattr(os, "system", _forbid)
+
+    sandbox = FakeSandbox(workdir=tmp_path / "fake_box")
+    res_bash = execute_step(sandbox, 1, "bash", {"cmd": "rm -rf /"})
     assert res_bash["exit_code"] == 0
-    assert "bash_ok" in res_bash["stdout"]
+    assert "[simulated:bash]" in res_bash["stdout"]
 
-    # 4. Truncation test: generate > 64KB output (e.g. 100KB)
-    large_code = "print('A' * 80000)"
-    res_large = execute_step(
-        sandbox=sandbox,
-        step_idx=4,
-        tool_name="python",
-        tool_args={"code": large_code},
-        thought="Run large output",
+    res_py = execute_step(sandbox, 2, "python", {"code": "import os; os.system('id')"})
+    assert res_py["exit_code"] == 0
+    assert "[simulated:python]" in res_py["stdout"]
+
+    # Deterministic output for same command
+    res_bash2 = execute_step(sandbox, 3, "bash", {"cmd": "rm -rf /"})
+    assert res_bash2["stdout"] == res_bash["stdout"]
+
+
+def test_docker_dead_socket_fails_closed_without_host_execution(env, tmp_path, monkeypatch):
+    """Point DOCKER_HOST at a dead socket and prove nothing ever executes on the host."""
+    monkeypatch.setenv("DOCKER_HOST", f"unix://{tmp_path / 'dead-docker.sock'}")
+
+    def _forbid_os_system(*args, **kwargs):
+        raise AssertionError("os.system must NEVER be called")
+
+    monkeypatch.setattr(os, "system", _forbid_os_system)
+
+    real_run = subprocess.run
+
+    def _checked_run(cmd, *args, **kwargs):
+        assert isinstance(cmd, list) and cmd[0] == "docker", f"Non-docker command attempted on host: {cmd}"
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", _checked_run)
+
+    with pytest.raises(SandboxUnavailableError):
+        DockerSandbox(workdir=tmp_path / "box")
+
+    # End-to-end via API (sync_exec=True in test env) -> status="sandbox_unavailable"
+    client: TestClient = env["client"]
+    res = client.post(
+        "/api/v1/sandboxes/runs",
+        headers=env["member_a"],
+        json={
+            "name": "dead-docker-run",
+            "runner_backend": "docker",
+            "sync_exec": True,
+        },
     )
-    assert res_large["exit_code"] == 0
-    # Output must be truncated to exactly 65536 bytes
-    assert len(res_large["stdout"].encode("utf-8")) == 65536
+    assert res.status_code == 201
+    data = res.json()
+    assert data["status"] == "sandbox_unavailable"
+    assert data["simulated"] is False
+    assert "Docker daemon" in (data["error"] or "")
 
 
 def test_path_traversal_validation():
@@ -118,67 +160,169 @@ def test_path_traversal_validation():
 
 
 # ---------------------------------------------------------------------------
-# Hardened Docker Specification Tests
+# 2. Hardened Docker Args, Allowlist, Minimal Env, Timeout, OOM, Truncation
 # ---------------------------------------------------------------------------
 
 
 def test_docker_hardened_flags_enforcement():
     args = build_docker_run_args(
-        image="python:3.11-slim",
+        image="python:3.12-slim",
         workdir_host="/tmp/host_workspace",
         sandbox_policy={"network_mode": "none"},
-        is_admin=False,
+        run_id="run123",
+        sample_id="task1",
     )
 
-    # Strictly check all required hardened flags
-    assert "--network=none" in args
+    assert args[:3] == ["docker", "run", "--rm"]
+    name_idx = args.index("--name")
+    assert args[name_idx + 1].startswith("matrix-sbx-run123-task1-")
+    assert "--init" in args
+    assert args[args.index("--network") + 1] == "none"
     assert "--read-only" in args
-    assert "--user=65534:65534" in args
-    assert "--cap-drop=ALL" in args
-    assert "--security-opt=no-new-privileges:true" in args
-    assert "--pids-limit=128" in args
-    assert "--tmpfs=/tmp:rw,noexec,nosuid,size=256m" in args
+    assert args[args.index("--user") + 1] == "65534:65534"
+    assert args[args.index("--cap-drop") + 1] == "ALL"
+    assert args[args.index("--security-opt") + 1] == "no-new-privileges:true"
+    assert args[args.index("--pids-limit") + 1] == "128"
+    assert args[args.index("--memory") + 1] == "512m"
+    assert args[args.index("--memory-swap") + 1] == "512m"
+    assert args[args.index("--cpus") + 1] == "1"
+    assert args[args.index("--tmpfs") + 1] == "/tmp:rw,noexec,nosuid,size=256m"
+    assert args[args.index("--ipc") + 1] == "none"
+    assert "--ulimit" in args
+    assert args.count("-v") == 1
+    assert args[args.index("-v") + 1] == "/tmp/host_workspace:/workspace:rw"
+    assert args[-1] == "python:3.12-slim"
 
 
-def test_docker_socket_mounting_forbidden():
-    # Attempting to mount docker.sock in docker args must raise SandboxPolicyError
-    with pytest.raises(SandboxPolicyError, match="strictly forbidden"):
-        build_docker_run_args(
-            image="python:3.11-slim",
-            workdir_host="/tmp/host_workspace",
-            sandbox_policy={"mounts": ["/var/run/docker.sock:/var/run/docker.sock"]},
-            is_admin=True,
-        )
+def test_image_allowlist_and_policy_rejection(monkeypatch):
+    monkeypatch.setenv("MATRIX_SANDBOX_IMAGES", "python:3.12-slim,alpine:3.20")
+
+    args = build_docker_run_args("alpine:3.20", "/tmp/ws")
+    assert args[-1] == "alpine:3.20"
+
+    with pytest.raises(SandboxPolicyError, match="allowlist"):
+        build_docker_run_args("ubuntu:latest", "/tmp/ws")
+
+    with pytest.raises(SandboxPolicyError, match="mounts/volumes"):
+        build_docker_run_args("python:3.12-slim", "/tmp/ws", {"mounts": ["/var/run/docker.sock:/var/run/docker.sock"]})
+
+    with pytest.raises(SandboxPolicyError, match="mounts/volumes"):
+        build_docker_run_args("python:3.12-slim", "/tmp/ws", {"volumes": ["/etc:/host_etc"]})
+
+    with pytest.raises(SandboxPolicyError, match="egress proxy"):
+        build_docker_run_args("python:3.12-slim", "/tmp/ws", {"network_mode": "bridge"})
+
+    with pytest.raises(SandboxPolicyError, match="cpus"):
+        build_docker_run_args("python:3.12-slim", "/tmp/ws", {"cpus": 8})
 
 
-def test_docker_sandbox_graceful_fallback(tmp_path):
-    # DockerSandbox should gracefully fall back to local execution if docker unavailable
-    ds = DockerSandbox(
-        workdir=tmp_path / "fallback_box",
-        sandbox_policy={"task_timeout_seconds": 15},
-    )
-    ds.write_file("test.txt", "fallback content")
-    assert ds.file_exists("test.txt")
-    code, stdout, _stderr = ds.execute_bash("cat test.txt")
+def test_docker_cli_minimal_env_no_server_secret_leak(tmp_path, monkeypatch):
+    monkeypatch.setenv("MATRIX_SECRET_PROBE", "super-secret-token-xyz")
+    monkeypatch.setenv("MATRIX_ADMIN_TOKEN", "admin-secret-abc")
+    captured_envs: list[dict[str, str]] = []
+
+    monkeypatch.setattr(runner_mod, "is_docker_available", lambda: True)
+
+    def _fake_run(cmd, **kwargs):
+        captured_envs.append(dict(kwargs.get("env") or {}))
+        return subprocess.CompletedProcess(cmd, 0, stdout=b"ok\n", stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    ds = DockerSandbox(workdir=tmp_path / "ws", run_id="r1", sample_id="s1")
+    code, out, err = ds.execute_bash("env")
     assert code == 0
-    assert "fallback content" in stdout
+    assert out == "ok\n"
+    assert err == ""
+    assert len(captured_envs) == 1
+    cli_env = captured_envs[0]
+    assert "MATRIX_SECRET_PROBE" not in cli_env
+    assert "MATRIX_ADMIN_TOKEN" not in cli_env
+    assert cli_env.get("HOME") == ""
+    assert "PATH" in cli_env
 
 
-# ---------------------------------------------------------------------------
-# API End-to-End Pipeline & Scorer Tests
-# ---------------------------------------------------------------------------
+def test_docker_timeout_kills_and_removes_container(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner_mod, "is_docker_available", lambda: True)
+    calls: list[list[str]] = []
+
+    def _fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if cmd[:2] == ["docker", "run"]:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=1.0, output=b"partial")
+        return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    ds = DockerSandbox(workdir=tmp_path / "ws", run_id="r1", sample_id="s1")
+    code, out, err = ds.execute_bash("sleep 60", timeout=1.0)
+    assert code == -1
+    assert out == "partial"
+    assert "timed out" in err
+
+    run_cmd = calls[0]
+    cname = run_cmd[run_cmd.index("--name") + 1]
+    assert ["docker", "kill", cname] in calls
+    assert ["docker", "rm", "-f", cname] in calls
 
 
-def test_sandbox_run_execution_local_pipeline_and_scorers(env):
+def test_docker_output_truncation_and_oom_137(env, tmp_path, monkeypatch):
+    monkeypatch.setattr(runner_mod, "is_docker_available", lambda: True)
+
+    # 1. Truncation at 64 KiB
+    def _large_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout=b"A" * 100_000, stderr=b"B" * 100_000)
+
+    monkeypatch.setattr(subprocess, "run", _large_run)
+    ds = DockerSandbox(workdir=tmp_path / "ws1", run_id="r1", sample_id="s1")
+    step = execute_step(ds, 1, "python", {"code": "print('A' * 100000)"})
+    assert step["exit_code"] == 0
+    assert len(step["stdout"].encode("utf-8")) == 65536
+    assert len(step["stderr"].encode("utf-8")) == 65536
+
+    # 2. OOM exit 137 -> transcript status == "oom"
+    def _oom_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 137, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", _oom_run)
     client: TestClient = env["client"]
-
-    # 1. Successful run with unit_test scorer and verified artifacts
     res = client.post(
         "/api/v1/sandboxes/runs",
         headers=env["member_a"],
         json={
-            "name": "unit-test-evaluation-run",
-            "runner_backend": "local_sandbox",
+            "name": "oom-run",
+            "runner_backend": "docker",
+            "solver_config": {
+                "steps": [{"tool_name": "python", "tool_args": {"code": "x = bytearray(10**9)"}}]
+            },
+            "sync_exec": True,
+        },
+    )
+    assert res.status_code == 201
+    run_id = res.json()["id"]
+    assert res.json()["simulated"] is False
+
+    t_list = client.get(f"/api/v1/sandboxes/runs/{run_id}/transcripts", headers=env["viewer_a"]).json()
+    assert len(t_list) == 1
+    assert t_list[0]["status"] == "oom"
+    assert t_list[0]["simulated"] is False
+
+
+# ---------------------------------------------------------------------------
+# 3. API Pipeline & Scorers (using explicit `fake` backend in MATRIX_ENV=test)
+# ---------------------------------------------------------------------------
+
+
+def test_sandbox_run_fake_pipeline_scorers_and_artifacts(env, monkeypatch):
+    monkeypatch.setenv("MATRIX_ENV", "test")
+    client: TestClient = env["client"]
+
+    res = client.post(
+        "/api/v1/sandboxes/runs",
+        headers=env["member_a"],
+        json={
+            "name": "fake-pipeline-run",
+            "runner_backend": "fake",
             "solver_config": {
                 "name": "react",
                 "steps": [
@@ -190,19 +334,11 @@ def test_sandbox_run_execution_local_pipeline_and_scorers(env):
                         },
                         "thought": "Write calculator module",
                     },
-                    {
-                        "tool_name": "file_edit",
-                        "tool_args": {
-                            "path": "test_calculator.py",
-                            "content": "from calculator import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",
-                        },
-                        "thought": "Write unit tests",
-                    },
                 ],
             },
             "scorer_config": {
-                "name": "unit_test",
-                "command": "python -m pytest test_calculator.py",
+                "name": "file_exists",
+                "files": ["calculator.py"],
                 "artifacts": ["calculator.py"],
             },
             "sync_exec": True,
@@ -212,13 +348,11 @@ def test_sandbox_run_execution_local_pipeline_and_scorers(env):
     run_data = res.json()
     run_id = run_data["id"]
     assert run_data["status"] == "completed"
+    assert run_data["simulated"] is True
     assert run_data["total_tasks"] == 1
     assert run_data["passed_tasks"] == 1
     assert run_data["pass_rate"] == 1.0
-    assert run_data["total_tokens"] > 0
-    assert run_data["total_cost_usd"] > 0
 
-    # Check transcript details
     transcripts_res = client.get(
         f"/api/v1/sandboxes/runs/{run_id}/transcripts",
         headers=env["viewer_a"],
@@ -227,64 +361,47 @@ def test_sandbox_run_execution_local_pipeline_and_scorers(env):
     t_list = transcripts_res.json()
     assert len(t_list) == 1
     assert t_list[0]["status"] == "passed"
-    assert t_list[0]["score"] == 1.0
+    assert t_list[0]["simulated"] is True
 
-    # Check transcript single item details
     t_key = t_list[0]["task_key"]
-    detail_res = client.get(
+    detail = client.get(
         f"/api/v1/sandboxes/runs/{run_id}/transcripts/{t_key}",
         headers=env["viewer_a"],
-    )
-    assert detail_res.status_code == 200
-    detail = detail_res.json()
-    assert detail["task_key"] == t_key
-    assert len(detail["steps"]) == 2
-    assert detail["steps"][0]["tool_name"] == "file_edit"
-    assert len(detail["verified_artifacts"]) >= 1
+    ).json()
+    assert detail["simulated"] is True
+    assert len(detail["verified_artifacts"]) == 1
     art = detail["verified_artifacts"][0]
     assert art["path"] == "calculator.py"
     assert len(art["sha256"]) == 64
-    assert art["size_bytes"] > 0
+    assert (art["storage_uri"] or "").startswith("artifact:")
 
 
-def test_scorer_file_exists_and_regex_and_pass_rate(env):
+def test_scorer_file_exists_and_artifact_hash(env, monkeypatch):
+    monkeypatch.setenv("MATRIX_ENV", "test")
     client: TestClient = env["client"]
 
-    # Multi-task run: Task 1 passes, Task 2 fails -> pass_rate = 0.5
+    # Multi-task pass_rate = 0.5
     res = client.post(
         "/api/v1/sandboxes/runs",
         headers=env["member_a"],
         json={
             "name": "multi-task-evaluation",
-            "runner_backend": "local_sandbox",
+            "runner_backend": "fake",
             "solver_config": {
                 "tasks": [
                     {
                         "task_key": "task_passing",
-                        "prompt": "Create output.json",
                         "steps": [
-                            {
-                                "tool_name": "file_edit",
-                                "tool_args": {"path": "output.json", "content": '{"status": "ok"}'},
-                            }
+                            {"tool_name": "file_edit", "tool_args": {"path": "output.json", "content": '{"ok": true}'}}
                         ],
                     },
                     {
                         "task_key": "task_failing",
-                        "prompt": "Do not create expected file",
-                        "steps": [
-                            {
-                                "tool_name": "bash",
-                                "tool_args": {"cmd": "echo 'doing nothing'"},
-                            }
-                        ],
+                        "steps": [{"tool_name": "bash", "tool_args": {"cmd": "echo nope"}}],
                     },
                 ]
             },
-            "scorer_config": {
-                "name": "file_exists",
-                "files": ["output.json"],
-            },
+            "scorer_config": {"name": "file_exists", "files": ["output.json"]},
             "sync_exec": True,
         },
     )
@@ -293,153 +410,131 @@ def test_scorer_file_exists_and_regex_and_pass_rate(env):
     assert data["total_tasks"] == 2
     assert data["passed_tasks"] == 1
     assert data["pass_rate"] == 0.5
+    assert data["simulated"] is True
 
-
-def test_scorer_artifact_hash(env):
-    client: TestClient = env["client"]
+    # Artifact hash scorer
     content = "deterministic content 12345"
     expected_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
-
-    res = client.post(
+    res_hash = client.post(
         "/api/v1/sandboxes/runs",
         headers=env["member_a"],
         json={
             "name": "artifact-hash-run",
-            "runner_backend": "local_sandbox",
+            "runner_backend": "fake",
             "solver_config": {
-                "steps": [
-                    {
-                        "tool_name": "file_edit",
-                        "tool_args": {"path": "artifact.txt", "content": content},
-                    }
-                ]
+                "steps": [{"tool_name": "file_edit", "tool_args": {"path": "artifact.txt", "content": content}}]
             },
-            "scorer_config": {
-                "name": "artifact_hash",
-                "hashes": {"artifact.txt": expected_sha},
-            },
+            "scorer_config": {"name": "artifact_hash", "hashes": {"artifact.txt": expected_sha}},
             "sync_exec": True,
         },
     )
-    assert res.status_code == 201
-    assert res.json()["pass_rate"] == 1.0
+    assert res_hash.status_code == 201
+    assert res_hash.json()["pass_rate"] == 1.0
 
 
 # ---------------------------------------------------------------------------
-# Security & RBAC Tests
+# 4. Security, Policy Rejection (422), sync_exec guard, RBAC & Isolation
 # ---------------------------------------------------------------------------
 
 
-def test_security_non_admin_network_access_rejected(env):
+def test_security_policy_rejections_422(env, monkeypatch):
     client: TestClient = env["client"]
 
-    # Member attempting to enable bridge/host network mode -> 403 Forbidden
+    # 1. local_sandbox backend is gone -> 422
+    r_local = client.post(
+        "/api/v1/sandboxes/runs",
+        headers=env["member_a"],
+        json={"name": "local-removed", "runner_backend": "local_sandbox"},
+    )
+    assert r_local.status_code == 422
+
+    # 2. fake backend without MATRIX_ENV=test/dev -> 422
+    monkeypatch.delenv("MATRIX_ENV", raising=False)
+    r_fake = client.post(
+        "/api/v1/sandboxes/runs",
+        headers=env["member_a"],
+        json={"name": "fake-blocked", "runner_backend": "fake"},
+    )
+    assert r_fake.status_code == 422
+
+    # 3. network_mode != 'none' rejected even for ADMIN -> 422 with exact message
+    for hdrs in (env["member_a"], env["admin_a"], env["key_a"]):
+        r_net = client.post(
+            "/api/v1/sandboxes/runs",
+            headers=hdrs,
+            json={"name": "net-run", "sandbox_policy": {"network_mode": "bridge"}},
+        )
+        assert r_net.status_code == 422
+        assert "network access for sandboxes is not supported until an egress proxy exists" in r_net.json()["detail"]
+
+    # 4. Server-owned keys rejected -> 422
+    for forged in ({"is_admin": True}, {"network_approved_by": "someone"}):
+        r_forged = client.post(
+            "/api/v1/sandboxes/runs",
+            headers=env["admin_a"],
+            json={"name": "forged", "sandbox_policy": forged},
+        )
+        assert r_forged.status_code == 422
+        assert "server-owned" in r_forged.text
+
+    # 5. User mounts/volumes rejected even for ADMIN -> 422
+    for bad_policy in (
+        {"mounts": ["/var/run/docker.sock:/var/run/docker.sock"]},
+        {"mounts": ["/tmp:/mnt"]},
+        {"volumes": ["/etc:/etc"]},
+    ):
+        r_mnt = client.post(
+            "/api/v1/sandboxes/runs",
+            headers=env["admin_a"],
+            json={"name": "mount-run", "sandbox_policy": bad_policy},
+        )
+        assert r_mnt.status_code == 422
+
+    # 6. Image outside operator allowlist -> 422
+    r_img = client.post(
+        "/api/v1/sandboxes/runs",
+        headers=env["admin_a"],
+        json={"name": "bad-img", "sandbox_policy": {"image": "evil/image:latest"}},
+    )
+    assert r_img.status_code == 422
+    assert "allowlist" in r_img.json()["detail"]
+
+
+def test_sync_exec_ignored_outside_test_env(env, monkeypatch):
+    monkeypatch.setenv("MATRIX_ENV", "production")
+    client: TestClient = env["client"]
+
     res = client.post(
         "/api/v1/sandboxes/runs",
         headers=env["member_a"],
-        json={
-            "name": "malicious-network-run",
-            "sandbox_policy": {"network_mode": "bridge"},
-        },
+        json={"name": "prod-queued", "runner_backend": "docker", "sync_exec": True},
     )
-    assert res.status_code == 403
-    assert "requires role admin" in res.json()["detail"]
-
-    # An API key is never ADMIN, even with every scope
-    key_res = client.post(
-        "/api/v1/sandboxes/runs",
-        headers=env["key_a"],
-        json={"name": "key-network-run", "sandbox_policy": {"network_mode": "bridge"}},
-    )
-    assert key_res.status_code == 403
-
-    # The approval is server-owned: a client cannot claim it in the policy (T3)
-    for forged in ({"is_admin": True}, {"network_approved_by": "someone"}):
-        forged_res = client.post(
-            "/api/v1/sandboxes/runs",
-            headers=env["member_a"],
-            json={"name": "forged", "sandbox_policy": {"network_mode": "bridge", **forged}},
-        )
-        assert forged_res.status_code == 422, forged_res.text
-        assert "server-owned" in forged_res.text
-
-    # Admin is allowed to request network_mode != 'none'
-    admin_res = client.post(
-        "/api/v1/sandboxes/runs",
-        headers=env["admin_a"],
-        json={
-            "name": "admin-network-run",
-            "sandbox_policy": {"network_mode": "bridge"},
-        },
-    )
-    assert admin_res.status_code == 201
-    with env["app"].state.session_factory() as db:
-        stored = db.get(SandboxRun, admin_res.json()["id"]).sandbox_policy
-    assert stored["network_mode"] == "bridge"
-    assert stored["network_approved_by"]  # the approving admin's user id, set by the server
-
-
-def test_runner_derives_network_approval_only_from_server_key():
-    from matrix_server.sandboxes.runner import network_approved
-
-    assert network_approved({"network_mode": "bridge", "network_approved_by": "user-1"}) is True
-    assert network_approved({"network_mode": "bridge", "is_admin": True}) is False
-    assert network_approved({}) is False
-
-
-def test_security_docker_socket_mounting_forbidden(env):
-    client: TestClient = env["client"]
-
-    # Even admin cannot mount docker.sock
-    res = client.post(
-        "/api/v1/sandboxes/runs",
-        headers=env["admin_a"],
-        json={
-            "name": "malicious-socket-mount",
-            "sandbox_policy": {
-                "mounts": ["/var/run/docker.sock:/var/run/docker.sock"],
-            },
-        },
-    )
-    assert res.status_code == 400
-    assert "docker.sock is strictly forbidden" in res.json()["detail"]
+    assert res.status_code == 201
+    # Must remain queued for worker rather than executing synchronously
+    assert res.json()["status"] == "queued"
 
 
 def test_security_path_traversal_blocked(env):
     client: TestClient = env["client"]
 
-    # Path traversal in task_key
     res = client.post(
         "/api/v1/sandboxes/runs",
         headers=env["member_a"],
-        json={
-            "name": "path-traversal-task",
-            "solver_config": {
-                "tasks": [{"task_key": "../../escape_task"}]
-            },
-        },
+        json={"name": "path-traversal-task", "solver_config": {"tasks": [{"task_key": "../../escape_task"}]}},
     )
     assert res.status_code == 400
     assert "path traversal not allowed" in res.json()["detail"]
 
-    # Path traversal in initial_files
     res_file = client.post(
         "/api/v1/sandboxes/runs",
         headers=env["member_a"],
-        json={
-            "name": "path-traversal-file",
-            "solver_config": {
-                "initial_files": {"../../etc/passwd": "root:x:0:0"}
-            },
-        },
+        json={"name": "path-traversal-file", "solver_config": {"initial_files": {"../../etc/passwd": "root:x:0:0"}}},
     )
     assert res_file.status_code == 400
 
 
 def test_security_anti_nan_rejection(env):
     client: TestClient = env["client"]
-
-    # Using raw httpx content with NaN representation
     res = client.post(
         "/api/v1/sandboxes/runs",
         headers=env["member_a"],
@@ -451,7 +546,6 @@ def test_security_anti_nan_rejection(env):
 def test_rbac_and_cancellation(env):
     client: TestClient = env["client"]
 
-    # Viewer cannot create a run (403)
     viewer_create = client.post(
         "/api/v1/sandboxes/runs",
         headers=env["viewer_a"],
@@ -459,7 +553,6 @@ def test_rbac_and_cancellation(env):
     )
     assert viewer_create.status_code == 403
 
-    # Member can create run
     create_res = client.post(
         "/api/v1/sandboxes/runs",
         headers=env["member_a"],
@@ -467,19 +560,12 @@ def test_rbac_and_cancellation(env):
     )
     assert create_res.status_code == 201
     run_id = create_res.json()["id"]
+    assert create_res.json()["runner_backend"] == "docker"
 
-    # Viewer cannot cancel run (403)
-    viewer_cancel = client.post(
-        f"/api/v1/sandboxes/runs/{run_id}/cancel",
-        headers=env["viewer_a"],
-    )
+    viewer_cancel = client.post(f"/api/v1/sandboxes/runs/{run_id}/cancel", headers=env["viewer_a"])
     assert viewer_cancel.status_code == 403
 
-    # Member can cancel run (200)
-    cancel_res = client.post(
-        f"/api/v1/sandboxes/runs/{run_id}/cancel",
-        headers=env["member_a"],
-    )
+    cancel_res = client.post(f"/api/v1/sandboxes/runs/{run_id}/cancel", headers=env["member_a"])
     assert cancel_res.status_code == 200
     assert cancel_res.json()["status"] == "cancelled"
     assert cancel_res.json()["finished_at"] is not None
@@ -488,7 +574,6 @@ def test_rbac_and_cancellation(env):
 def test_multi_tenant_isolation(env):
     client: TestClient = env["client"]
 
-    # Member A creates a run in Project A
     res_a = client.post(
         "/api/v1/sandboxes/runs",
         headers=env["member_a"],
@@ -497,22 +582,65 @@ def test_multi_tenant_isolation(env):
     assert res_a.status_code == 201
     run_a_id = res_a.json()["id"]
 
-    # Admin B (Project B) tries to read run from Project A -> 404
-    get_b = client.get(
-        f"/api/v1/sandboxes/runs/{run_a_id}",
-        headers=env["admin_b"],
-    )
-    assert get_b.status_code == 404
+    assert client.get(f"/api/v1/sandboxes/runs/{run_a_id}", headers=env["admin_b"]).status_code == 404
+    assert client.post(f"/api/v1/sandboxes/runs/{run_a_id}/cancel", headers=env["admin_b"]).status_code == 404
 
-    # Admin B tries to cancel run from Project A -> 404
-    cancel_b = client.post(
-        f"/api/v1/sandboxes/runs/{run_a_id}/cancel",
-        headers=env["admin_b"],
-    )
-    assert cancel_b.status_code == 404
-
-    # Listing runs in Project B does not contain Project A's run
     list_b = client.get("/api/v1/sandboxes/runs", headers=env["admin_b"])
     assert list_b.status_code == 200
-    b_ids = [r["id"] for r in list_b.json()["items"]]
-    assert run_a_id not in b_ids
+    assert run_a_id not in [r["id"] for r in list_b.json()["items"]]
+
+
+# ---------------------------------------------------------------------------
+# 5. Live Docker Containment Tests (skip with exact reason if no daemon)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.docker
+def test_live_docker_containment_uid_ro_no_net_no_env_leak(tmp_path, monkeypatch):
+    _require_docker()
+    monkeypatch.setenv("MATRIX_SECRET_PROBE", "should-never-enter-container")
+    ds = DockerSandbox(workdir=tmp_path / "live_ws", run_id="live", sample_id="c1")
+
+    # uid 65534
+    code, out, _ = ds.execute_bash("id -u")
+    assert code == 0 and out.strip() == "65534"
+
+    # /etc read-only
+    code, _, _ = ds.execute_bash("touch /etc/matrix_test_write")
+    assert code != 0
+
+    # no network interfaces besides lo
+    code, out, _ = ds.execute_python("import os; print(','.join(sorted(os.listdir('/sys/class/net'))))")
+    assert code == 0 and out.strip() == "lo"
+
+    # server env does not leak
+    code, out, _ = ds.execute_bash("printenv MATRIX_SECRET_PROBE || true")
+    assert code == 0 and "should-never-enter-container" not in out
+
+
+@pytest.mark.docker
+def test_live_docker_timeout_and_oom_leave_no_orphan_containers(tmp_path):
+    _require_docker()
+    ds = DockerSandbox(
+        workdir=tmp_path / "live_oom",
+        sandbox_policy={"memory": "64m", "pids_limit": 32},
+        run_id="liveoom",
+        sample_id="s1",
+    )
+
+    # Timeout kills and removes container
+    code, _, err = ds.execute_bash("sleep 30", timeout=1.0)
+    assert code == -1 and "timed out" in err
+
+    # OOM returns 137
+    code, _, _ = ds.execute_python("x = bytearray(256 * 1024 * 1024)", timeout=15.0)
+    assert code == 137
+
+    # No orphan containers
+    ps = subprocess.run(
+        ["docker", "ps", "-a", "--filter", "name=matrix-sbx-liveoom", "-q"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert ps.stdout.strip() == ""

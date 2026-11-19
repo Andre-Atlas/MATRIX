@@ -7,10 +7,11 @@ SPEC.loader.exec_module(check_skips)
 
 S3 = "SKIPPED [84] tests/test_artifacts.py:52: MATRIX_TEST_S3_ENDPOINT not set"
 PERF = "SKIPPED [4] tests/test_runs_api.py:581: perf check runs once, on SQLite + ClickHouse"
+DOCKER = "SKIPPED [5] tests/test_sandboxes_api.py:400: Docker daemon not available"
 
 
 def test_only_allowed_skips_pass():
-    assert check_skips.unexpected(f"short test summary info\n{S3}\n{PERF}\n1 passed, 88 skipped") == []
+    assert check_skips.unexpected(f"short test summary info\n{S3}\n{PERF}\n{DOCKER}\n1 passed, 93 skipped") == []
 
 
 def test_other_skip_fails_even_next_to_s3():
@@ -27,10 +28,12 @@ def test_allowed_reason_must_match_exactly_and_in_its_file():
         "SKIPPED [1] tests/test_rbac.py:10: MATRIX_TEST_S3_ENDPOINT not set",  # right reason, wrong file
         "SKIPPED [1] tests/test_artifacts.py:99: oops MATRIX_TEST_S3_ENDPOINT not set",  # only contains it
         "SKIPPED [1] tests/test_runs_api.py:12: perf check runs once",  # truncated reason
+        "SKIPPED [1] tests/test_benchmarks_api.py:42: Docker daemon not available",  # right reason, wrong file
+        "SKIPPED [1] tests/test_sandboxes_api.py:42: Docker daemon not available right now",  # extra text
         "SKIPPED [1] tests/test_artifacts.py: no line number",
     ]
     out = "\n".join(lines)
-    assert len(check_skips.unexpected(out)) == 4
+    assert len(check_skips.unexpected(out)) == 6
 
 
 def test_xfail_and_xpass_fail():

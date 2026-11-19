@@ -20,6 +20,7 @@ ALLOWED = frozenset(
     {
         ("tests/test_artifacts.py", "MATRIX_TEST_S3_ENDPOINT not set"),
         ("tests/test_runs_api.py", "perf check runs once, on SQLite + ClickHouse"),
+        ("tests/test_sandboxes_api.py", "Docker daemon not available"),
     }
 )
 # `SKIPPED [3] tests/test_x.py:10: motivo` (pytest -rs); the count is absent for a single skip.

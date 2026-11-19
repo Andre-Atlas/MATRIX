@@ -66,6 +66,12 @@ class Settings(BaseSettings):
     verify_hash_max_bytes: int = 256 * 1024**2
     artifact_url_ttl_seconds: int = 3600
 
+    # Sandboxes (ADR-010, T7): operator image allowlist and default container resource limits.
+    sandbox_images: str = "python:3.12-slim"
+    sandbox_pids_limit: int = 128
+    sandbox_memory: str = "512m"
+    sandbox_cpus: float = 1.0
+
 
 @lru_cache
 def get_settings() -> Settings:

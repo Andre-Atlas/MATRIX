@@ -1,20 +1,22 @@
-"""Inspect AI Sandboxes Runner.
+"""Inspect AI Sandboxes Runner (ADR-010, T7).
 
-Implements the Dataset -> Solver -> Scorer evaluation pipeline with
-LocalSandbox (isolated temporary directory with timeout and limits) and
-hardened DockerSandbox execution specification.
+Implements the Dataset -> Solver -> Scorer evaluation pipeline with:
+- `SandboxEngine` interface (`docker` and `fake`; Inspect AI is the planned real engine per ADR-010).
+- `DockerSandbox`: hardened, fail-closed container execution (never falls back to host execution).
+- `FakeSandbox`: deterministic simulated execution allowed ONLY when `MATRIX_ENV` is `test` or `dev`.
 """
 
 from __future__ import annotations
 
+import abc
 import hashlib
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 from collections.abc import Callable
@@ -38,24 +40,24 @@ from matrix_server.storage.models import (
 
 log = logging.getLogger(__name__)
 
-MAX_OUTPUT_BYTES = 65536  # 64 KB truncation
+MAX_OUTPUT_BYTES = 65536  # 64 KiB truncation
 DEFAULT_TIMEOUT_SECONDS = 30.0
 COST_PER_TOKEN_USD = 0.000003  # $3.00 per 1M tokens estimate
+DEFAULT_SANDBOX_IMAGE = "python:3.12-slim"
+MAX_CPUS = 4.0
 
-FORBIDDEN_SOCKET_PATTERNS = (
-    "docker.sock",
-    "/var/run/docker.sock",
-    "/run/docker.sock",
+NETWORK_UNSUPPORTED_MSG = "network access for sandboxes is not supported until an egress proxy exists"
+RESERVED_POLICY_KEYS = frozenset({"network_approved_by", "is_admin"})
+_MEMORY_RE = re.compile(r"^[1-9][0-9]*[kmgKMG]$")
+_SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9_.-]+")
+_DAEMON_ERROR_MARKERS = (
+    "cannot connect to the docker daemon",
+    "is the docker daemon running",
+    "error during connect",
+    "connect: no such file",
+    "connect: connection refused",
+    "permission denied while trying to connect",
 )
-
-# Written by the API (never accepted from the client) when an ADMIN approves network access; the
-# worker derives `is_admin` from it. `is_admin` itself is reserved so an old/forged policy is inert.
-NETWORK_APPROVED_BY = "network_approved_by"
-RESERVED_POLICY_KEYS = frozenset({NETWORK_APPROVED_BY, "is_admin"})
-
-
-def network_approved(policy: dict[str, Any]) -> bool:
-    return bool(policy.get(NETWORK_APPROVED_BY))
 
 
 class SandboxPolicyError(ValueError):
@@ -64,6 +66,53 @@ class SandboxPolicyError(ValueError):
 
 class SandboxExecutionError(RuntimeError):
     """Raised on fatal execution errors inside a sandbox."""
+
+
+class SandboxUnavailableError(RuntimeError):
+    """Raised when the Docker daemon/CLI is unavailable (fail-closed, never host fallback)."""
+
+
+def is_fake_backend_allowed() -> bool:
+    """`fake` sandbox backend is allowed ONLY when MATRIX_ENV is explicitly `test` or `dev`."""
+    return os.environ.get("MATRIX_ENV", "").strip().lower() in {"test", "dev"}
+
+
+def is_test_env() -> bool:
+    """`sync_exec` is allowed only in test environments (`MATRIX_ENV=test` or pytest)."""
+    env = os.environ.get("MATRIX_ENV")
+    if env is not None:
+        return env.strip().lower() == "test"
+    return "PYTEST_CURRENT_TEST" in os.environ
+
+
+def allowed_sandbox_images() -> list[str]:
+    """Return the operator-configured image allowlist (`MATRIX_SANDBOX_IMAGES`)."""
+    raw = os.environ.get("MATRIX_SANDBOX_IMAGES")
+    if raw is None:
+        raw = get_settings().sandbox_images
+    return [img.strip() for img in raw.split(",") if img.strip()]
+
+
+def default_sandbox_image() -> str:
+    images = allowed_sandbox_images()
+    return images[0] if images else DEFAULT_SANDBOX_IMAGE
+
+
+def _docker_cli_env() -> dict[str, str]:
+    """Minimal environment for the `docker` CLI — never leaks server secrets."""
+    env: dict[str, str] = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": "",
+    }
+    docker_host = os.environ.get("DOCKER_HOST")
+    if docker_host:
+        env["DOCKER_HOST"] = docker_host
+    return env
+
+
+def _safe_name(value: str, fallback: str = "x", max_len: int = 16) -> str:
+    cleaned = _SAFE_NAME_RE.sub("-", str(value or "")).strip("-")
+    return (cleaned[:max_len] or fallback).lower()
 
 
 def _truncate_output(text: str | None) -> str:
@@ -90,87 +139,153 @@ def validate_sandbox_path(path: str, label: str = "path") -> str:
     return "/".join(parts)
 
 
-def check_forbidden_mounts(mounts: list[Any]) -> None:
-    """Ensure no mounts reference docker.sock."""
-    for m in mounts:
-        m_str = str(m)
-        if any(sock in m_str for sock in FORBIDDEN_SOCKET_PATTERNS):
-            raise SandboxPolicyError("Mounting /var/run/docker.sock is strictly forbidden")
+def validate_sandbox_policy(
+    policy: dict[str, Any],
+    *,
+    image: str | None = None,
+    allowed_images: list[str] | None = None,
+) -> dict[str, Any]:
+    """Validate sandbox execution policy and return normalized container limits."""
+    reserved = sorted(k for k in policy if k in RESERVED_POLICY_KEYS)
+    if reserved:
+        raise SandboxPolicyError(f"sandbox_policy keys are server-owned: {', '.join(reserved)}")
 
-
-def validate_sandbox_policy(policy: dict[str, Any], is_admin: bool = False) -> None:
-    """Validate sandbox execution policy quotas and permissions."""
     network_mode = policy.get("network_mode", "none")
-    if network_mode != "none" and not is_admin:
-        raise SandboxPolicyError("network_mode != 'none' requires admin role")
+    if network_mode != "none":
+        raise SandboxPolicyError(NETWORK_UNSUPPORTED_MSG)
 
-    mounts = policy.get("mounts", [])
-    if isinstance(mounts, list):
-        check_forbidden_mounts(mounts)
+    if "mounts" in policy or "volumes" in policy:
+        raise SandboxPolicyError("User-specified mounts/volumes are not allowed in sandbox_policy")
+
+    settings = get_settings()
+    allowlist = allowed_images if allowed_images is not None else allowed_sandbox_images()
+    effective_image = image if image is not None else policy.get("image") or (
+        allowlist[0] if allowlist else DEFAULT_SANDBOX_IMAGE
+    )
+    if not isinstance(effective_image, str) or not effective_image or effective_image not in allowlist:
+        raise SandboxPolicyError(
+            f"Sandbox image '{effective_image}' is not in the operator allowlist"
+        )
+
+    pids_limit = policy.get("pids_limit", settings.sandbox_pids_limit)
+    if isinstance(pids_limit, bool) or not isinstance(pids_limit, int) or not (1 <= pids_limit <= 4096):
+        raise SandboxPolicyError("pids_limit must be an integer between 1 and 4096")
+
+    memory = policy.get("memory", settings.sandbox_memory)
+    if not isinstance(memory, str) or not _MEMORY_RE.match(memory):
+        raise SandboxPolicyError("memory must be a valid size string such as '512m' or '1g'")
+
+    cpus = policy.get("cpus", settings.sandbox_cpus)
+    if isinstance(cpus, bool) or not isinstance(cpus, (int, float)) or not (0 < float(cpus) <= MAX_CPUS):
+        raise SandboxPolicyError(f"cpus must be greater than 0 and at most {int(MAX_CPUS)}")
 
     timeout = policy.get("timeout_seconds")
-    if timeout is not None and (not isinstance(timeout, (int, float)) or not (1 <= timeout <= 3600)):
+    if timeout is not None and (
+        isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not (1 <= timeout <= 3600)
+    ):
         raise SandboxPolicyError("timeout_seconds must be between 1 and 3600")
 
     task_timeout = policy.get("task_timeout_seconds")
-    if task_timeout is not None and (not isinstance(task_timeout, (int, float)) or not (1 <= task_timeout <= 600)):
+    if task_timeout is not None and (
+        isinstance(task_timeout, bool)
+        or not isinstance(task_timeout, (int, float))
+        or not (1 <= task_timeout <= 600)
+    ):
         raise SandboxPolicyError("task_timeout_seconds must be between 1 and 600")
 
     max_steps = policy.get("max_steps")
-    if max_steps is not None and (not isinstance(max_steps, int) or not (1 <= max_steps <= 100)):
+    if max_steps is not None and (
+        isinstance(max_steps, bool) or not isinstance(max_steps, int) or not (1 <= max_steps <= 100)
+    ):
         raise SandboxPolicyError("max_steps must be between 1 and 100")
+
+    return {
+        "image": effective_image,
+        "pids_limit": pids_limit,
+        "memory": memory,
+        "cpus": float(cpus),
+    }
 
 
 def build_docker_run_args(
-    image: str,
+    image: str | None,
     workdir_host: str,
     sandbox_policy: dict[str, Any] | None = None,
-    is_admin: bool = False,
+    *,
+    container_name: str | None = None,
+    run_id: str = "run",
+    sample_id: str = "sample",
+    allowed_images: list[str] | None = None,
 ) -> list[str]:
-    """Build hardened Docker execution flags strictly matching specification.
+    """Single source of truth for hardened `docker run` arguments (ADR-010, T7).
 
     Enforces:
-    - --network=none (unless admin)
-    - --read-only
-    - --user=65534:65534 (nobody:nogroup)
-    - --cap-drop=ALL
-    - --security-opt=no-new-privileges:true
-    - --pids-limit=128
-    - --tmpfs /tmp:rw,noexec,nosuid,size=256m
-    - strictly forbids mounting /var/run/docker.sock
+    - `--rm --name matrix-sbx-<run>-<sample>-<rand> --init`
+    - `--network none`
+    - `--read-only`
+    - `--user 65534:65534`
+    - `--cap-drop ALL`
+    - `--security-opt no-new-privileges:true`
+    - `--pids-limit <cfg,128>`
+    - `--memory <cfg,512m> --memory-swap <same>`
+    - `--cpus <cfg,1,max 4>`
+    - `--tmpfs /tmp:rw,noexec,nosuid,size=256m`
+    - `--ipc none`
+    - `--ulimit nofile=256:256 --ulimit fsize=67108864:67108864`
+    - operator image allowlist only; no user mounts/volumes (only runner-owned `/workspace`).
     """
     policy = sandbox_policy or {}
-    validate_sandbox_policy(policy, is_admin=is_admin)
+    resolved = validate_sandbox_policy(policy, image=image, allowed_images=allowed_images)
 
-    network_mode = policy.get("network_mode", "none")
-    mounts = policy.get("mounts", [])
+    cname = container_name or (
+        f"matrix-sbx-{_safe_name(run_id)}-{_safe_name(sample_id)}-{secrets.token_hex(4)}"
+    )
+    cpus = resolved["cpus"]
+    cpus_str = str(int(cpus)) if cpus == int(cpus) else f"{cpus:g}"
+    memory = resolved["memory"]
 
-    args = [
+    return [
         "docker",
         "run",
         "--rm",
-        f"--network={network_mode}",
+        "--name",
+        cname,
+        "--init",
+        "--network",
+        "none",
         "--read-only",
-        "--user=65534:65534",
-        "--cap-drop=ALL",
-        "--security-opt=no-new-privileges:true",
-        "--pids-limit=128",
-        "--tmpfs=/tmp:rw,noexec,nosuid,size=256m",
+        "--user",
+        "65534:65534",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges:true",
+        "--pids-limit",
+        str(resolved["pids_limit"]),
+        "--memory",
+        memory,
+        "--memory-swap",
+        memory,
+        "--cpus",
+        cpus_str,
+        "--tmpfs",
+        "/tmp:rw,noexec,nosuid,size=256m",
+        "--ipc",
+        "none",
+        "--ulimit",
+        "nofile=256:256",
+        "--ulimit",
+        "fsize=67108864:67108864",
         "-v",
         f"{workdir_host}:/workspace:rw",
         "-w",
         "/workspace",
+        resolved["image"],
     ]
-
-    for m in mounts:
-        args.extend(["-v", str(m)])
-
-    args.append(image)
-    return args
 
 
 def is_docker_available() -> bool:
-    """Check if the docker daemon is reachable."""
+    """Check if the Docker daemon is reachable using a minimal environment."""
     if not shutil.which("docker"):
         return False
     try:
@@ -179,11 +294,29 @@ def is_docker_available() -> bool:
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=1.5,
+            timeout=2.0,
+            env=_docker_cli_env(),
         )
         return proc.returncode == 0
     except Exception:  # noqa: BLE001
         return False
+
+
+def _force_cleanup_container(container_name: str) -> None:
+    """Kill and force-remove a container by name, ignoring errors."""
+    env = _docker_cli_env()
+    for subcmd in (["docker", "kill", container_name], ["docker", "rm", "-f", container_name]):
+        try:
+            subprocess.run(
+                subcmd,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5.0,
+                env=env,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Ignoring error during container cleanup (%s): %s", subcmd, exc)
 
 
 # --- Task Domain Object ----------------------------------------------------
@@ -204,21 +337,23 @@ class SandboxTask:
     steps: list[dict[str, Any]] = field(default_factory=list)
 
 
-# --- Execution Environments ------------------------------------------------
+# --- SandboxEngine Interface & Implementations -----------------------------
 
 
-class LocalSandbox:
-    """Isolated directory in temporary workspace enforcing limits and anti-traversal."""
+class SandboxEngine(abc.ABC):
+    """Abstract interface for sandbox execution backends (`docker`, `fake`).
 
-    def __init__(
-        self,
-        workdir: Path,
-        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
-        env: dict[str, str] | None = None,
-    ) -> None:
-        self.workdir = workdir
+    Per ADR-010, Inspect AI in a dedicated `matrix-runner` service is the target real engine;
+    until that service lands, `DockerSandbox` provides hardened per-sample containers and
+    `FakeSandbox` provides deterministic test/dev simulation without host execution.
+    """
+
+    backend: str
+    simulated: bool
+
+    def __init__(self, workdir: Path, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> None:
+        self.workdir = workdir.resolve()
         self.timeout_seconds = timeout_seconds
-        self.env = env or {}
 
     def write_file(self, rel_path: str, content: str | bytes) -> Path:
         clean = validate_sandbox_path(rel_path, "file path")
@@ -256,151 +391,169 @@ class LocalSandbox:
 
     def list_files(self) -> list[str]:
         files: list[str] = []
+        if not self.workdir.exists():
+            return files
         for p in self.workdir.rglob("*"):
             if p.is_file():
-                rel = str(p.relative_to(self.workdir))
-                files.append(rel)
+                files.append(str(p.relative_to(self.workdir)))
         return sorted(files)
 
+    @abc.abstractmethod
     def execute_bash(self, cmd: str, timeout: float | None = None) -> tuple[int, str, str]:
-        to = timeout or self.timeout_seconds
-        run_env = {**os.environ, **self.env}
-        try:
-            proc = subprocess.run(
-                ["bash", "-c", cmd],
-                check=False,
-                cwd=self.workdir,
-                env=run_env,
-                capture_output=True,
-                timeout=to,
-            )
-            stdout = _truncate_output(proc.stdout.decode("utf-8", errors="replace"))
-            stderr = _truncate_output(proc.stderr.decode("utf-8", errors="replace"))
-            return proc.returncode, stdout, stderr
-        except subprocess.TimeoutExpired as exc:
-            stdout = _truncate_output((exc.stdout or b"").decode("utf-8", errors="replace"))
-            stderr = _truncate_output(f"Execution timed out after {to}s")
-            return -1, stdout, stderr
-        except Exception as exc:  # noqa: BLE001
-            return -1, "", _truncate_output(f"Execution error: {exc}")
+        """Run a shell command inside the sandbox."""
 
+    @abc.abstractmethod
     def execute_python(self, code: str, timeout: float | None = None) -> tuple[int, str, str]:
-        to = timeout or self.timeout_seconds
-        run_env = {**os.environ, **self.env}
-        try:
-            proc = subprocess.run(
-                [sys.executable, "-c", code],
-                check=False,
-                cwd=self.workdir,
-                env=run_env,
-                capture_output=True,
-                timeout=to,
-            )
-            stdout = _truncate_output(proc.stdout.decode("utf-8", errors="replace"))
-            stderr = _truncate_output(proc.stderr.decode("utf-8", errors="replace"))
-            return proc.returncode, stdout, stderr
-        except subprocess.TimeoutExpired as exc:
-            stdout = _truncate_output((exc.stdout or b"").decode("utf-8", errors="replace"))
-            stderr = _truncate_output(f"Execution timed out after {to}s")
-            return -1, stdout, stderr
-        except Exception as exc:  # noqa: BLE001
-            return -1, "", _truncate_output(f"Execution error: {exc}")
+        """Run Python code inside the sandbox."""
+
+    def cleanup(self) -> None:
+        """Release any engine-owned resources."""
 
 
-class DockerSandbox:
-    """Docker container execution environment with graceful fallback to LocalSandbox."""
+class FakeSandbox(SandboxEngine):
+    """Deterministic simulated sandbox for `MATRIX_ENV in {'test', 'dev'}`.
+
+    NEVER executes user code on the host (no subprocess, no eval/exec).
+    """
+
+    backend = "fake"
+    simulated = True
 
     def __init__(
         self,
         workdir: Path,
-        image: str = "python:3.11-slim",
         sandbox_policy: dict[str, Any] | None = None,
-        is_admin: bool = False,
     ) -> None:
-        self.workdir = workdir
-        self.image = image
-        self.sandbox_policy = sandbox_policy or {}
-        self.is_admin = is_admin
-        self._local: LocalSandbox = LocalSandbox(
-            workdir=workdir,
-            timeout_seconds=float(self.sandbox_policy.get("task_timeout_seconds", DEFAULT_TIMEOUT_SECONDS)),
-            env=self.sandbox_policy.get("env"),
-        )
-        self.docker_active = is_docker_available()
-        if not self.docker_active:
-            log.warning("Docker daemon is not available; falling back gracefully to local_sandbox")
-
-    def write_file(self, rel_path: str, content: str | bytes) -> Path:
-        return self._local.write_file(rel_path, content)
-
-    def read_file(self, rel_path: str) -> str:
-        return self._local.read_file(rel_path)
-
-    def file_exists(self, rel_path: str) -> bool:
-        return self._local.file_exists(rel_path)
-
-    def get_file_bytes(self, rel_path: str) -> bytes:
-        return self._local.get_file_bytes(rel_path)
-
-    def list_files(self) -> list[str]:
-        return self._local.list_files()
+        if not is_fake_backend_allowed():
+            raise SandboxPolicyError(
+                "runner_backend='fake' is only allowed when MATRIX_ENV is 'test' or 'dev'"
+            )
+        policy = sandbox_policy or {}
+        timeout = float(policy.get("task_timeout_seconds", DEFAULT_TIMEOUT_SECONDS))
+        super().__init__(workdir=workdir, timeout_seconds=timeout)
+        self.sandbox_policy = policy
 
     def execute_bash(self, cmd: str, timeout: float | None = None) -> tuple[int, str, str]:
-        if not self.docker_active:
-            return self._local.execute_bash(cmd, timeout=timeout)
-
-        docker_args = build_docker_run_args(
-            self.image,
-            str(self.workdir),
-            sandbox_policy=self.sandbox_policy,
-            is_admin=self.is_admin,
-        )
-        full_cmd = docker_args + ["bash", "-c", cmd]
-        to = timeout or self._local.timeout_seconds
-        try:
-            proc = subprocess.run(full_cmd, check=False, capture_output=True, timeout=to)
-            stdout = _truncate_output(proc.stdout.decode("utf-8", errors="replace"))
-            stderr = _truncate_output(proc.stderr.decode("utf-8", errors="replace"))
-            return proc.returncode, stdout, stderr
-        except subprocess.TimeoutExpired as exc:
-            stdout = _truncate_output((exc.stdout or b"").decode("utf-8", errors="replace"))
-            stderr = _truncate_output(f"Docker execution timed out after {to}s")
-            return -1, stdout, stderr
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Docker execution failed (%s); falling back to local_sandbox", exc)
-            return self._local.execute_bash(cmd, timeout=timeout)
+        digest = hashlib.sha256(f"bash:{cmd}".encode()).hexdigest()[:12]
+        return 0, _truncate_output(f"[simulated:bash] {digest}"), ""
 
     def execute_python(self, code: str, timeout: float | None = None) -> tuple[int, str, str]:
-        if not self.docker_active:
-            return self._local.execute_python(code, timeout=timeout)
+        digest = hashlib.sha256(f"python:{code}".encode()).hexdigest()[:12]
+        return 0, _truncate_output(f"[simulated:python] {digest}"), ""
 
+
+class DockerSandbox(SandboxEngine):
+    """Hardened Docker container execution environment (fail-closed, zero host fallback)."""
+
+    backend = "docker"
+    simulated = False
+
+    def __init__(
+        self,
+        workdir: Path,
+        image: str | None = None,
+        sandbox_policy: dict[str, Any] | None = None,
+        *,
+        run_id: str = "run",
+        sample_id: str = "sample",
+        allowed_images: list[str] | None = None,
+    ) -> None:
+        policy = sandbox_policy or {}
+        resolved = validate_sandbox_policy(policy, image=image, allowed_images=allowed_images)
+        timeout = float(policy.get("task_timeout_seconds", DEFAULT_TIMEOUT_SECONDS))
+        super().__init__(workdir=workdir, timeout_seconds=timeout)
+        self.image: str = resolved["image"]
+        self.sandbox_policy = policy
+        self.run_id = run_id
+        self.sample_id = sample_id
+        self.allowed_images = allowed_images
+        self._active_containers: set[str] = set()
+
+        if not is_docker_available():
+            raise SandboxUnavailableError("Docker daemon is not available")
+
+    def _run_in_container(self, cmd_argv: list[str], timeout: float | None = None) -> tuple[int, str, str]:
+        cname = f"matrix-sbx-{_safe_name(self.run_id)}-{_safe_name(self.sample_id)}-{secrets.token_hex(4)}"
         docker_args = build_docker_run_args(
             self.image,
             str(self.workdir),
             sandbox_policy=self.sandbox_policy,
-            is_admin=self.is_admin,
+            container_name=cname,
+            run_id=self.run_id,
+            sample_id=self.sample_id,
+            allowed_images=self.allowed_images,
         )
-        full_cmd = docker_args + ["python", "-c", code]
-        to = timeout or self._local.timeout_seconds
+        full_cmd = docker_args + cmd_argv
+        to = timeout or self.timeout_seconds
+        self._active_containers.add(cname)
+        needs_cleanup = False
         try:
-            proc = subprocess.run(full_cmd, check=False, capture_output=True, timeout=to)
+            proc = subprocess.run(
+                full_cmd,
+                check=False,
+                capture_output=True,
+                timeout=to,
+                env=_docker_cli_env(),
+            )
             stdout = _truncate_output(proc.stdout.decode("utf-8", errors="replace"))
             stderr = _truncate_output(proc.stderr.decode("utf-8", errors="replace"))
+            if proc.returncode == 125 and any(m in stderr.lower() for m in _DAEMON_ERROR_MARKERS):
+                raise SandboxUnavailableError(f"Docker daemon unavailable: {stderr[:300]}")
+            if proc.returncode == 137 and not stderr:
+                stderr = "Container killed by OOM (exit code 137)"
             return proc.returncode, stdout, stderr
         except subprocess.TimeoutExpired as exc:
-            stdout = _truncate_output((exc.stdout or b"").decode("utf-8", errors="replace"))
+            needs_cleanup = True
+            raw_out = exc.stdout if isinstance(exc.stdout, bytes) else (exc.stdout or "").encode("utf-8", "replace")
+            stdout = _truncate_output(raw_out.decode("utf-8", errors="replace"))
             stderr = _truncate_output(f"Docker execution timed out after {to}s")
             return -1, stdout, stderr
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Docker execution failed (%s); falling back to local_sandbox", exc)
-            return self._local.execute_python(code, timeout=timeout)
+        except (FileNotFoundError, OSError) as exc:
+            needs_cleanup = True
+            raise SandboxUnavailableError(f"Docker CLI/daemon unavailable: {exc}") from exc
+        finally:
+            if needs_cleanup:
+                _force_cleanup_container(cname)
+            self._active_containers.discard(cname)
+
+    def execute_bash(self, cmd: str, timeout: float | None = None) -> tuple[int, str, str]:
+        return self._run_in_container(["bash", "-c", cmd], timeout=timeout)
+
+    def execute_python(self, code: str, timeout: float | None = None) -> tuple[int, str, str]:
+        return self._run_in_container(["python", "-c", code], timeout=timeout)
+
+    def cleanup(self) -> None:
+        for cname in list(self._active_containers):
+            _force_cleanup_container(cname)
+            self._active_containers.discard(cname)
+
+
+def create_sandbox_engine(
+    backend: str,
+    workdir: Path,
+    sandbox_policy: dict[str, Any] | None = None,
+    *,
+    run_id: str = "run",
+    sample_id: str = "sample",
+) -> SandboxEngine:
+    """Instantiate the configured `SandboxEngine` (`docker` or `fake`)."""
+    if backend == "docker":
+        return DockerSandbox(
+            workdir=workdir,
+            sandbox_policy=sandbox_policy,
+            run_id=run_id,
+            sample_id=sample_id,
+        )
+    if backend == "fake":
+        return FakeSandbox(workdir=workdir, sandbox_policy=sandbox_policy)
+    raise SandboxPolicyError(f"Unsupported sandbox runner_backend: '{backend}'")
 
 
 # --- Step Execution Helper -------------------------------------------------
 
 
 def execute_step(
-    sandbox: LocalSandbox | DockerSandbox,
+    sandbox: SandboxEngine,
     step_idx: int,
     tool_name: str,
     tool_args: dict[str, Any],
@@ -452,6 +605,8 @@ def execute_step(
         else:
             stderr = f"Unsupported tool: {tool_name}"
             exit_code = 1
+    except (SandboxUnavailableError, SandboxPolicyError):
+        raise
     except Exception as exc:  # noqa: BLE001
         stderr = f"Step execution exception: {exc}"
         exit_code = 1
@@ -463,7 +618,7 @@ def execute_step(
     input_tokens = tool_args.get("input_tokens") or max(1, len(in_text) // 4)
     output_tokens = tool_args.get("output_tokens") or max(1, len(out_text) // 4)
 
-    return {
+    record: dict[str, Any] = {
         "step": step_idx,
         "thought": thought or f"Execute {tool_name}",
         "tool_name": tool_name,
@@ -475,13 +630,16 @@ def execute_step(
         "input_tokens": int(input_tokens),
         "output_tokens": int(output_tokens),
     }
+    if exit_code == 137:
+        record["oom"] = True
+    return record
 
 
 # --- Solvers ---------------------------------------------------------------
 
 
 def run_solver(
-    sandbox: LocalSandbox | DockerSandbox,
+    sandbox: SandboxEngine,
     task: SandboxTask,
     solver_config: dict[str, Any],
     max_steps: int = 30,
@@ -493,7 +651,6 @@ def run_solver(
     executed_steps: list[dict[str, Any]] = []
 
     if configured_steps:
-        # Scripted or deterministic solver steps
         for idx, step_spec in enumerate(configured_steps[:max_steps], start=1):
             tool_name = step_spec.get("tool_name", "bash")
             tool_args = step_spec.get("tool_args", {})
@@ -509,9 +666,7 @@ def run_solver(
             executed_steps.append(step_record)
         return executed_steps
 
-    # Dynamic solvers
     if solver_name == "react":
-        # React (Reasoning + Acting) pipeline
         s1 = execute_step(
             sandbox=sandbox,
             step_idx=1,
@@ -522,7 +677,6 @@ def run_solver(
         )
         executed_steps.append(s1)
 
-        # Step 2: If task provides prompt or initial commands, execute
         solve_cmd = solver_config.get("command") or f"echo 'Resolved task {task.task_key}'"
         s2 = execute_step(
             sandbox=sandbox,
@@ -535,7 +689,6 @@ def run_solver(
         executed_steps.append(s2)
 
     elif solver_name == "plan_and_solve":
-        # Plan and solve: generates plan step, then executes
         s1 = execute_step(
             sandbox=sandbox,
             step_idx=1,
@@ -556,7 +709,6 @@ def run_solver(
         executed_steps.append(s2)
 
     else:
-        # custom solver
         s1 = execute_step(
             sandbox=sandbox,
             step_idx=1,
@@ -574,7 +726,7 @@ def run_solver(
 
 
 def evaluate_scorer(
-    sandbox: LocalSandbox | DockerSandbox,
+    sandbox: SandboxEngine,
     task: SandboxTask,
     scorer_config: dict[str, Any],
     steps: list[dict[str, Any]],
@@ -592,8 +744,12 @@ def evaluate_scorer(
     scorer_details: dict[str, Any] = {"scorer": scorer_name}
     error: str | None = None
 
-    # 1. Scorer evaluation
-    if scorer_name == "unit_test":
+    if any(s.get("exit_code") == 137 for s in steps):
+        status = "oom"
+        score = 0.0
+        error = "Container killed by OOM (exit code 137)"
+        scorer_details["oom"] = True
+    elif scorer_name == "unit_test":
         test_cmd = (
             scorer_config.get("command")
             or scorer_config.get("test_cmd")
@@ -602,25 +758,37 @@ def evaluate_scorer(
         if not test_cmd:
             if task.test_script:
                 sandbox.write_file("_test_suite.py", task.test_script)
-                test_cmd = f"{sys.executable} _test_suite.py"
+                test_cmd = "python _test_suite.py"
             elif scorer_config.get("test_script"):
                 sandbox.write_file("_test_suite.py", scorer_config["test_script"])
-                test_cmd = f"{sys.executable} _test_suite.py"
+                test_cmd = "python _test_suite.py"
             else:
                 test_cmd = "python -c 'import sys; sys.exit(0)'"
 
         exit_code, stdout, stderr = sandbox.execute_bash(test_cmd, timeout=task_timeout)
-        passed = exit_code == 0
-        score = 1.0 if passed else 0.0
-        status = "passed" if passed else "failed"
-        scorer_details.update({
-            "command": test_cmd,
-            "exit_code": exit_code,
-            "stdout": stdout,
-            "stderr": stderr,
-        })
-        if not passed:
-            error = f"Unit test failed with exit code {exit_code}: {stderr or stdout}"
+        if exit_code == 137:
+            status = "oom"
+            score = 0.0
+            error = "Container killed by OOM (exit code 137)"
+            scorer_details.update({
+                "command": test_cmd,
+                "exit_code": exit_code,
+                "stdout": stdout,
+                "stderr": stderr,
+                "oom": True,
+            })
+        else:
+            passed = exit_code == 0
+            score = 1.0 if passed else 0.0
+            status = "passed" if passed else "failed"
+            scorer_details.update({
+                "command": test_cmd,
+                "exit_code": exit_code,
+                "stdout": stdout,
+                "stderr": stderr,
+            })
+            if not passed:
+                error = f"Unit test failed with exit code {exit_code}: {stderr or stdout}"
 
     elif scorer_name == "file_exists":
         expected_files = (
@@ -701,7 +869,6 @@ def evaluate_scorer(
     if "artifacts" in scorer_config:
         artifacts_to_check.update(scorer_config["artifacts"])
     if not artifacts_to_check:
-        # Automatically collect any created non-hidden files
         for f in sandbox.list_files():
             if not f.startswith("."):
                 artifacts_to_check.add(f)
@@ -718,7 +885,7 @@ def evaluate_scorer(
             if save_blob is not None:
                 try:
                     storage_uri = save_blob(rel_path, data)
-                except Exception as store_err:  # noqa: BLE001 - e.g. quota exceeded: recorded unstored
+                except Exception as store_err:  # noqa: BLE001
                     log.debug("Artifact store write skipped/failed: %s", store_err)
 
             verified_artifacts.append({
@@ -784,6 +951,7 @@ def run_sandbox_job(
         run.status = "running"
         run.started_at = utcnow()
         run.error = None
+        run.simulated = run.runner_backend == "fake"
         project_id = run.project_id
         runner_backend = run.runner_backend
         dataset_id = run.dataset_id
@@ -884,11 +1052,11 @@ def run_sandbox_job(
     transcripts_created: list[SandboxTaskTranscript] = []
     total_tokens_accum = 0
     total_cost_usd_accum = 0.0
+    fatal_status: str | None = None
     fatal_error: str | None = None
 
     try:
         for task in tasks:
-            # Check cancellation between tasks
             with session_factory() as session:
                 current_status = session.scalar(
                     select(SandboxRun.status).where(SandboxRun.id == sandbox_run_id)
@@ -898,27 +1066,22 @@ def run_sandbox_job(
                     break
 
             t_start = time.perf_counter()
-            with tempfile.TemporaryDirectory(prefix="matrix_sandbox_") as tmpdir:
+            tmpdir = tempfile.mkdtemp(prefix="matrix_sandbox_")
+            os.chmod(tmpdir, 0o700)
+            sandbox: SandboxEngine | None = None
+            try:
                 workdir = Path(tmpdir)
-                sandbox: LocalSandbox | DockerSandbox
-                if runner_backend == "docker":
-                    sandbox = DockerSandbox(
-                        workdir=workdir,
-                        sandbox_policy=sandbox_policy,
-                        is_admin=network_approved(sandbox_policy),
-                    )
-                else:
-                    sandbox = LocalSandbox(
-                        workdir=workdir,
-                        timeout_seconds=task_timeout,
-                        env=task.env,
-                    )
+                sandbox = create_sandbox_engine(
+                    runner_backend,
+                    workdir=workdir,
+                    sandbox_policy=sandbox_policy,
+                    run_id=sandbox_run_id,
+                    sample_id=task.task_key,
+                )
 
-                # Initialize workspace files
                 for fpath, fcontent in task.initial_files.items():
                     sandbox.write_file(fpath, fcontent)
 
-                # Solver execution
                 steps = run_solver(
                     sandbox=sandbox,
                     task=task,
@@ -927,7 +1090,6 @@ def run_sandbox_job(
                     task_timeout=task_timeout,
                 )
 
-                # Scorer execution
                 t_status, score, scorer_details, verified_arts, task_err = evaluate_scorer(
                     sandbox=sandbox,
                     task=task,
@@ -941,7 +1103,7 @@ def run_sandbox_job(
                 duration_ms = (time.perf_counter() - t_start) * 1000.0
                 task_in_tokens = sum(s["input_tokens"] for s in steps)
                 task_out_tokens = sum(s["output_tokens"] for s in steps)
-                total_tokens_accum += (task_in_tokens + task_out_tokens)
+                total_tokens_accum += task_in_tokens + task_out_tokens
                 total_cost_usd_accum += (task_in_tokens + task_out_tokens) * COST_PER_TOKEN_USD
 
                 transcript = SandboxTaskTranscript(
@@ -949,6 +1111,7 @@ def run_sandbox_job(
                     sandbox_run_id=sandbox_run_id,
                     task_key=task.task_key,
                     status=t_status,
+                    simulated=sandbox.simulated,
                     score=score,
                     scorer_details=scorer_details,
                     steps=steps,
@@ -963,9 +1126,18 @@ def run_sandbox_job(
                     session.add(transcript)
 
                 transcripts_created.append(transcript)
+            finally:
+                if sandbox is not None:
+                    sandbox.cleanup()
+                shutil.rmtree(tmpdir, ignore_errors=True)
 
+    except SandboxUnavailableError as exc:
+        log.error("Sandbox unavailable for run %s: %s", sandbox_run_id, exc)
+        fatal_status = "sandbox_unavailable"
+        fatal_error = str(exc)[:2000]
     except Exception as exc:
         log.exception("Fatal error during sandbox run %s", sandbox_run_id)
+        fatal_status = "failed"
         fatal_error = str(exc)[:2000]
 
     # 4. Finalize SandboxRun aggregates
@@ -974,7 +1146,7 @@ def run_sandbox_job(
         if run is not None:
             if run.status != "cancelled":
                 if fatal_error:
-                    run.status = "failed"
+                    run.status = fatal_status or "failed"
                     run.error = fatal_error
                 else:
                     run.status = "completed"
