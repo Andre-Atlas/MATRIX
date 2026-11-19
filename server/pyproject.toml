@@ -19,6 +19,7 @@ dependencies = [
   "regex>=2026.9.29",
   "boto3>=1.43.127",
   "argon2-cffi>=25.1.0",
+  "cryptography>=50.0.2",
 ]
 
 [project.scripts]

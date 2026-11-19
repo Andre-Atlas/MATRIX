@@ -86,4 +86,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         sandboxes,
     ):
         app.include_router(module.router)
+    app.include_router(mlops.canonical_router)
     return app

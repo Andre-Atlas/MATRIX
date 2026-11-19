@@ -590,7 +590,16 @@ class ModelVersion(Base):
     """Immutable registered version of a model or LoRA adapter."""
 
     __tablename__ = "mlops_model_versions"
-    __table_args__ = (UniqueConstraint("model_id", "version", name="uq_mlops_model_versions_model_version"),)
+    __table_args__ = (
+        UniqueConstraint("model_id", "version", name="uq_mlops_model_versions_model_version"),
+        Index(
+            "uq_mlops_model_versions_one_production",
+            "model_id",
+            unique=True,
+            sqlite_where=text("stage = 'production'"),
+            postgresql_where=text("stage = 'production'"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
@@ -870,5 +879,6 @@ class SandboxTaskTranscript(Base):
 import matrix_server.artifacts.models
 import matrix_server.egress.models
 import matrix_server.gateway.models
+import matrix_server.mlops.registry_models
 import matrix_server.runs.models
 import matrix_server.sweeps.models  # noqa: F401  (all of these only register tables)

@@ -53,6 +53,27 @@ class MergeConflictError(VersioningError):
         super().__init__(msg)
 
 
+DEFAULT_MAX_COMMIT_ITEMS = 10_000
+
+
+class CommitItemLimitError(VersioningError):
+    """Raised when a commit would materialize more items than the configured cap.
+
+    Each commit copies all `n` items into `dataset_commit_items` (O(n) write time and storage per
+    commit), so an upper bound protects relational storage and request latency.
+    """
+
+    def __init__(self, count: int, limit: int) -> None:
+        self.count = count
+        self.limit = limit
+        super().__init__(f"Commit exceeds maximum allowed items ({count} > {limit})")
+
+
+def _check_commit_item_limit(count: int, max_items: int | None) -> None:
+    if max_items is not None and count > max_items:
+        raise CommitItemLimitError(count, max_items)
+
+
 # --- Canonical Hashing & Tree Hashing --------------------------------------
 
 
@@ -224,8 +245,12 @@ def commit_changes(
     changes: dict[str, Any] | list[dict[str, Any]] | None = None,
     snapshot_from_working_tree: bool = False,
     author: str | None = None,
+    max_items: int | None = DEFAULT_MAX_COMMIT_ITEMS,
 ) -> DatasetCommit:
     """Create an immutable commit on a branch.
+
+    Note: each commit materializes all `n` items in `dataset_commit_items` (O(n) rows and write
+    time per commit). `max_items` bounds `n` and raises `CommitItemLimitError` when exceeded.
 
     If `snapshot_from_working_tree`: reads current `dataset_items` for the dataset as snapshot.
     If `changes`: applies `upsert` and `delete` deltas against parent commit items.
@@ -331,6 +356,8 @@ def commit_changes(
     else:
         # Empty commit (preserves parent snapshot)
         new_items = dict(parent_items)
+
+    _check_commit_item_limit(len(new_items), max_items)
 
     # Compute delta stats
     added_keys = [k for k in new_items if k not in parent_items]
@@ -524,8 +551,13 @@ def merge_branches(
     conflict_strategy: str = "fail",
     message: str | None = None,
     author: str | None = None,
+    max_items: int | None = DEFAULT_MAX_COMMIT_ITEMS,
 ) -> DatasetCommit:
-    """Merge source_branch into target_branch with fast-forward or 3-way merge."""
+    """Merge source_branch into target_branch with fast-forward or 3-way merge.
+
+    Non-fast-forward merges materialize all `n` merged items in `dataset_commit_items` (O(n));
+    `max_items` bounds `n` and raises `CommitItemLimitError` when exceeded.
+    """
     if conflict_strategy not in ("fail", "ours", "theirs"):
         raise ValueError(f"Invalid conflict_strategy: {conflict_strategy}. Expected fail, ours, or theirs.")
 
@@ -645,6 +677,8 @@ def merge_branches(
     if conflicts and conflict_strategy == "fail":
         raise MergeConflictError(conflicts, f"Merge conflict on {len(conflicts)} items between '{source_branch}' and '{target_branch}'")
 
+    _check_commit_item_limit(len(merged_items), max_items)
+
     tree_hash = compute_tree_hash({k: it["content_hash"] for k, it in merged_items.items()})
     msg = message or f"Merge branch '{source_branch}' into '{target_branch}'"
 
@@ -707,8 +741,13 @@ def revert_branch(
     target_commit_id: str,
     message: str | None = None,
     author: str | None = None,
+    max_items: int | None = DEFAULT_MAX_COMMIT_ITEMS,
 ) -> DatasetCommit:
-    """Create a new commit on `branch_name` restoring the snapshot of `target_commit_id`."""
+    """Create a new commit on `branch_name` restoring the snapshot of `target_commit_id`.
+
+    Materializes all `n` items of `target_commit_id` in `dataset_commit_items` (O(n));
+    `max_items` bounds `n` and raises `CommitItemLimitError` when exceeded.
+    """
     ds = session.scalars(
         select(Dataset).where(Dataset.id == dataset_id, Dataset.project_id == project_id)
     ).first()
@@ -736,6 +775,7 @@ def revert_branch(
         raise CommitNotFoundError(f"Target commit '{target_commit_id}' not found in dataset '{dataset_id}'")
 
     target_items = _load_commit_items_map(session, target_commit.id)
+    _check_commit_item_limit(len(target_items), max_items)
     current_items = _load_commit_items_map(session, branch.head_commit_id)
 
     added = [k for k in target_items if k not in current_items]

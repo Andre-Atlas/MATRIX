@@ -72,6 +72,12 @@ class Settings(BaseSettings):
     sandbox_memory: str = "512m"
     sandbox_cpus: float = 1.0
 
+    # Registry webhooks & Dataset versioning (T6, contract G3).
+    # MATRIX_SECRET_KEY is required to encrypt webhook secrets at rest (Fernet).
+    secret_key: str | None = None
+    # Cap on items materialized per dataset commit (O(n) rows in dataset_commit_items).
+    max_dataset_commit_items: int = 10_000
+
 
 @lru_cache
 def get_settings() -> Settings:
