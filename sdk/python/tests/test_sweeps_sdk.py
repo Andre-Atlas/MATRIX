@@ -157,10 +157,12 @@ def test_sdk_sweep_agent_pruning_and_error_recovery() -> None:
 
 def test_deprecated_mlops_sweep_wrappers_emit_deprecation_warning() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/api/v1/mlops/sweeps":
+        if request.method == "POST" and request.url.path == "/api/v1/sweeps":
             return httpx.Response(201, json={"id": "sw_old", "name": "old"})
-        if request.url.path.endswith("/trials/next"):
-            return httpx.Response(409, json={"detail": "exhausted"})
+        if request.method == "GET" and request.url.path == "/api/v1/sweeps/sw_old":
+            return httpx.Response(200, json={"sweep": {"id": "sw_old", "config": {"metric": {"key": "eval/loss"}}}})
+        if request.method == "POST" and request.url.path == "/api/v1/sweeps/sw_old/next":
+            return httpx.Response(204)
         return httpx.Response(404)
 
     client = mx.MatrixClient("mx_test", "http://sweep.test", transport=httpx.MockTransport(handler))
