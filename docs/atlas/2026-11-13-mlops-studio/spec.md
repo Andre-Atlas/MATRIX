@@ -5,7 +5,7 @@ ATLAS · feature · arquitetura+dados+design+produto · large → pesquisa, desc
 ```
 
 Origem: [`docs/blueprint-sota.md`](../../blueprint-sota.md) (Módulos 1 e 2) e [`docs/atlas/2026-11-09-plataforma-mvp/report.md`](../2026-11-09-plataforma-mvp/report.md) (Item 3 do roadmap).
-ADR: [`docs/adr/006-mlops-tracking-e-model-registry.md`](../../adr/006-mlops-tracking-e-model-registry.md) · Design Brief: [design-brief.md](design-brief.md).
+ADR: [`docs/adr/014-mlops-tracking-e-model-registry.md`](../../adr/014-mlops-tracking-e-model-registry.md) · Design Brief: [design-brief.md](design-brief.md).
 
 ---
 
@@ -22,7 +22,7 @@ Objetivos desta entrega:
 
 ---
 
-## 2. Arquitetura (Resumo do ADR-006)
+## 2. Arquitetura (Resumo do ADR-014)
 
 - **Relacional (PostgreSQL/SQLite)**: 7 novas tabelas portáveis com `project_id` obrigatório (`mlops_sweeps`, `mlops_training_runs`, `mlops_artifacts`, `mlops_artifact_lineage`, `mlops_registered_models`, `mlops_model_versions`, `mlops_model_aliases`), migradas via `0005_mlops_studio.py`.
 - **Séries Temporais (`TrainingMetricStore`)**: `ClickHouseTrainingMetricStore` (`MergeTree` + `CODEC(ZSTD(3))` + downsampling) em produção e `MemoryTrainingMetricStore` para dev/testes.

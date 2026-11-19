@@ -74,6 +74,10 @@ class SpanStore(Protocol):
 
     def get_span(self, project_id: str, trace_id: str, span_id: str) -> Span | None: ...
 
+    def delete_project(self, project_id: str) -> None:
+        """Remove every span of a project (project deletion; may complete asynchronously)."""
+        ...
+
 
 # --------------------------------------------------------------------------- shared helpers
 
@@ -334,6 +338,10 @@ class MemorySpanStore:
     def get_span(self, project_id: str, trace_id: str, span_id: str) -> Span | None:
         with self._lock:
             return self._data.get(project_id, {}).get(trace_id, {}).get(span_id)
+
+    def delete_project(self, project_id: str) -> None:
+        with self._lock:
+            self._data.pop(project_id, None)
 
 
 def _page(items: list[Any], limit: int, make_cursor: Any) -> tuple[list[Any], str | None]:
@@ -598,6 +606,15 @@ SETTINGS index_granularity = 8192
 
     def drop_database(self) -> None:
         self._client.command(f"DROP DATABASE IF EXISTS `{self.database}`")
+
+    def delete_project(self, project_id: str) -> None:
+        """Schedules a mutation (applied asynchronously by ClickHouse)."""
+        if not project_id:
+            raise ValueError("project_id required")
+        self._client.command(
+            f"ALTER TABLE {self.table} DELETE WHERE project_id = {{project_id:String}}",
+            parameters={"project_id": project_id},
+        )
 
     # ---- writes
 

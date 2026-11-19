@@ -1,4 +1,4 @@
-"""Zero-copy dataset versioning engine (ADR-007 Git-like / LakeFS branching for datasets)."""
+"""Zero-copy dataset versioning engine (ADR-015 Git-like / LakeFS branching for datasets)."""
 
 from __future__ import annotations
 

@@ -5,6 +5,7 @@ import { useState } from "react";
 import { buildRuleRequest, describeCondition, emptyRuleForm, toggleAction, type ConditionKind, type RuleForm } from "@/lib/annotation-form";
 import { formatTimestamp } from "@/lib/format";
 import { proxy } from "@/lib/proxy-client";
+import { useCan } from "@/components/auth/role-context";
 import { RULE_ACTIONS, RULE_OPS, type Dataset, type Rule } from "@/lib/types";
 import { Mono, td, th } from "@/components/ui";
 import { field, label, primaryBtn } from "@/components/evals/ui";
@@ -21,6 +22,7 @@ const ACTION_HELP = { annotate: "Send to queue", add_to_dataset: "Add to dataset
 
 export function RulesSection({ rules, datasets }: { rules: Rule[]; datasets: Dataset[] }) {
   const router = useRouter();
+  const isAdmin = useCan("admin");
   const [form, setForm] = useState<RuleForm>(emptyRuleForm);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -91,7 +93,7 @@ export function RulesSection({ rules, datasets }: { rules: Rule[]; datasets: Dat
                     <Mono className="text-xs text-zinc-400">{formatTimestamp(r.created_at)}</Mono>
                   </td>
                   <td className={`${td} text-right`}>
-                    <DeleteButton path={`rules/${encodeURIComponent(r.id)}`} what={`rule ${r.name}`} />
+                    <DeleteButton min="admin" path={`rules/${encodeURIComponent(r.id)}`} what={`rule ${r.name}`} />
                   </td>
                 </tr>
               ))}
@@ -100,6 +102,7 @@ export function RulesSection({ rules, datasets }: { rules: Rule[]; datasets: Dat
         </div>
       )}
 
+      {isAdmin ? (
       <form onSubmit={submit} aria-label="Create rule" className="space-y-3 rounded-md border border-zinc-800 bg-zinc-900/30 p-3">
         <div className="flex flex-wrap items-end gap-2">
           <label className={label}>
@@ -177,6 +180,9 @@ export function RulesSection({ rules, datasets }: { rules: Rule[]; datasets: Dat
           {busy ? "Creating…" : "Create rule"}
         </button>
       </form>
+      ) : (
+        <p className="text-xs text-zinc-500">Creating and deleting these requires the admin role.</p>
+      )}
     </section>
   );
 }

@@ -1,3 +1,9 @@
+"""`main`'s MLOps tables after T4: runs are `runs`, checkpoints are `model_artifacts` (metadata
+over the G0 blob store), metric points live in the G1 `MetricStore` (`run_metrics`). The tests of
+`main`'s own metric store (`MergeTree`, no dedup, averaging downsampling, NaN refused by the store)
+were replaced by the same checks on the G1 store fed through `mlops.compat` (the adapter path)."""
+
+import math
 import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
@@ -7,20 +13,19 @@ from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 
 from matrix_server.config import Settings
-from matrix_server.mlops.metrics_store import (
-    MemoryTrainingMetricStore,
-    TrainingMetricStore,
-    build_training_metric_store,
-)
+from matrix_server.mlops import compat
+from matrix_server.runs import service
+from matrix_server.runs.models import Run, RunReport
+from matrix_server.runs.store import MemoryMetricStore, MetricStore, build_metric_store
 from matrix_server.storage.db import Base, init_db, make_engine, make_session_factory
 from matrix_server.storage.models import (
-    Artifact,
     ArtifactLineage,
     MLOpsSweep,
     ModelAlias,
+    ModelArtifact,
     ModelVersion,
+    Project,
     RegisteredModel,
-    TrainingRun,
 )
 
 PG_URL = os.environ.get("MATRIX_TEST_DATABASE_URL")
@@ -37,11 +42,22 @@ def session(request, tmp_path):
         Base.metadata.drop_all(eng)
     init_db(eng)
     s = make_session_factory(eng)()
+    s.add_all([Project(id="p1", name="p1"), Project(id="p2", name="p2")])
+    s.commit()
     yield s
     s.close()
     if request.param == "postgres":
         Base.metadata.drop_all(eng)
     eng.dispose()
+
+
+def _insert(store: MetricStore, project_id: str, run_id: str, main_points: list[dict]) -> int:
+    """`main` points through the adapter's translation and the G1 validation into the store."""
+    raw, _ = compat.points_in(main_points)
+    parsed, rejected = service.parse_points(raw, datetime.now(UTC))
+    assert rejected == []
+    store.insert(project_id, run_id, [p for _, p in parsed])
+    return len(main_points)
 
 
 def test_mlops_models_crud_and_multitenant_isolation(session):
@@ -70,54 +86,45 @@ def test_mlops_models_crud_and_multitenant_isolation(session):
         "confusion_matrix": [[120, 8], [5, 117]],
         "shap_importance": [{"feature": "token_entropy", "importance": 0.41}],
     }
-    run_p1 = TrainingRun(
+    run_p1 = Run(
         project_id="p1",
         name="qwen-lora-01",
         run_type="lora",
         base_model="Qwen/Qwen2.5-7B-Instruct",
         sweep_id=sweep_p1.id,
-        hyperparams={"lr": 2e-4, "lora_r": 16},
-        summary_metrics={"train/loss": 0.312},
-        hardware_info={"gpu": "A100-80GB", "count": 2},
-        classic_eval=classic_eval_payload,
+        params={"lr": 2e-4, "lora_r": 16},
+        env={"hardware": {"gpu": "A100-80GB", "count": 2}},
         tags=["lora", "dpo"],
-        total_steps=1000,
     )
-    run_p2 = TrainingRun(
-        project_id="p2",
-        name="qwen-lora-01",
-        run_type="sft",
-        sweep_id=sweep_p2.id,
-    )
+    run_p2 = Run(project_id="p2", name="qwen-lora-01", run_type="sft", sweep_id=sweep_p2.id)
     session.add_all([run_p1, run_p2])
     session.flush()
+    for kind, name, data in compat.classic_eval_to_reports(classic_eval_payload):
+        session.add(RunReport(run_id=run_p1.id, project_id="p1", kind=kind, name=name, data=data))
 
     sweep_p1.best_run_id = run_p1.id
     sweep_p1.best_metric_value = 0.312
 
     large_size = 12 * 1024 * 1024 * 1024  # 12 GiB (> 32-bit int max)
-    art_p1 = Artifact(
+    art_p1 = ModelArtifact(
         project_id="p1",
         run_id=run_p1.id,
         name="adapter-weights",
         kind="lora_adapter",
         version=1,
-        storage_backend="s3",
-        storage_uri="s3://matrix-artifacts/p1/adapter.safetensors",
+        external_uri="s3://matrix-artifacts/p1/adapter.safetensors",
         sha256="a" * 64,
         size_bytes=large_size,
         status="committed",
         metadata_={"format": "safetensors"},
     )
-    art_p2 = Artifact(
+    art_p2 = ModelArtifact(
         project_id="p2",
         run_id=run_p2.id,
         name="adapter-weights",
         kind="lora_adapter",
         version=1,
-        storage_backend="local",
-        storage_uri="local://p2/adapter.safetensors",
-        status="committed",
+        status="pending_upload",
     )
     session.add_all([art_p1, art_p2])
     session.flush()
@@ -178,15 +185,18 @@ def test_mlops_models_crud_and_multitenant_isolation(session):
     session.commit()
     session.expire_all()
 
-    loaded_run = session.get(TrainingRun, run_p1.id)
-    assert loaded_run is not None
-    assert loaded_run.classic_eval == classic_eval_payload
-    loaded_art = session.get(Artifact, art_p1.id)
+    loaded_run = session.get(Run, run_p1.id)
+    assert loaded_run is not None and loaded_run.status == "running" and loaded_run.run_type == "lora"
+    reports = session.execute(
+        select(RunReport.kind, RunReport.data).where(RunReport.run_id == run_p1.id, RunReport.name == "classic_eval")
+    ).all()
+    assert compat.reports_to_classic_eval([(k, d) for k, d in reports]) == classic_eval_payload
+    loaded_art = session.get(ModelArtifact, art_p1.id)
     assert loaded_art is not None
     assert loaded_art.size_bytes == large_size
 
     # Multi-tenant isolation checks
-    p1_runs = session.scalars(select(TrainingRun).where(TrainingRun.project_id == "p1")).all()
+    p1_runs = session.scalars(select(Run).where(Run.project_id == "p1")).all()
     assert [r.id for r in p1_runs] == [run_p1.id]
     p2_models = session.scalars(select(RegisteredModel).where(RegisteredModel.project_id == "p2")).all()
     assert [m.id for m in p2_models] == [model_p2.id]
@@ -243,106 +253,94 @@ def test_mlops_unique_constraints_and_cascades(session):
     assert session.scalars(select(ModelAlias)).all() == []
 
 
-def test_memory_metric_store_protocol_and_builder():
-    store = build_training_metric_store(Settings(span_store="memory"))
-    assert isinstance(store, MemoryTrainingMetricStore)
-    assert isinstance(store, TrainingMetricStore)
+def test_metric_store_protocol_and_builder():
+    store = build_metric_store(Settings(span_store="memory"))
+    assert isinstance(store, MemoryMetricStore)
+    assert isinstance(store, MetricStore)
 
 
-def test_memory_metric_store_insert_filters_and_isolation():
-    store = MemoryTrainingMetricStore()
+def test_adapter_points_land_in_the_g1_store_with_isolation():
+    store = MemoryMetricStore()
     t0 = datetime(2026, 11, 13, 12, 0, tzinfo=UTC)
-
-    inserted = store.insert_points(
+    inserted = _insert(
+        store,
         "p1",
         "run-1",
         [
             {"category": "train", "metric_name": "loss", "step": 1, "epoch": 0.1, "value": 2.5, "recorded_at": t0},
             {"category": "train", "metric_name": "loss", "step": 2, "epoch": 0.2, "value": 2.0, "recorded_at": t0 + timedelta(seconds=1)},
-            {"category": "eval", "metric_name": "loss", "step": 2, "epoch": 0.2, "value": 2.1, "recorded_at": t0 + timedelta(seconds=2)},
-            {"category": "gpu", "metric_name": "util_pct", "step": 2, "value": 95.0, "recorded_at": t0 + timedelta(seconds=3)},
+            {"category": "eval", "metric_name": "eval/loss", "step": 2, "epoch": 0.2, "value": 2.1, "recorded_at": t0 + timedelta(seconds=2)},
+            {"category": "system", "metric_name": "gpu.0.utilization", "step": 2, "value": 95.0, "recorded_at": t0 + timedelta(seconds=3)},
             {"category": "train", "metric_name": "lr", "step": 3, "value": 1e-4, "recorded_at": t0 + timedelta(seconds=4)},
         ],
     )
     assert inserted == 5
+    # category "system" -> sys/ prefix; the epoch is its own key at the same step
+    assert store.keys("p1", "run-1") == ["epoch", "eval/loss", "loss", "lr", "sys/gpu.0.utilization"]
+    series, _ = store.read_series("p1", ["run-1"], ["epoch"])
+    assert series["run-1"]["epoch"].steps == [1, 2] and series["run-1"]["epoch"].values == [0.1, 0.2]
+    # summary skips sys/ keys; last_steps is the highest non-sys step
+    assert store.summaries("p1", ["run-1"])["run-1"] == {"epoch": 0.2, "eval/loss": 2.1, "loss": 2.0, "lr": 1e-4}
+    assert store.last_steps("p1", ["run-1"]) == {"run-1": 3}
 
-    # Different project / run is isolated
-    store.insert_points(
-        "p2",
-        "run-1",
-        [{"category": "train", "metric_name": "loss", "step": 1, "value": 99.0, "recorded_at": t0}],
-    )
-    assert store.query_metrics("p3", "run-1") == {}
-    p2_data = store.query_metrics("p2", "run-1")
-    assert len(p2_data["loss"]) == 1 and p2_data["loss"][0]["value"] == 99.0
-
-    # Category filter
-    eval_only = store.query_metrics("p1", "run-1", category="eval")
-    assert list(eval_only.keys()) == ["loss"]
-    assert len(eval_only["loss"]) == 1
-    assert eval_only["loss"][0]["value"] == 2.1
-    assert eval_only["loss"][0]["min"] == 2.1
-    assert eval_only["loss"][0]["max"] == 2.1
-
-    # Metric names + step range filter
-    filtered = store.query_metrics(
-        "p1", "run-1", metric_names=["loss", "lr"], category="train", min_step=2, max_step=3
-    )
-    assert sorted(filtered.keys()) == ["loss", "lr"]
-    assert [p["step"] for p in filtered["loss"]] == [2]
-    assert [p["step"] for p in filtered["lr"]] == [3]
+    _insert(store, "p2", "run-1", [{"category": "train", "metric_name": "loss", "step": 1, "value": 99.0}])
+    assert store.keys("p3", "run-1") == []
+    p2, _ = store.read_series("p2", ["run-1"], ["loss"])
+    assert p2["run-1"]["loss"].values == [99.0]
+    # step range filter
+    ranged, _ = store.read_series("p1", ["run-1"], ["loss", "lr"], from_step=2, to_step=3)
+    assert ranged["run-1"]["loss"].steps == [2] and ranged["run-1"]["lr"].steps == [3]
 
 
-@pytest.mark.parametrize("total_points,max_points", [(1000, 50), (250, 10), (105, 100)])
-def test_memory_metric_store_deterministic_downsampling(total_points: int, max_points: int):
-    store = MemoryTrainingMetricStore()
+def test_resending_a_point_replaces_it():
+    """`main`'s MergeTree duplicated re-sent points; run_metrics keeps one per (key, step)."""
+    store = MemoryMetricStore()
+    _insert(store, "p1", "r", [{"metric_name": "loss", "step": 5, "value": 1.0}])
+    _insert(store, "p1", "r", [{"metric_name": "loss", "step": 5, "value": 0.5}])
+    series, _ = store.read_series("p1", ["r"], ["loss"])
+    assert series["r"]["loss"].steps == [5] and series["r"]["loss"].values == [0.5]
+
+
+@pytest.mark.parametrize("total_points,max_points", [(1000, 52), (250, 12), (105, 100)])
+def test_m4_downsampling_is_deterministic_and_keeps_the_ends(total_points: int, max_points: int):
+    store = MemoryMetricStore()
     t0 = datetime(2026, 11, 13, 12, 0, tzinfo=UTC)
     points = [
-        {
-            "category": "train",
-            "metric_name": "loss",
-            "step": i,
-            "epoch": i / 100.0,
-            "value": float(total_points - i),
-            "recorded_at": t0 + timedelta(seconds=i),
-        }
+        {"category": "train", "metric_name": "loss", "step": i, "value": float(total_points - i),
+         "recorded_at": t0 + timedelta(seconds=i)}
         for i in range(total_points)
     ]
-    store.insert_points("p1", "run-ds", points)
-
-    res1 = store.query_metrics("p1", "run-ds", max_points=max_points)
-    res2 = store.query_metrics("p1", "run-ds", max_points=max_points)
-    assert res1 == res2  # deterministic
-
-    series = res1["loss"]
-    assert 1 <= len(series) <= max_points
-    steps = [p["step"] for p in series]
-    assert steps == sorted(steps)
-    for bucket in series:
-        assert bucket["min"] <= bucket["value"] <= bucket["max"]
-        assert isinstance(bucket["recorded_at"], datetime)
+    _insert(store, "p1", "run-ds", points)
+    res1, down1 = store.read_series("p1", ["run-ds"], ["loss"], max_points=max_points)
+    res2, _ = store.read_series("p1", ["run-ds"], ["loss"], max_points=max_points)
+    series = res1["run-ds"]["loss"]
+    assert series == res2["run-ds"]["loss"]  # deterministic
+    assert down1 is (total_points > max_points)
+    assert 1 <= len(series.steps) <= max_points
+    assert series.steps == sorted(series.steps)
+    assert series.steps[0] == 0 and series.steps[-1] == total_points - 1  # first and last survive
 
 
-def test_memory_metric_store_rejects_nan_and_inf():
-    store = MemoryTrainingMetricStore()
-    for bad in (float("nan"), float("inf"), float("-inf")):
-        with pytest.raises(ValueError, match="finite"):
-            store.insert_points("p1", "run-1", [{"metric_name": "loss", "step": 1, "value": bad}])
+def test_non_finite_values_are_stored_and_read_as_null():
+    """`main`'s store refused NaN/Inf; G1 keeps them and reads them as null. The deprecated JSON
+    adapter still refuses them in the body (422, see test_mlops_api)."""
+    store = MemoryMetricStore()
+    parsed, _ = service.parse_points([{"key": "loss", "step": 1, "value": "nan"}], datetime.now(UTC))
+    store.insert("p1", "run-1", [p for _, p in parsed])
+    series, _ = store.read_series("p1", ["run-1"], ["loss"])
+    assert series["run-1"]["loss"].values == [None]
+    assert math.isnan(parsed[0][1].value)
 
 
 def test_memory_metric_store_thread_safety():
-    store = MemoryTrainingMetricStore()
+    store = MemoryMetricStore()
 
     def worker(worker_id: int) -> None:
-        pts = [
-            {"metric_name": "loss", "step": worker_id * 20 + i, "value": float(i)}
-            for i in range(20)
-        ]
-        store.insert_points("p1", "run-mt", pts)
-        store.query_metrics("p1", "run-mt", max_points=50)
+        _insert(store, "p1", "run-mt", [{"metric_name": "loss", "step": worker_id * 20 + i, "value": float(i)} for i in range(20)])
+        store.read_series("p1", ["run-mt"], ["loss"], max_points=52)
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(worker, range(8)))
 
-    res = store.query_metrics("p1", "run-mt", max_points=500)
-    assert len(res["loss"]) == 160
+    res, _ = store.read_series("p1", ["run-mt"], ["loss"], max_points=500)
+    assert len(res["run-mt"]["loss"].steps) == 160

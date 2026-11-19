@@ -9,7 +9,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel
 
-from matrix_server.auth import AuthContext, require_role
+from matrix_server.auth import Principal, Role, require
 from matrix_server.domain.spans import SpanKind
 from matrix_server.storage.spans import SpanStore
 from matrix_server.vectors.drift import (
@@ -171,18 +171,18 @@ def _generate_synthetic_baseline(
 @router.get("/projection", response_model=VectorProjectionResponse)
 def get_vector_projection(
     request: Request,
-    ctx: Annotated[AuthContext, Depends(require_role("viewer"))],
+    principal: Annotated[Principal, Depends(require(Role.VIEWER))],
     limit: int = Query(default=100, ge=1, le=1000),
     cluster: int | None = Query(default=None),
     kind: Literal["query", "document", "gap"] | None = Query(default=None),
 ) -> VectorProjectionResponse:
     """Returns 2D and 3D vector coordinates, cluster assignments, and knowledge gaps."""
     store: SpanStore = request.app.state.span_store
-    queries, documents = _extract_items_from_spans(store, ctx.project_id)
+    queries, documents = _extract_items_from_spans(store, principal.project_id)
 
     # Fallback to realistic baseline if project has insufficient traces
     if len(queries) + len(documents) < 6:
-        syn_queries, syn_docs = _generate_synthetic_baseline(ctx.project_id)
+        syn_queries, syn_docs = _generate_synthetic_baseline(principal.project_id)
         queries = queries + syn_queries
         documents = documents + syn_docs
 
@@ -224,7 +224,7 @@ def get_vector_projection(
 @router.get("/drift", response_model=DriftReport)
 def get_vector_drift(
     request: Request,
-    ctx: Annotated[AuthContext, Depends(require_role("viewer"))],
+    principal: Annotated[Principal, Depends(require(Role.VIEWER))],
     reference_window_days: int = Query(default=7, ge=1, le=90),
     production_window_days: int = Query(default=1, ge=1, le=30),
 ) -> DriftReport:
@@ -236,8 +236,8 @@ def get_vector_drift(
     prod_since = now - timedelta(days=production_window_days)
     ref_since = now - timedelta(days=reference_window_days)
 
-    traces_prod, _ = store.list_traces(project_id=ctx.project_id, since=prod_since, limit=200)
-    traces_ref, _ = store.list_traces(project_id=ctx.project_id, since=ref_since, until=prod_since, limit=200)
+    traces_prod, _ = store.list_traces(project_id=principal.project_id, since=prod_since, limit=200)
+    traces_ref, _ = store.list_traces(project_id=principal.project_id, since=ref_since, until=prod_since, limit=200)
 
     num_clusters = 5
 
@@ -247,14 +247,14 @@ def get_vector_drift(
         prod_queries: list[QueryItem] = []
 
         for t in traces_ref:
-            res = store.get_trace(project_id=ctx.project_id, trace_id=t.trace_id)
+            res = store.get_trace(project_id=principal.project_id, trace_id=t.trace_id)
             if res and res[1]:
                 s = res[1][0]
                 if s.input:
                     ref_queries.append(QueryItem(id=s.span_id, text=s.input))
 
         for t in traces_prod:
-            res = store.get_trace(project_id=ctx.project_id, trace_id=t.trace_id)
+            res = store.get_trace(project_id=principal.project_id, trace_id=t.trace_id)
             if res and res[1]:
                 s = res[1][0]
                 if s.input:
@@ -276,7 +276,7 @@ def get_vector_drift(
             )
 
     # Provide high-fidelity baseline report
-    seed = sum(ord(c) for c in ctx.project_id) + 42
+    seed = sum(ord(c) for c in principal.project_id) + 42
     rng = random.Random(seed)
 
     ref_counts = [rng.randint(25, 45) for _ in range(num_clusters)]

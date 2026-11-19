@@ -1,114 +1,173 @@
-import type { NextRequest } from "next/server";
-import { cleanBaseUrl } from "@/lib/api";
+// Server-side proxy from the browser to the MATRIX API. The browser never holds a credential: the
+// session token lives in the HttpOnly session cookie (`__Host-matrix_session` in production) and is turned into
+// `Authorization: Bearer` + `X-Matrix-Project` here (ADR-006). No cookie -> 401 without calling the
+// API. Hardening kept from the pre-login version: strict path segments, same-origin check on
+// mutations, streamed body limit, an allowlist of response headers. The login and logout routes of
+// the API are not reachable through here (the login response carries the token).
+import { sessionIsDead } from "@/lib/auth-calls";
+import { sameOrigin } from "@/lib/same-origin";
+import { clearSessionCookies, sessionFromCookieHeader } from "@/lib/session-cookie";
+import { apiBase, cacheControlFor, upstreamHeaders } from "@/lib/upstream";
 
-async function forward(req: NextRequest, ctx: { params: Promise<{ path: string[] }> }) {
+const MAX_PROXY_BODY_BYTES = 10 * 1024 * 1024;
+
+const MUTATING = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+// Response headers passed back to the browser (never authorization, cookies or anything else).
+const RESPONSE_HEADERS = [
+  "content-type",
+  "content-disposition",
+  "x-content-type-options",
+  "content-security-policy",
+  "cache-control",
+  "retry-after",
+];
+const BAD_SEGMENT = /[/\\%\u0000-\u001f\u007f]/;
+
+type Ctx = { params: Promise<{ path: string[] }> };
+
+function error(status: number, detail: string, extra?: (h: Headers) => void): Response {
+  const res = Response.json({ detail }, { status, headers: { "cache-control": "no-store" } });
+  extra?.(res.headers);
+  return res;
+}
+
+/**
+ * Not reachable through the proxy: login/logout (their responses carry or kill a session token; only
+ * the dedicated /api/auth/* routes call them) and admin/* (platform-admin token routes; a browser
+ * session never authorises them, and their 401 used to be a cross-site logout lever).
+ */
+function blocked(path: string[]): boolean {
+  if (path[0] === "admin") return true;
+  return path[0] === "auth" && (path[1] === "login" || path[1] === "logout");
+}
+
+function validSegment(seg: string): boolean {
+  return seg !== "" && seg !== "." && seg !== ".." && !BAD_SEGMENT.test(seg);
+}
+
+class BodyTooLarge extends Error {}
+
+/** The request body as a stream that errors once more than `limit` bytes went through. */
+function limitedBody(body: ReadableStream<Uint8Array>, limit: number, onOverflow: () => void) {
+  let seen = 0;
+  return body.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        seen += chunk.byteLength;
+        if (seen > limit) {
+          onOverflow();
+          controller.error(new BodyTooLarge());
+          return;
+        }
+        controller.enqueue(chunk);
+      },
+    }),
+  );
+}
+
+/**
+ * The API answered 401. The cookies are dropped only when `/auth/me` confirms the session is dead
+ * (the same check as /api/auth/expired), and never on a request another site started: a cross-site
+ * GET must not be able to sign the user out.
+ */
+async function expired(req: Request, res: Response, session: Parameters<typeof sessionIsDead>[1]): Promise<Response> {
+  res.headers.set("cache-control", "no-store");
+  if (req.headers.get("sec-fetch-site") === "cross-site") return res;
+  if (await sessionIsDead(req, session)) clearSessionCookies(res.headers);
+  return res;
+}
+
+function finish(res: Response): Response {
+  res.headers.set("cache-control", cacheControlFor(res.headers.get("cache-control")));
+  res.headers.append("vary", "Cookie");
+  return res;
+}
+
+async function forward(req: Request, ctx: Ctx): Promise<Response> {
   const { path } = await ctx.params;
-  const cleanPath = path[0] === "api" && path[1] === "v1" ? path.slice(2) : path;
-  const subPath = cleanPath.join("/");
-  const apiPath = `/api/v1/${subPath}`;
-  const hasBody = req.method !== "GET" && req.method !== "DELETE";
-
-  if (subPath === "auth/logout" && req.method === "POST") {
-    const logoutHeaders = new Headers({ "content-type": "application/json" });
-    logoutHeaders.append("set-cookie", "matrix_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax");
-    logoutHeaders.append("set-cookie", "matrix_project_id=; Path=/; Max-Age=0; SameSite=Lax");
-    return new Response(JSON.stringify({ ok: true }), {
-      status: 200,
-      headers: logoutHeaders,
-    });
+  const method = req.method.toUpperCase();
+  if (!Array.isArray(path) || path.length === 0 || !path.every(validSegment)) {
+    return error(400, "invalid path");
   }
+  if (blocked(path)) return error(404, "not found");
+  if (MUTATING.has(method) && !sameOrigin(req)) {
+    return error(403, "cross-origin request refused");
+  }
+  const session = sessionFromCookieHeader(req.headers.get("cookie"));
+  if (!session) return error(401, "not signed in");
+  const declared = req.headers.get("content-length");
+  if (declared !== null && Number(declared) > MAX_PROXY_BODY_BYTES) {
+    return error(413, "request body too large");
+  }
+  const hasBody = method !== "GET" && method !== "HEAD" && method !== "DELETE";
+  const search = new URL(req.url).search;
+  const apiPath = `/api/v1/${path.map(encodeURIComponent).join("/")}`;
 
   // Development/screenshot fixtures; the module is only loaded when the flag is set.
-  if (process.env.MATRIX_MOCK === "1" || process.env.NEXT_PUBLIC_MATRIX_MOCK === "1") {
+  if (process.env.MATRIX_MOCK === "1") {
     const { mockFetch } = await import("@/lib/mock-api");
-    const params = Object.fromEntries(req.nextUrl.searchParams);
-    return mockFetch(req.method, apiPath, params, hasBody ? await req.text() : null);
+    const params = Object.fromEntries(new URL(req.url).searchParams);
+    const res = await mockFetch(method, apiPath, params, hasBody ? await req.text() : null, {
+      token: session.token,
+      projectId: session.projectId,
+    });
+    const out = new Response(res.body, { status: res.status, headers: res.headers });
+    return finish(res.status === 401 ? await expired(req, out, session) : out);
   }
 
-  const base = cleanBaseUrl();
+  const base = apiBase();
+  const root = new URL(`${base}/api/v1/`);
   const url = new URL(`${base}${apiPath}`);
-  url.search = req.nextUrl.search;
-  const headers: Record<string, string> = {};
-  const ct = req.headers.get("content-type");
-  if (ct) headers["content-type"] = ct;
-
-  const cookie = req.cookies.get("matrix_session")?.value;
-  const key = process.env.MATRIX_API_KEY;
-  if (cookie) {
-    headers.authorization = `Bearer ${cookie}`;
-    if (key) headers["x-matrix-api-key"] = key;
-  } else if (key) {
-    headers.authorization = `Bearer ${key}`;
+  if (url.origin !== root.origin || !url.pathname.startsWith(root.pathname)) {
+    return error(400, "invalid path");
   }
+  url.search = search;
 
-  const proj = req.cookies.get("matrix_project_id")?.value;
-  if (proj) headers["x-matrix-project-id"] = proj;
+  // Built from scratch: nothing the browser sent (authorization, project, client-IP headers) is
+  // forwarded. The trusted-proxy header, if configured, is overwritten with the IP Next sees.
+  const ct = req.headers.get("content-type");
+  const noProject = path[0] === "auth" || (path.length === 1 && path[0] === "projects");
+  const headers = upstreamHeaders(req, noProject ? { ...session, projectId: null } : session, ct ? { "content-type": ct } : {});
 
-  const bodyText = hasBody ? await req.text() : undefined;
-
+  let overflow = false;
+  const body =
+    hasBody && req.body ? limitedBody(req.body, MAX_PROXY_BODY_BYTES, () => (overflow = true)) : undefined;
   let res: Response;
   try {
     res = await fetch(url, {
-      method: req.method,
+      method,
       headers,
-      body: bodyText,
+      body,
       cache: "no-store",
-    });
-  } catch (err) {
-    if (process.env.MATRIX_FALLBACK_TO_MOCK === "1") {
-      const { mockFetch } = await import("@/lib/mock-api");
-      const params = Object.fromEntries(req.nextUrl.searchParams);
-      return mockFetch(req.method, apiPath, params, bodyText ?? null);
-    }
-    return new Response(
-      JSON.stringify({
-        detail: `Failed to connect to MATRIX backend at ${url.origin}: ${(err as Error).message}. Check MATRIX_API_URL or run with MATRIX_MOCK=1`,
-      }),
-      { status: 502, headers: { "content-type": "application/json" } }
-    );
+      // Never follow: a redirect to another host would re-send Authorization/X-Matrix-Project there
+      // and the server would download the target. The 3xx goes back to the browser as is.
+      redirect: "manual",
+      ...(body ? { duplex: "half" } : {}),
+    } as RequestInit);
+  } catch {
+    if (overflow) return error(413, "request body too large");
+    return error(502, "MATRIX API unreachable");
+  }
+  if (overflow) {
+    await res.body?.cancel();
+    return error(413, "request body too large");
   }
 
-  if (res.status === 401 && cookie && key) {
-    try {
-      res = await fetch(url, {
-        method: req.method,
-        headers: {
-          ...headers,
-          authorization: `Bearer ${key}`,
-        },
-        body: bodyText,
-        cache: "no-store",
-      });
-    } catch {
-      // keep original 401 response if retry fails
-    }
+  const out = new Headers();
+  for (const name of RESPONSE_HEADERS) {
+    const value = res.headers.get(name);
+    if (value !== null) out.set(name, value);
   }
-
-  const respHeaders = new Headers();
-  respHeaders.set("content-type", res.headers.get("content-type") ?? "application/json");
-  const cd = res.headers.get("content-disposition");
-  if (cd) respHeaders.set("content-disposition", cd);
-
-  const setCookies =
-    typeof res.headers.getSetCookie === "function"
-      ? res.headers.getSetCookie()
-      : res.headers.get("set-cookie")
-        ? [res.headers.get("set-cookie")!]
-        : [];
-  for (const sc of setCookies) {
-    respHeaders.append("set-cookie", sc);
+  if (res.status >= 300 && res.status < 400) {
+    // Status and Location only, plus the security headers above; the body is not relayed.
+    await res.body?.cancel();
+    const location = res.headers.get("location");
+    if (location !== null) out.set("location", location);
+    return finish(new Response(null, { status: res.status, headers: out }));
   }
-
-  return new Response(res.body, {
-    status: res.status,
-    headers: respHeaders,
-  });
+  if (!out.has("content-type")) out.set("content-type", "application/json");
+  const response = new Response(res.body, { status: res.status, headers: out });
+  return finish(res.status === 401 ? await expired(req, response, session) : response);
 }
 
-export {
-  forward as GET,
-  forward as POST,
-  forward as PUT,
-  forward as PATCH,
-  forward as DELETE,
-};
+export { forward as GET, forward as POST, forward as PUT, forward as PATCH, forward as DELETE };

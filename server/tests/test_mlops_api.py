@@ -7,103 +7,38 @@ import json
 
 import pytest
 from fastapi.testclient import TestClient
+from rbac_helpers import api_key_headers, project_with_roles
 
 from matrix_server.app import create_app
-from matrix_server.auth import create_jwt
 from matrix_server.config import Settings
 from matrix_server.storage.models import Dataset, Experiment, SafetyScan
 
 
 @pytest.fixture
 def env(tmp_path):
+    # Users, memberships and sessions of the branch's RBAC (G0); `main`'s JWT/register flow is gone.
     settings = Settings(
         database_url=f"sqlite:///{tmp_path}/mlops_api.db",
         span_store="memory",
-        artifact_store="local",
-        artifact_dir=str(tmp_path / "artifacts"),
-        jwt_secret="test-mlops-jwt-secret",
+        artifact_backend="local",
+        artifact_local_dir=str(tmp_path / "artifacts"),
     )
     app = create_app(settings)
     client = TestClient(app)
-
-    # Register Project A (Alice = admin)
-    reg_a = client.post(
-        "/api/v1/auth/register",
-        json={
-            "email": "alice@example.com",
-            "password": "alice-password-123",
-            "name": "Alice Admin",
-            "project_name": "Project A",
-        },
-    )
-    assert reg_a.status_code == 201
-    data_a = reg_a.json()
-    project_a = data_a["project"]["id"]
-    admin_token_a = data_a["token"]
-
-    # Register Project B (Bob = admin)
-    reg_b = client.post(
-        "/api/v1/auth/register",
-        json={
-            "email": "bob@example.com",
-            "password": "bob-password-123",
-            "name": "Bob Admin",
-            "project_name": "Project B",
-        },
-    )
-    assert reg_b.status_code == 201
-    data_b = reg_b.json()
-    project_b = data_b["project"]["id"]
-    admin_token_b = data_b["token"]
-
-    # Create member & viewer users in Project A
-    member_reg = client.post(
-        "/api/v1/auth/register",
-        json={
-            "email": "member@example.com",
-            "password": "member-password-123",
-            "name": "Mike Member",
-            "project_name": "Member Own Project",
-        },
-    )
-    assert member_reg.status_code == 201
-    member_id = member_reg.json()["user"]["id"]
-
-    viewer_reg = client.post(
-        "/api/v1/auth/register",
-        json={
-            "email": "viewer@example.com",
-            "password": "viewer-password-123",
-            "name": "Vera Viewer",
-            "project_name": "Viewer Own Project",
-        },
-    )
-    assert viewer_reg.status_code == 201
-    viewer_id = viewer_reg.json()["user"]["id"]
-
-    # Add member and viewer to Project A via DB
-    from matrix_server.storage.models import ProjectMember
-
-    with app.state.session_factory() as db:
-        db.add(ProjectMember(project_id=project_a, user_id=member_id, role="member"))
-        db.add(ProjectMember(project_id=project_a, user_id=viewer_id, role="viewer"))
-        db.commit()
-
-    member_token_a = create_jwt({"sub": member_id}, settings.jwt_secret)
-    viewer_token_a = create_jwt({"sub": viewer_id}, settings.jwt_secret)
-
-    def headers(token: str, project_id: str) -> dict[str, str]:
-        return {"Authorization": f"Bearer {token}", "x-matrix-project-id": project_id}
+    factory = app.state.session_factory
+    project_a, roles_a = project_with_roles(factory, "Project A")
+    project_b, roles_b = project_with_roles(factory, "Project B")
 
     return {
         "app": app,
         "client": client,
         "project_a": project_a,
         "project_b": project_b,
-        "admin_a": headers(admin_token_a, project_a),
-        "member_a": headers(member_token_a, project_a),
-        "viewer_a": headers(viewer_token_a, project_a),
-        "admin_b": headers(admin_token_b, project_b),
+        "admin_a": roles_a["admin"],
+        "member_a": roles_a["member"],
+        "viewer_a": roles_a["viewer"],
+        "admin_b": roles_b["admin"],
+        "key_a": api_key_headers(factory, project_a),
     }
 
 
@@ -219,10 +154,14 @@ def test_end_to_end_mlops_flow_and_deduplication(env):
     assert art1["upload_url"] is not None
     assert art1["version"] == 1
 
-    # PUT local presigned URL (no Bearer header required)
-    put_resp = client.put(art1["upload_url"], content=blob)
-    assert put_resp.status_code == 200, put_resp.text
-    assert put_resp.json()["size_bytes"] == len(blob)
+    # T4: the upload goes to the G0 content route of the reserved blob (relative URL, so `main`'s
+    # SDK sends its credentials): a MEMBER of the blob's project; another project does not see it.
+    assert art1["upload_url"].startswith("/api/v1/artifacts/") and art1["upload_url"].endswith("/content")
+    assert client.put(art1["upload_url"], content=blob).status_code == 401
+    assert client.put(art1["upload_url"], content=blob, headers=env["viewer_a"]).status_code == 403
+    assert client.put(art1["upload_url"], content=blob, headers=env["admin_b"]).status_code == 404
+    put_resp = client.put(art1["upload_url"], content=blob, headers=hdrs)
+    assert put_resp.status_code == 204, put_resp.text
 
     # Commit artifact
     commit_resp = client.post(f"/api/v1/mlops/artifacts/{art1['id']}/commit", headers=hdrs)
@@ -233,7 +172,11 @@ def test_end_to_end_mlops_flow_and_deduplication(env):
     dl_resp = client.get(f"/api/v1/mlops/artifacts/{art1['id']}/download-url", headers=env["viewer_a"])
     assert dl_resp.status_code == 200
     dl_url = dl_resp.json()["download_url"]
-    get_blob = client.get(dl_url)
+    assert dl_url.startswith("/api/v1/artifacts/") and dl_url.endswith("/download")
+    assert client.get(dl_url).status_code == 401
+    # scoped to project A: a caller of project B does not see the blob
+    assert client.get(dl_url, headers=env["admin_b"]).status_code == 404
+    get_blob = client.get(dl_url, headers=env["viewer_a"])
     assert get_blob.status_code == 200
     assert get_blob.content == blob
 
@@ -603,8 +546,16 @@ def test_rbac_multi_tenant_isolation_and_security(env):
         == 422
     )
 
-    # 5. Anti-SSRF on external_uri (422)
-    for bad_uri in ("file:///etc/passwd", "http://169.254.169.254/latest/meta-data", "s3://localhost/bucket"):
+    # 5. External URIs are registered by reference only (never fetched, T4): scheme allowlist,
+    # no credentials, no traversal. `s3://localhost/...` is now just a name (no request is made to
+    # it, so the duplicated private-IP check of `main` was removed; network access to user URLs
+    # goes through `egress_client`).
+    for bad_uri in (
+        "file:///etc/passwd",
+        "http://169.254.169.254/latest/meta-data",
+        "s3://user:secret@bucket/key",
+        "s3://bucket/../etc/passwd",
+    ):
         resp = client.post(
             "/api/v1/mlops/artifacts/presign-upload",
             headers=member_a,
@@ -617,9 +568,17 @@ def test_rbac_multi_tenant_isolation_and_security(env):
         )
         assert resp.status_code == 422, f"Expected 422 for {bad_uri}, got {resp.status_code}"
 
-    # 6. Invalid local presigned token returns 403
-    assert client.put("/api/v1/mlops/artifacts/local/invalid.token", content=b"x").status_code == 403
-    assert client.get("/api/v1/mlops/artifacts/local/invalid.token").status_code == 403
+    ok = client.post(
+        "/api/v1/mlops/artifacts/presign-upload",
+        headers=member_a,
+        json={"name": "by-ref", "sha256": "b" * 64, "size_bytes": 100, "external_uri": "s3://localhost/bucket/x"},
+    )
+    assert ok.status_code == 201 and ok.json()["storage_backend"] == "external" and ok.json()["upload_url"] is None
+
+    # 6. `main`'s HMAC-token routes are gone (T4): uploads/downloads use the G0 artifact routes
+    bad = "/api/v1/mlops/artifacts/local/invalid.token"
+    assert client.put(bad, content=b"x", headers=member_a).status_code in (404, 405)
+    assert client.get(bad, headers=member_a).status_code in (404, 405)
 
     # 7. Admin force delete works
     assert client.delete(f"/api/v1/mlops/models/{model_id}?force=true", headers=admin_a).status_code == 200
@@ -684,9 +643,8 @@ def test_local_artifact_upload_bypasses_json_limit_and_validates_sha256(tmp_path
     settings = Settings(
         database_url=f"sqlite:///{tmp_path}/art_limits.db",
         span_store="memory",
-        artifact_store="local",
-        artifact_dir=str(tmp_path / "artifacts"),
-        jwt_secret="test-mlops-jwt-secret",
+        artifact_backend="local",
+        artifact_local_dir=str(tmp_path / "artifacts"),
         max_json_body_bytes=1000,
         max_body_bytes=2000,
         max_artifact_bytes=10_000,
@@ -694,20 +652,8 @@ def test_local_artifact_upload_bypasses_json_limit_and_validates_sha256(tmp_path
     app = create_app(settings)
     client = TestClient(app)
     try:
-        reg = client.post(
-            "/api/v1/auth/register",
-            json={
-                "email": "art@example.com",
-                "password": "art-password-123",
-                "name": "Art User",
-                "project_name": "Art Project",
-            },
-        )
-        assert reg.status_code == 201
-        hdrs = {
-            "Authorization": f"Bearer {reg.json()['token']}",
-            "x-matrix-project-id": reg.json()["project"]["id"],
-        }
+        _, roles = project_with_roles(app.state.session_factory, "Art Project")
+        hdrs = roles["member"]
 
         # Payload > max_json_body_bytes (1000) and > max_body_bytes (2000), but <= max_artifact_bytes (10_000)
         payload = b"A" * 5000
@@ -721,18 +667,24 @@ def test_local_artifact_upload_bypasses_json_limit_and_validates_sha256(tmp_path
         upload_url = presign.json()["upload_url"]
 
         # Wrong content -> 422 sha256 mismatch
-        bad_put = client.put(upload_url, content=b"B" * 5000)
+        bad_put = client.put(upload_url, content=b"B" * 5000, headers=hdrs)
         assert bad_put.status_code == 422
         assert "sha256" in bad_put.json()["detail"].lower()
 
-        # Correct content -> 200
-        ok_put = client.put(upload_url, content=payload)
-        assert ok_put.status_code == 200, ok_put.text
-        assert ok_put.json()["size_bytes"] == len(payload)
-
-        # Oversized payload (> max_artifact_bytes=10_000) -> 413
-        big_put = client.put(upload_url, content=b"C" * 10_001)
+        # Oversized payload (> max_artifact_bytes=10_000) -> 413 (raw-upload body limit)
+        big_put = client.put(upload_url, content=b"C" * 10_001, headers=hdrs)
         assert big_put.status_code == 413
+
+        # Correct content -> 204 (G0 content route), then commit and read it back
+        ok_put = client.put(upload_url, content=payload, headers=hdrs)
+        assert ok_put.status_code == 204, ok_put.text
+        art_id = presign.json()["id"]
+        committed = client.post(f"/api/v1/mlops/artifacts/{art_id}/commit", headers=hdrs)
+        assert committed.status_code == 200 and committed.json()["status"] == "committed"
+        assert committed.json()["size_bytes"] == len(payload)
+        dl = client.get(f"/api/v1/mlops/artifacts/{art_id}/download-url", headers=hdrs).json()
+        assert dl["sha256"] == sha
+        assert client.get(dl["download_url"], headers=hdrs).content == payload
     finally:
         app.state.db_engine.dispose()
 

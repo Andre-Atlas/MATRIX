@@ -4,6 +4,7 @@ import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { STANDARD_LABELS, isValidLabel, labelMoveKind, promptPath } from "@/lib/prompt-template";
 import { proxy } from "@/lib/proxy-client";
+import { useCan } from "@/components/auth/role-context";
 import type { PromptVersion } from "@/lib/types";
 import { field } from "@/components/evals/ui";
 
@@ -12,6 +13,7 @@ const CUSTOM = "__custom__";
 /** Moves a label onto this version. Moving it to an older version is the rollback button. */
 export function LabelMover({ name, version, labelVersions }: { name: string; version: number; labelVersions: Record<string, number> }) {
   const router = useRouter();
+  const canWrite = useCan("member");
   const [choice, setChoice] = useState<string>("production");
   const [custom, setCustom] = useState("");
   const [confirming, setConfirming] = useState(false);
@@ -38,6 +40,8 @@ export function LabelMover({ name, version, labelVersions }: { name: string; ver
       setBusy(false);
     }
   }
+
+  if (!canWrite) return null;
 
   const verb = kind === "rollback" ? "Roll back" : kind === "promote" ? "Promote" : "Apply";
   return (

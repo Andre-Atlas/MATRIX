@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from matrix_server.benchmarks.runner import run_benchmark_job
 from matrix_server.evals.runner import ExperimentConfigError, run_experiment
+from matrix_server.projects import PURGE_SPANS_JOB
 from matrix_server.sandboxes.runner import run_sandbox_job
 from matrix_server.storage import jobs
 from matrix_server.storage.db import utcnow
@@ -63,6 +64,9 @@ def run_experiment_job(session: Session, job: Job) -> None:
     try:
         exp = session.get(Experiment, exp_id, populate_existing=True)
         run_experiment(session, exp)
+        if exp.status == "failed":
+            # Every cell failed: a recorded outcome, not a systemic error. The job succeeds (no retry).
+            log.warning("experiment %s failed: %s", exp_id, exp.error)
     except JobLost:
         session.rollback()
         log.warning("job %s: lease lost, experiment %s left to its current owner", job.id, exp_id)
@@ -104,6 +108,21 @@ def settle_failed_experiment(session_factory: sessionmaker[Session], job: Job) -
         elif not exp.error:
             exp.error = "internal error: job failed"
         exp.finished_at = utcnow()
+
+
+@register(PURGE_SPANS_JOB)
+def purge_project_spans(session: Session, job: Job) -> None:
+    """Data of a deleted project kept outside the relational store (`DELETE /api/v1/projects/{id}`;
+    its rows are already gone): spans, run metric points and artifact blobs. Each step is
+    idempotent, so a retry after a partial failure redoes all of them."""
+    from matrix_server.workers.artifact_handlers import get_artifact_store
+    from matrix_server.workers.online_handlers import get_span_store
+    from matrix_server.workers.run_handlers import get_metric_store
+
+    get_span_store().delete_project(job.project_id)
+    get_metric_store().delete_project(job.project_id)
+    removed = get_artifact_store().delete_project(job.project_id)
+    log.info("project %s purged (%d artifact objects)", job.project_id, removed)
 
 
 @register("benchmark.run")
@@ -168,4 +187,3 @@ def settle_failed_sandbox(session_factory: sessionmaker[Session], job: Job) -> N
         elif not run.error:
             run.error = "internal error: sandbox job failed"
         run.finished_at = utcnow()
-

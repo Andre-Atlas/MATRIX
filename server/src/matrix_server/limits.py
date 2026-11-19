@@ -9,12 +9,19 @@ undeclared body is counted as it streams and refused once it crosses the limit. 
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from starlette.exceptions import HTTPException
 
 JSON_API_PREFIX = "/api/v1/"
-LOCAL_ARTIFACT_UPLOAD_PREFIX = "/api/v1/mlops/artifacts/local/"
+# Raw artifact uploads (contract G0 section 2): streamed, so exempt from the JSON limit and bounded by
+# `raw_upload_limit` (settings.max_artifact_bytes); the route also enforces it while reading.
+# The last entry is main's MLOps local upload (signed token in the path; merged by ADR-013, T4 folds
+# it into the artifact store).
+RAW_UPLOAD_ROUTES = (("POST", re.compile(r"^/api/v1/artifacts/?$")),
+                     ("PUT", re.compile(r"^/api/v1/artifacts/[A-Za-z0-9_-]{1,64}/content$")),
+                     ("PUT", re.compile(r"^/api/v1/mlops/artifacts/local/[A-Za-z0-9_.=-]{1,4096}$")))
 
 
 class BodyTooLarge(HTTPException):
@@ -27,22 +34,18 @@ class BodyTooLarge(HTTPException):
 
 class BodyLimitMiddleware:
     def __init__(
-        self,
-        app: Any,
-        max_body_bytes: int,
-        max_json_body_bytes: int,
-        max_artifact_bytes: int | None = None,
+        self, app: Any, max_body_bytes: int, max_json_body_bytes: int, raw_upload_limit: int | None = None
     ) -> None:
         self.app = app
         self.max_body_bytes = max_body_bytes
         self.max_json_body_bytes = max_json_body_bytes
-        self.max_artifact_bytes = max_artifact_bytes
+        self.raw_upload_limit = raw_upload_limit
 
     def _limit(self, path: str, method: str = "") -> int:
-        if method == "PUT" and path.startswith(LOCAL_ARTIFACT_UPLOAD_PREFIX):
-            if self.max_artifact_bytes is not None:
-                return self.max_artifact_bytes
-            return self.max_body_bytes
+        if self.raw_upload_limit is not None and any(
+            method == m and rx.match(path) for m, rx in RAW_UPLOAD_ROUTES
+        ):
+            return self.raw_upload_limit
         if path.startswith(JSON_API_PREFIX) or path == JSON_API_PREFIX.rstrip("/"):
             return min(self.max_json_body_bytes, self.max_body_bytes)
         return self.max_body_bytes

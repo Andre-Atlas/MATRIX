@@ -21,7 +21,8 @@ Handler = Callable[[Session, Job], None]
 HANDLERS: dict[str, Handler] = {}
 
 # Modules whose import registers handlers via `@register`; `run_worker` imports them at start-up.
-HANDLER_MODULES: list[str] = ["matrix_server.workers.handlers", "matrix_server.workers.online_handlers"]
+HANDLER_MODULES: list[str] = ["matrix_server.workers.handlers", "matrix_server.workers.online_handlers",
+                               "matrix_server.workers.artifact_handlers", "matrix_server.workers.run_handlers"]
 
 
 def load_handler_modules(modules: list[str] | None = None) -> None:

@@ -17,17 +17,19 @@ from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor
 
 from . import tracing
+from ._net import client_kwargs
 from .prompts import Prompt
 
 if TYPE_CHECKING:
     from .benchmarks import BenchmarksClient
     from .datasets import DatasetsClient
-    from .mlops import MLOpsClient, TrainingRun
+    from .mlops import MLOpsClient
     from .sandboxes import SandboxesClient
 
 DEFAULT_ENDPOINT = "http://localhost:8000"
 
 log = logging.getLogger("matrix_sdk")
+_default_client: MatrixClient | None = None  # set by init(set_global=True); used by start_run()
 _clock = time.monotonic  # monkeypatched in tests
 
 
@@ -38,13 +40,6 @@ class MatrixError(RuntimeError):
 def _seg(value: Any) -> str:
     """One URL path segment: `/`, `?`, `#`, `%` and spaces in ids or names stay inside it."""
     return quote(str(value), safe="")
-
-
-def _clean_no_proxy() -> None:
-    for var in ("NO_PROXY", "no_proxy"):
-        val = os.environ.get(var)
-        if val and "[::1]" in val:
-            os.environ[var] = ",".join(p.strip() for p in val.split(",") if p.strip() != "[::1]")
 
 
 class MatrixClient:
@@ -60,7 +55,6 @@ class MatrixClient:
         owns_provider: bool = True,
         span_processors: list[SpanProcessor] | None = None,
     ) -> None:
-        _clean_no_proxy()
         self.api_key = api_key
         self.endpoint = endpoint.rstrip("/")
         self.project_name = project_name
@@ -71,8 +65,9 @@ class MatrixClient:
         self._http = httpx.Client(
             base_url=self.endpoint,
             headers={"Authorization": f"Bearer {api_key}"},
-            transport=transport,
             timeout=timeout,
+            # proxy env honoured without rewriting NO_PROXY in the caller's process (see _net)
+            **client_kwargs(transport),
         )
         self._cache: dict[tuple, tuple[Prompt, float]] = {}
         self._refreshing: set[tuple] = set()
@@ -198,6 +193,14 @@ class MatrixClient:
             body["metadata"] = metadata
         return self._request("POST", f"/api/v1/datasets/{_seg(dataset_id)}/items", json=body)
 
+    # -- training runs
+    def start_run(self, *args: Any, **kwargs: Any):
+        """Same as `matrix_sdk.start_run(...)`, bound to this client."""
+        from .tracking import start_run
+
+        return start_run(*args, client=self, **kwargs)
+
+    # -- datasets (versioning, from main)
     @property
     def datasets(self) -> DatasetsClient:
         if self._datasets is None:
@@ -241,9 +244,6 @@ class MatrixClient:
                     self._mlops = MLOpsClient(self)
         return self._mlops
 
-    def start_run(self, name: str, **kwargs: Any) -> TrainingRun:
-        return self.mlops.start_run(name, **kwargs)
-
     def register_model(self, name: str, **kwargs: Any) -> dict[str, Any]:
         return self.mlops.register_model(name, **kwargs)
 
@@ -285,6 +285,10 @@ def init(
     if set_global and owns:
         trace.set_tracer_provider(provider)
     tracing._set_provider(provider)  # helpers and instrumentations share one provider
-    return MatrixClient(
+    client = MatrixClient(
         key, base, project_name, tracer_provider=provider, owns_provider=owns, span_processors=processors
     )
+    if set_global:
+        global _default_client
+        _default_client = client
+    return client

@@ -4,9 +4,9 @@ import hashlib
 
 import pytest
 from fastapi.testclient import TestClient
+from rbac_helpers import api_key_headers, project_with_roles
 
 from matrix_server.app import create_app
-from matrix_server.auth import create_jwt
 from matrix_server.config import Settings
 from matrix_server.sandboxes.runner import (
     DockerSandbox,
@@ -16,103 +16,39 @@ from matrix_server.sandboxes.runner import (
     execute_step,
     validate_sandbox_path,
 )
-from matrix_server.storage.models import ProjectMember
+from matrix_server.storage.models import SandboxRun
 
 
 @pytest.fixture
 def env(tmp_path):
-    artifact_root = tmp_path / "artifacts"
-    artifact_root.mkdir(parents=True, exist_ok=True)
+    # Users, memberships and sessions of the branch's RBAC (G0); `main`'s JWT/register flow is gone.
     settings = Settings(
         database_url=f"sqlite:///{tmp_path}/sandboxes_test.db",
         span_store="memory",
-        artifact_store="local",
-        artifact_dir=str(artifact_root),
-        jwt_secret="test-sandboxes-secret-jwt",
+        artifact_backend="local",
+        artifact_local_dir=str(tmp_path / "artifacts"),
     )
     app = create_app(settings)
     client = TestClient(app)
-
-    # Register Project A (Alice = admin)
-    reg_a = client.post(
-        "/api/v1/auth/register",
-        json={
-            "email": "alice@example.com",
-            "password": "alice-password-123",
-            "name": "Alice Admin",
-            "project_name": "Project A",
-        },
-    )
-    assert reg_a.status_code == 201
-    data_a = reg_a.json()
-    project_a = data_a["project"]["id"]
-    admin_token_a = data_a["token"]
-
-    # Register Project B (Bob = admin)
-    reg_b = client.post(
-        "/api/v1/auth/register",
-        json={
-            "email": "bob@example.com",
-            "password": "bob-password-123",
-            "name": "Bob Admin",
-            "project_name": "Project B",
-        },
-    )
-    assert reg_b.status_code == 201
-    data_b = reg_b.json()
-    project_b = data_b["project"]["id"]
-    admin_token_b = data_b["token"]
-
-    # Create Member and Viewer users
-    member_reg = client.post(
-        "/api/v1/auth/register",
-        json={
-            "email": "member@example.com",
-            "password": "member-password-123",
-            "name": "Mike Member",
-            "project_name": "Member Own",
-        },
-    )
-    member_id = member_reg.json()["user"]["id"]
-
-    viewer_reg = client.post(
-        "/api/v1/auth/register",
-        json={
-            "email": "viewer@example.com",
-            "password": "viewer-password-123",
-            "name": "Vera Viewer",
-            "project_name": "Viewer Own",
-        },
-    )
-    viewer_id = viewer_reg.json()["user"]["id"]
-
-    with app.state.session_factory() as db:
-        db.add(ProjectMember(project_id=project_a, user_id=member_id, role="member"))
-        db.add(ProjectMember(project_id=project_a, user_id=viewer_id, role="viewer"))
-        db.commit()
-
-    member_token_a = create_jwt({"sub": member_id}, settings.jwt_secret)
-    viewer_token_a = create_jwt({"sub": viewer_id}, settings.jwt_secret)
-
-    def headers(token: str, pid: str) -> dict[str, str]:
-        return {"Authorization": f"Bearer {token}", "x-matrix-project-id": pid}
+    factory = app.state.session_factory
+    project_a, roles_a = project_with_roles(factory, "Project A")
+    project_b, roles_b = project_with_roles(factory, "Project B")
 
     return {
         "app": app,
         "client": client,
-        "tmp_path": tmp_path,
         "project_a": project_a,
         "project_b": project_b,
-        "admin_a": headers(admin_token_a, project_a),
-        "member_a": headers(member_token_a, project_a),
-        "viewer_a": headers(viewer_token_a, project_a),
-        "admin_b": headers(admin_token_b, project_b),
+        "admin_a": roles_a["admin"],
+        "member_a": roles_a["member"],
+        "viewer_a": roles_a["viewer"],
+        "admin_b": roles_b["admin"],
+        "viewer_token_a": roles_a["viewer"],
+        "member_token_a": roles_a["member"],
+        "admin_token_a": roles_a["admin"],
+        "admin_token_b": roles_b["admin"],
+        "key_a": api_key_headers(factory, project_a),
     }
-
-
-# ---------------------------------------------------------------------------
-# Unit / Local Sandbox Execution & Step Transcription Tests
-# ---------------------------------------------------------------------------
 
 
 def test_local_sandbox_step_execution_and_truncation(tmp_path):
@@ -407,7 +343,25 @@ def test_security_non_admin_network_access_rejected(env):
         },
     )
     assert res.status_code == 403
-    assert "requires admin role" in res.json()["detail"]
+    assert "requires role admin" in res.json()["detail"]
+
+    # An API key is never ADMIN, even with every scope
+    key_res = client.post(
+        "/api/v1/sandboxes/runs",
+        headers=env["key_a"],
+        json={"name": "key-network-run", "sandbox_policy": {"network_mode": "bridge"}},
+    )
+    assert key_res.status_code == 403
+
+    # The approval is server-owned: a client cannot claim it in the policy (T3)
+    for forged in ({"is_admin": True}, {"network_approved_by": "someone"}):
+        forged_res = client.post(
+            "/api/v1/sandboxes/runs",
+            headers=env["member_a"],
+            json={"name": "forged", "sandbox_policy": {"network_mode": "bridge", **forged}},
+        )
+        assert forged_res.status_code == 422, forged_res.text
+        assert "server-owned" in forged_res.text
 
     # Admin is allowed to request network_mode != 'none'
     admin_res = client.post(
@@ -419,6 +373,18 @@ def test_security_non_admin_network_access_rejected(env):
         },
     )
     assert admin_res.status_code == 201
+    with env["app"].state.session_factory() as db:
+        stored = db.get(SandboxRun, admin_res.json()["id"]).sandbox_policy
+    assert stored["network_mode"] == "bridge"
+    assert stored["network_approved_by"]  # the approving admin's user id, set by the server
+
+
+def test_runner_derives_network_approval_only_from_server_key():
+    from matrix_server.sandboxes.runner import network_approved
+
+    assert network_approved({"network_mode": "bridge", "network_approved_by": "user-1"}) is True
+    assert network_approved({"network_mode": "bridge", "is_admin": True}) is False
+    assert network_approved({}) is False
 
 
 def test_security_docker_socket_mounting_forbidden(env):

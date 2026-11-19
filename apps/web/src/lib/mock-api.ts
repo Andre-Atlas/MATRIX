@@ -1,5 +1,6 @@
 // In-memory implementation of the API, used only when MATRIX_MOCK=1.
 import { ApiError } from "./api-error";
+import { authGet, authSend, mockGate, MEMBER_ACCEPTED, NO_CONTENT, type MockCtx } from "./mock-auth";
 import {
   createMockSafetyScan,
   getMockGatewayLogs,
@@ -16,6 +17,8 @@ import {
 import { evalExportJsonl, evalGet, evalSend } from "./mock-evals";
 import { mlopsGet, mlopsSend } from "./mock-mlops";
 import { dpoExportJsonl, opsGet, opsSend } from "./mock-ops";
+import { runArtifactDownload, runsGet, runsSend } from "./mock-runs";
+import type { ListResponse, OverviewStats, Score, SessionDetail, TraceDetail, TraceSummary } from "./types";
 import { sotaGet, sotaSend } from "./sota-mocks";
 import type {
   CreateSafetyScanRequest,
@@ -23,14 +26,8 @@ import type {
   GatewayProvidersResponse,
   GatewayRulesResponse,
   GatewayStatsResponse,
-  ListResponse,
-  OverviewStats,
   SafetyCategoriesResponse,
   SafetyScansResponse,
-  Score,
-  SessionDetail,
-  TraceDetail,
-  TraceSummary,
 } from "./types";
 
 type Params = Record<string, string | number | undefined>;
@@ -53,10 +50,20 @@ function sinceMs(params: Params): number {
   return Number.isNaN(t) ? -Infinity : t;
 }
 
-export async function mockGet<T>(path: string, params: Params = {}): Promise<T> {
+export type { MockCtx };
+export { NO_CONTENT };
+
+/** `ctx` is the session of the caller (token and active project). The web server always passes it. */
+export async function mockGet<T>(path: string, params: Params = {}, ctx?: MockCtx): Promise<T> {
   const db = mockDb();
   const p = path.replace(/\/+$/, "");
   let m: RegExpExecArray | null;
+
+  if (ctx) {
+    mockGate("GET", p, ctx);
+    const authed = authGet(ctx, p, params);
+    if (authed !== undefined) return authed as T;
+  }
 
   if (p === "/api/v1/stats/overview") {
     const from = sinceMs(params);
@@ -218,6 +225,9 @@ export async function mockGet<T>(path: string, params: Params = {}): Promise<T> 
   const evalResult = evalGet(p);
   if (evalResult !== undefined) return evalResult as T;
 
+  const runsResult = runsGet(p, params);
+  if (runsResult !== undefined) return runsResult as T;
+
   const opsResult = opsGet(p, params);
   if (opsResult !== undefined) return opsResult as T;
 
@@ -227,47 +237,40 @@ export async function mockGet<T>(path: string, params: Params = {}): Promise<T> 
   throw new ApiError(404, `mock: no handler for GET ${path}`);
 }
 
-export async function mockSend<T>(method: string, path: string, body?: unknown): Promise<T> {
+export async function mockSend<T>(method: string, path: string, body?: unknown, ctx?: MockCtx): Promise<T> {
   const m = method.toUpperCase();
   const p = path.replace(/\/+$/, "");
-
-  if (m === "POST" && (p === "/api/v1/auth/login" || p === "/api/v1/auth/register")) {
-    const reqBody = (body ?? {}) as { email?: string; name?: string };
-    return {
-      token: "mock-jwt-token",
-      user: {
-        id: "user-admin-01",
-        email: reqBody.email || "admin@matrix.local",
-        name: reqBody.name || "Matrix Admin",
-      },
-      projects: [
-        {
-          id: "proj-default",
-          name: "default",
-          role: "admin",
-        },
-      ],
-    } as T;
+  if (ctx) {
+    mockGate(m, p, ctx);
+    const authed = authSend(ctx, m, p, body);
+    if (authed !== undefined) return authed as T;
   }
-
-  if (m === "POST" && p === "/api/v1/auth/logout") {
-    return { ok: true } as T;
-  }
-
   if (m === "POST" && p === "/api/v1/safety/scans") {
     return createMockSafetyScan(body as CreateSafetyScanRequest) as T;
   }
-
   const out =
-    sotaSend(m, p, body) ?? evalSend(m, p, body) ?? opsSend(m, p, body) ?? mlopsSend(m, p, body);
+    evalSend(m, p, body) ??
+    opsSend(m, p, body) ??
+    runsSend(m, p, body) ??
+    sotaSend(m, p, body) ??
+    mlopsSend(m, p, body);
   if (out === undefined) throw new ApiError(404, `mock: no handler for ${method} ${path}`);
   return out as T;
 }
 
 /** Backs /api/proxy/* in mock mode: same status codes and bodies as the real API would return. */
-export async function mockFetch(method: string, path: string, params: Params, rawBody: string | null): Promise<Response> {
+export async function mockFetch(
+  method: string,
+  path: string,
+  params: Params,
+  rawBody: string | null,
+  ctx?: MockCtx,
+): Promise<Response> {
   try {
     if (method === "GET") {
+      if (ctx) mockGate("GET", path.replace(/\/+$/, ""), ctx);
+      const download = runArtifactDownload(path);
+      if (download) return download;
       const text = evalExportJsonl(path) ?? dpoExportJsonl(path);
       if (text !== undefined) {
         return new Response(text, {
@@ -277,7 +280,7 @@ export async function mockFetch(method: string, path: string, params: Params, ra
           },
         });
       }
-      return Response.json(await mockGet(path, params));
+      return Response.json(await mockGet(path, params, ctx));
     }
     let body: unknown;
     try {
@@ -285,14 +288,18 @@ export async function mockFetch(method: string, path: string, params: Params, ra
     } catch {
       return Response.json({ detail: "invalid JSON body" }, { status: 400 });
     }
-    return Response.json(await mockSend(method, path, body), { status: method === "POST" ? 201 : 200 });
+    const out = await mockSend(method, path, body, ctx);
+    if (out === NO_CONTENT) return new Response(null, { status: 204 });
+    const login = path.replace(/\/+$/, "") === "/api/v1/auth/login";
+    if (out === MEMBER_ACCEPTED) return Response.json(out, { status: 202 });
+    return Response.json(out, { status: method === "POST" && !login ? 201 : 200 });
   } catch (e) {
     if (e instanceof ApiError) {
       const isJson = e.body.startsWith("{");
-      return new Response(isJson ? e.body : JSON.stringify({ detail: e.body }), {
-        status: e.status,
-        headers: { "content-type": "application/json" },
-      });
+      const headers: Record<string, string> = { "content-type": "application/json" };
+      if (e.retryAfter !== undefined) headers["retry-after"] = String(e.retryAfter);
+      if (e.status === 401) headers["www-authenticate"] = "Bearer";
+      return new Response(isJson ? e.body : JSON.stringify({ detail: e.body }), { status: e.status, headers });
     }
     throw e;
   }

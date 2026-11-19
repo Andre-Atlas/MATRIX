@@ -19,6 +19,7 @@ from typing import Any, Protocol, runtime_checkable
 
 import httpx
 
+from matrix_server.net import client_kwargs
 from matrix_server.pricing import compute_cost
 
 __all__ = [
@@ -131,13 +132,6 @@ def _content_text(content: Any) -> str:
     return str(content)
 
 
-def _clean_no_proxy() -> None:
-    for var in ("NO_PROXY", "no_proxy"):
-        val = os.environ.get(var)
-        if val and "[::1]" in val:
-            os.environ[var] = ",".join(p.strip() for p in val.split(",") if p.strip() != "[::1]")
-
-
 class _HTTPBase:
     provider_name = "http"
 
@@ -158,11 +152,10 @@ class _HTTPBase:
         self._sleep = sleep
 
     def _post(self, url: str, headers: dict, payload: dict, key: str | None) -> dict:
-        _clean_no_proxy()
         attempt = 0
         while True:
             try:
-                with httpx.Client(timeout=self.timeout, transport=self._transport) as client:
+                with httpx.Client(timeout=self.timeout, **client_kwargs(self._transport)) as client:
                     resp = client.post(url, headers=headers, json=payload)
             except httpx.HTTPError as exc:
                 if attempt < self.max_retries and isinstance(exc, httpx.TransportError):

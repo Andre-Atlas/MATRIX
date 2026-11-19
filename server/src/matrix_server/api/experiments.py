@@ -15,7 +15,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from matrix_server.api.datasets import get_dataset_or_404, iso_utc, parse_body
-from matrix_server.auth import current_project_id
+from matrix_server.auth import Role, project_of
 from matrix_server.evals.metrics import build_metric
 from matrix_server.evals.providers import get_provider
 from matrix_server.evals.runner import find_regressions, max_cells
@@ -31,7 +31,8 @@ from matrix_server.storage.models import (
 )
 
 DbSession = Annotated[Session, Depends(get_db)]
-ProjectId = Annotated[str, Depends(current_project_id)]
+ProjectId = Annotated[str, Depends(project_of(Role.VIEWER))]  # reads
+MemberProjectId = Annotated[str, Depends(project_of(Role.MEMBER))]  # writes
 
 router = APIRouter(prefix="/api/v1", tags=["experiments"])
 
@@ -190,7 +191,7 @@ def _results(db: Session, experiment_id: str) -> list[ExperimentResult]:
 
 @router.post("/experiments", status_code=201)
 def create_experiment(
-    db: DbSession, project_id: ProjectId, payload: Annotated[dict[str, Any], Body()]
+    db: DbSession, project_id: MemberProjectId, payload: Annotated[dict[str, Any], Body()]
 ) -> dict[str, Any]:
     body = parse_body(ExperimentCreate, payload)
     dataset = get_dataset_or_404(db, project_id, body.dataset_id)

@@ -12,8 +12,6 @@ class Settings(BaseSettings):
     clickhouse_url: str = "http://localhost:8123"
     clickhouse_database: str = "matrix"
     admin_token: str | None = None
-    jwt_secret: str = "matrix-insecure-dev-secret-change-in-prod"
-    jwt_exp_hours: int = 72
     # Every request body (OTLP ingest included) is bounded by max_body_bytes; the JSON API
     # (/api/v1/*) by the smaller max_json_body_bytes. Larger bodies get 413.
     max_body_bytes: int = 10_000_000
@@ -22,15 +20,51 @@ class Settings(BaseSettings):
     # Bound on the decoded attribute size of one request (resource/scope attributes are copied
     # into each span): max_normalized_factor x max_body_bytes, else 413.
     max_normalized_factor: int = 4
-    artifact_store: Literal["local", "s3"] = "local"
-    artifact_dir: str = "./.matrix_artifacts"
-    s3_endpoint: str = "http://localhost:9000"
+
+    # Training runs (contract G1): caps on accepted metric point writes per run and per key.
+    max_points_per_run: int = 50_000_000
+    max_points_per_key: int = 10_000_000
+    # Runs per project (POST /runs answers 409 beyond it; delete runs to make room) and runs in the
+    # `running` state per project (429 beyond it, until some finish or the reaper fails them).
+    max_runs_per_project: int = 100_000
+    max_active_runs_per_project: int = 1000
+
+    # Users and web sessions (ADR-006, contract G0 section 1).
+    session_idle_ttl_seconds: int = 7 * 24 * 3600
+    session_absolute_ttl_seconds: int = 30 * 24 * 3600
+    # Whether any logged-in user may create projects (POST /api/v1/projects).
+    allow_project_creation: bool = True
+    # Header carrying the real client IP, set (overwritten) by a trusted reverse proxy such as the
+    # Next.js server, e.g. "X-Forwarded-For" or "X-Real-IP". Off by default: the socket peer is used.
+    # With a comma-separated list the rightmost entry (the one the trusted proxy saw) is taken.
+    # Honoured ONLY when the socket peer is inside `trusted_proxies`.
+    trusted_proxy_header: str | None = None
+    # Comma-separated CIDRs (or addresses) of the reverse proxies allowed to set
+    # `trusted_proxy_header`, e.g. "172.16.0.0/12,10.0.0.0/8,192.168.0.0/16" for a compose network.
+    # Empty (default): the header is never trusted. Peers in this list (and private/loopback peers)
+    # are never treated as the client's real IP for the per-IP login lock.
+    trusted_proxies: str = ""
+    # Concurrent argon2 operations per process (each needs 64 MiB); excess waits, then 503.
+    password_hash_concurrency: int = 4
+
+    # Artifact store (ADR-007, contract G0 section 2). Raw upload routes are exempt from the JSON
+    # body limit and bounded by max_artifact_bytes instead (limits.py).
+    artifact_backend: Literal["local", "s3"] = "local"
+    artifact_local_dir: str = "./artifacts"
+    s3_endpoint: str | None = None
+    s3_public_endpoint: str | None = None
     s3_bucket: str = "matrix-artifacts"
     s3_region: str = "us-east-1"
-    s3_access_key: str = ""
-    s3_secret_key: str = ""
-    max_artifact_bytes: int = 50_000_000_000
-    artifact_presign_ttl_seconds: int = 900
+    s3_access_key: str | None = None
+    s3_secret_key: str | None = None
+    s3_auto_create_bucket: bool = False
+    # Trust the S3 server's verification of x-amz-checksum-sha256 for presigned uploads above
+    # verify_hash_max_bytes (AWS S3, MinIO). Off: such uploads are refused at complete (audit S11).
+    s3_trust_checksum: bool = False
+    max_artifact_bytes: int = 5 * 1024**3
+    project_quota_bytes: int = 50 * 1024**3
+    verify_hash_max_bytes: int = 256 * 1024**2
+    artifact_url_ttl_seconds: int = 3600
 
 
 @lru_cache

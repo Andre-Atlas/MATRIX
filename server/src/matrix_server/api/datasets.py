@@ -15,7 +15,7 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from matrix_server.auth import AuthContext, current_project_id, require_role
+from matrix_server.auth import Principal, Role, project_of, require
 from matrix_server.datasets.versioning import (
     BranchExistsError,
     BranchNotFoundError,
@@ -40,9 +40,11 @@ from matrix_server.storage.models import (
 )
 
 DbSession = Annotated[Session, Depends(get_db)]
-ProjectId = Annotated[str, Depends(current_project_id)]
-ViewerAuth = Annotated[AuthContext, Depends(require_role("viewer"))]
-MemberAuth = Annotated[AuthContext, Depends(require_role("member"))]
+ProjectId = Annotated[str, Depends(project_of(Role.VIEWER))]  # reads
+MemberProjectId = Annotated[str, Depends(project_of(Role.MEMBER))]  # writes
+# Handlers that need more than the project id (actor for commit authorship).
+ViewerAuth = Annotated[Principal, Depends(require(Role.VIEWER))]
+MemberAuth = Annotated[Principal, Depends(require(Role.MEMBER))]
 
 router = APIRouter(prefix="/api/v1", tags=["datasets"])
 
@@ -224,7 +226,7 @@ def get_dataset_or_404(db: Session, project_id: str, dataset_id: str) -> Dataset
 
 @router.post("/datasets", status_code=201)
 def create_dataset(
-    db: DbSession, project_id: ProjectId, payload: Annotated[dict[str, Any], Body()]
+    db: DbSession, project_id: MemberProjectId, payload: Annotated[dict[str, Any], Body()]
 ) -> dict[str, Any]:
     body = parse_body(DatasetCreate, payload)
     name = body.name.strip()
@@ -318,19 +320,19 @@ def get_dataset(
 def list_dataset_items(
     dataset_id: str,
     db: DbSession,
-    auth: ViewerAuth,
+    principal: ViewerAuth,
     limit: Annotated[int, Query(ge=1, le=MAX_PAGE)] = DEFAULT_PAGE,
     cursor: str | None = None,
 ) -> dict[str, Any]:
     """List dataset working items with multimodal media support."""
-    ds = get_dataset_or_404(db, auth.project_id, dataset_id)
+    ds = get_dataset_or_404(db, principal.project_id, dataset_id)
     items, next_cursor = _items_page(db, ds.id, limit, cursor)
     return {"items": [item_out(i, include_media=True) for i in items], "next_cursor": next_cursor}
 
 
 @router.post("/datasets/{dataset_id}/items", status_code=201)
 def add_item(
-    dataset_id: str, db: DbSession, project_id: ProjectId, payload: Annotated[dict[str, Any], Body()]
+    dataset_id: str, db: DbSession, project_id: MemberProjectId, payload: Annotated[dict[str, Any], Body()]
 ) -> dict[str, Any]:
     ds = get_dataset_or_404(db, project_id, dataset_id)
     body = parse_body(ItemCreate, payload)
@@ -407,7 +409,7 @@ def add_item_from_span(
     dataset_id: str,
     request: Request,
     db: DbSession,
-    project_id: ProjectId,
+    project_id: MemberProjectId,
     payload: Annotated[dict[str, Any], Body()],
 ) -> dict[str, Any]:
     ds = get_dataset_or_404(db, project_id, dataset_id)
@@ -438,7 +440,7 @@ def add_item_from_span(
 
 
 @router.delete("/datasets/{dataset_id}/items/{item_id}", status_code=204)
-def delete_item(dataset_id: str, item_id: str, db: DbSession, project_id: ProjectId) -> Response:
+def delete_item(dataset_id: str, item_id: str, db: DbSession, project_id: MemberProjectId) -> Response:
     ds = get_dataset_or_404(db, project_id, dataset_id)
     item = db.scalars(
         select(DatasetItem).where(
@@ -499,15 +501,15 @@ def export_jsonl(dataset_id: str, request: Request, db: DbSession, project_id: P
 def list_branches_route(
     dataset_id: str,
     db: DbSession,
-    auth: ViewerAuth,
+    principal: ViewerAuth,
 ) -> dict[str, Any]:
     """List zero-copy branches for a dataset."""
-    get_dataset_or_404(db, auth.project_id, dataset_id)
+    get_dataset_or_404(db, principal.project_id, dataset_id)
     branches = db.scalars(
         select(DatasetBranch)
         .where(
             DatasetBranch.dataset_id == dataset_id,
-            DatasetBranch.project_id == auth.project_id,
+            DatasetBranch.project_id == principal.project_id,
         )
         .order_by(DatasetBranch.created_at.asc(), DatasetBranch.name.asc())
     ).all()
@@ -518,21 +520,21 @@ def list_branches_route(
 def create_branch_route(
     dataset_id: str,
     db: DbSession,
-    auth: MemberAuth,
+    principal: MemberAuth,
     payload: Annotated[dict[str, Any], Body()],
 ) -> dict[str, Any]:
     """Create a new zero-copy branch."""
-    get_dataset_or_404(db, auth.project_id, dataset_id)
+    get_dataset_or_404(db, principal.project_id, dataset_id)
     body = parse_body(BranchCreate, payload)
     try:
         branch = create_branch(
             session=db,
-            project_id=auth.project_id,
+            project_id=principal.project_id,
             dataset_id=dataset_id,
             name=body.name,
             from_branch=body.from_branch,
             from_commit_id=body.from_commit_id,
-            created_by=auth.user_email or auth.user_id,
+            created_by=principal.actor_id,
         )
     except InvalidBranchNameError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -547,18 +549,18 @@ def create_branch_route(
 def list_commits_route(
     dataset_id: str,
     db: DbSession,
-    auth: ViewerAuth,
+    principal: ViewerAuth,
     branch: str | None = None,
     limit: Annotated[int, Query(ge=1, le=MAX_PAGE)] = DEFAULT_PAGE,
     cursor: str | None = None,
 ) -> dict[str, Any]:
     """List commits for a dataset, optionally filtered by branch history."""
-    get_dataset_or_404(db, auth.project_id, dataset_id)
+    get_dataset_or_404(db, principal.project_id, dataset_id)
     if branch:
         br = db.scalars(
             select(DatasetBranch).where(
                 DatasetBranch.dataset_id == dataset_id,
-                DatasetBranch.project_id == auth.project_id,
+                DatasetBranch.project_id == principal.project_id,
                 DatasetBranch.name == branch,
             )
         ).first()
@@ -571,7 +573,7 @@ def list_commits_route(
         all_commits = db.scalars(
             select(DatasetCommit).where(
                 DatasetCommit.dataset_id == dataset_id,
-                DatasetCommit.project_id == auth.project_id,
+                DatasetCommit.project_id == principal.project_id,
             )
         ).all()
         by_id = {c.id: c for c in all_commits}
@@ -609,7 +611,7 @@ def list_commits_route(
     # All commits for dataset
     stmt = select(DatasetCommit).where(
         DatasetCommit.dataset_id == dataset_id,
-        DatasetCommit.project_id == auth.project_id,
+        DatasetCommit.project_id == principal.project_id,
     )
     if cursor:
         ts, row_id = _decode_cursor(cursor)
@@ -636,17 +638,17 @@ def list_commits_route(
 def create_commit_route(
     dataset_id: str,
     db: DbSession,
-    auth: MemberAuth,
+    principal: MemberAuth,
     payload: Annotated[dict[str, Any], Body()],
 ) -> dict[str, Any]:
     """Create a commit on a branch."""
-    get_dataset_or_404(db, auth.project_id, dataset_id)
+    get_dataset_or_404(db, principal.project_id, dataset_id)
     body = parse_body(CommitCreate, payload)
     try:
-        author = body.author or auth.user_email or auth.user_id
+        author = body.author or principal.actor_id
         commit = commit_changes(
             session=db,
-            project_id=auth.project_id,
+            project_id=principal.project_id,
             dataset_id=dataset_id,
             branch_name=body.branch,
             message=body.message,
@@ -664,17 +666,17 @@ def list_commit_items_route(
     dataset_id: str,
     commit_id: str,
     db: DbSession,
-    auth: ViewerAuth,
+    principal: ViewerAuth,
     limit: Annotated[int, Query(ge=1, le=MAX_PAGE)] = DEFAULT_PAGE,
     cursor: str | None = None,
 ) -> dict[str, Any]:
     """List versioned items within a commit."""
-    get_dataset_or_404(db, auth.project_id, dataset_id)
+    get_dataset_or_404(db, principal.project_id, dataset_id)
     commit = db.scalars(
         select(DatasetCommit).where(
             DatasetCommit.id == commit_id,
             DatasetCommit.dataset_id == dataset_id,
-            DatasetCommit.project_id == auth.project_id,
+            DatasetCommit.project_id == principal.project_id,
         )
     ).first()
     if commit is None:
@@ -707,18 +709,18 @@ def list_commit_items_route(
 def diff_route(
     dataset_id: str,
     db: DbSession,
-    auth: ViewerAuth,
+    principal: ViewerAuth,
     base: str = Query(...),
     head: str = Query(...),
 ) -> dict[str, Any]:
     """Diff items between two commits or branch heads."""
-    get_dataset_or_404(db, auth.project_id, dataset_id)
+    get_dataset_or_404(db, principal.project_id, dataset_id)
 
     def resolve_commit_id(ref: str) -> str:
         branch = db.scalars(
             select(DatasetBranch).where(
                 DatasetBranch.dataset_id == dataset_id,
-                DatasetBranch.project_id == auth.project_id,
+                DatasetBranch.project_id == principal.project_id,
                 DatasetBranch.name == ref,
             )
         ).first()
@@ -730,7 +732,7 @@ def diff_route(
             select(DatasetCommit.id).where(
                 DatasetCommit.id == ref,
                 DatasetCommit.dataset_id == dataset_id,
-                DatasetCommit.project_id == auth.project_id,
+                DatasetCommit.project_id == principal.project_id,
             )
         ).first()
         if commit is not None:
@@ -743,7 +745,7 @@ def diff_route(
     try:
         diff_res = diff_commits(
             session=db,
-            project_id=auth.project_id,
+            project_id=principal.project_id,
             dataset_id=dataset_id,
             base_commit_id=base_commit_id,
             head_commit_id=head_commit_id,
@@ -761,22 +763,22 @@ def diff_route(
 def merge_route(
     dataset_id: str,
     db: DbSession,
-    auth: MemberAuth,
+    principal: MemberAuth,
     payload: Annotated[dict[str, Any], Body()],
 ) -> dict[str, Any]:
     """Merge source_branch into target_branch."""
-    get_dataset_or_404(db, auth.project_id, dataset_id)
+    get_dataset_or_404(db, principal.project_id, dataset_id)
     body = parse_body(MergeCreate, payload)
     try:
         merge_commit = merge_branches(
             session=db,
-            project_id=auth.project_id,
+            project_id=principal.project_id,
             dataset_id=dataset_id,
             source_branch=body.source_branch,
             target_branch=body.target_branch,
             conflict_strategy=body.conflict_strategy,
             message=body.message,
-            author=body.author or auth.user_email or auth.user_id,
+            author=body.author or principal.actor_id,
         )
     except MergeConflictError as exc:
         raise HTTPException(
@@ -800,21 +802,21 @@ def merge_route(
 def revert_route(
     dataset_id: str,
     db: DbSession,
-    auth: MemberAuth,
+    principal: MemberAuth,
     payload: Annotated[dict[str, Any], Body()],
 ) -> dict[str, Any]:
     """Revert a branch to a previous commit state by creating a new commit."""
-    get_dataset_or_404(db, auth.project_id, dataset_id)
+    get_dataset_or_404(db, principal.project_id, dataset_id)
     body = parse_body(RevertCreate, payload)
     try:
         revert_commit = revert_branch(
             session=db,
-            project_id=auth.project_id,
+            project_id=principal.project_id,
             dataset_id=dataset_id,
             branch_name=body.branch,
             target_commit_id=body.target_commit_id,
             message=body.message,
-            author=body.author or auth.user_email or auth.user_id,
+            author=body.author or principal.actor_id,
         )
     except (DatasetNotFoundError, BranchNotFoundError, CommitNotFoundError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

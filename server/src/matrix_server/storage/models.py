@@ -17,12 +17,16 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from matrix_server.storage.db import Base, new_id, utcnow
 
 # --- Projects and API keys -------------------------------------------------
+
+API_KEY_SCOPES = ("ingest", "read", "write")
+_ALL_SCOPES_SQL = text("'[\"ingest\", \"read\", \"write\"]'")
 
 
 class Project(Base):
@@ -33,7 +37,6 @@ class Project(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     api_keys: Mapped[list[ApiKey]] = relationship(back_populates="project", cascade="all, delete-orphan")
-    members: Mapped[list[ProjectMember]] = relationship(back_populates="project", cascade="all, delete-orphan")
 
 
 class ApiKey(Base):
@@ -48,45 +51,16 @@ class ApiKey(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # G0 (ADR-006): scopes are a subset of API_KEY_SCOPES; keys from before G0 get all three.
+    name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    scopes: Mapped[list[str]] = mapped_column(
+        JSON, nullable=False, default=lambda: list(API_KEY_SCOPES), server_default=_ALL_SCOPES_SQL
+    )
+    created_by: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
 
     project: Mapped[Project] = relationship(back_populates="api_keys")
-
-
-# --- Users and Memberships -------------------------------------------------
-
-
-class User(Base):
-    __tablename__ = "users"
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
-    email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
-    name: Mapped[str] = mapped_column(String(200), nullable=False)
-    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
-
-    memberships: Mapped[list[ProjectMember]] = relationship(back_populates="user", cascade="all, delete-orphan")
-
-
-class ProjectMember(Base):
-    __tablename__ = "project_members"
-    __table_args__ = (
-        UniqueConstraint("project_id", "user_id", name="uq_project_members_project_user"),
-        Index("ix_project_members_user_id", "user_id"),
-    )
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
-    project_id: Mapped[str] = mapped_column(
-        String(32), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    user_id: Mapped[str] = mapped_column(
-        String(32), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
-    )
-    role: Mapped[str] = mapped_column(String(32), nullable=False, default="member")  # admin, member, viewer
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
-
-    project: Mapped[Project] = relationship(back_populates="members")
-    user: Mapped[User] = relationship(back_populates="memberships")
 
 
 # --- Scores ----------------------------------------------------------------
@@ -372,6 +346,102 @@ class Job(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+# --- Audit log (G0) ---------------------------------------------------------
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_log"
+    __table_args__ = (Index("ix_audit_project_ts", "project_id", "ts"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    project_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    actor_kind: Mapped[str] = mapped_column(String(16), nullable=False)  # user | api_key | system
+    actor_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    action: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    target: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    detail: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+
+
+# --- Users, memberships, web sessions (G0, ADR-006) ---------------------------
+
+
+class User(Base):
+    """Person who logs in to the web UI. `email` is stored lower-cased and unique."""
+
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    email: Mapped[str] = mapped_column(String(320), unique=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False, default="")
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    password_changed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class Membership(Base):
+    """Role of a user in a project: viewer | member | admin | owner (see `auth.Role`)."""
+
+    __tablename__ = "memberships"
+    __table_args__ = (UniqueConstraint("user_id", "project_id", name="uq_memberships_user_project"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    project_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class WebSession(Base):
+    """Opaque server-side session. `id` is the SHA-256 (hex) of the `mxs_` token; the token itself
+    is never stored. Valid while not revoked, before `expires_at` (absolute) and while
+    `last_seen_at` is within the idle TTL."""
+
+    __tablename__ = "web_sessions"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class LoginAttempt(Base):
+    """Failed-login throttle per (e-mail, IP). `key` is a SHA-256 of both, so the table holds no
+    e-mail and unknown e-mails are throttled exactly like known ones. `lock_count` escalates the
+    lock duration and resets on a successful login. Stale rows are purged (`users.purge_stale_login_rows`)."""
+
+    __tablename__ = "login_attempts"
+    __table_args__ = (Index("ix_login_attempts_window_start", "window_start"),)
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lock_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+class LoginKnownIp(Base):
+    """A network (IPv4 address or IPv6 /64) a user logged in from successfully, for the e-mail lock
+    bypass (`users.reserve_login_attempt`). `key` is a SHA-256 of (e-mail, network): no e-mail or
+    address is stored. Rows older than `users.KNOWN_IP_TTL` are purged."""
+
+    __tablename__ = "login_known_ips"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    last_success_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
+
 # --- Defensive Security & OWASP Top 10 Scans --------------------------------
 
 
@@ -400,8 +470,8 @@ class SafetyScan(Base):
 class MLOpsSweep(Base):
     """Hyperparameter sweep configuration and status.
 
-    `best_run_id` intentionally has no FK to `mlops_training_runs` to avoid a circular FK
-    with `TrainingRun.sweep_id` and keep Alembic downgrades cleanly reversible.
+    `best_run_id` is a plain reference to `runs.id` (no FK, like `runs.sweep_id`), so a sweep and
+    its runs never form a circular FK.
     """
 
     __tablename__ = "mlops_sweeps"
@@ -424,60 +494,33 @@ class MLOpsSweep(Base):
     stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-class TrainingRun(Base):
-    """Training / fine-tuning / classic ML run metadata."""
+class ModelArtifact(Base):
+    """Versioned checkpoint / adapter / model metadata (`main`'s MLOps artifacts, T4).
 
-    __tablename__ = "mlops_training_runs"
+    Unique `name` + `version` per project, `pending_upload` -> `committed`, produced by a `runs`
+    row. The bytes are NOT here: `artifact_id` points at the G0 `artifacts` row whose blob the
+    artifact store holds (dedup, quota, verified sha256); an artifact registered by reference has
+    `external_uri` (s3/gs/hf/lakefs, never fetched) instead. `sha256`/`size_bytes` are the declared
+    values for an external URI and the verified ones once a blob upload is committed. A blob row
+    deleted through `DELETE /api/v1/artifacts/{id}` leaves `artifact_id` null (the metadata stays)."""
+
+    __tablename__ = "model_artifacts"
     __table_args__ = (
-        Index("ix_mlops_training_runs_project_status", "project_id", "status"),
-        Index("ix_mlops_training_runs_project_created", "project_id", "created_at"),
-    )
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
-    project_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
-    name: Mapped[str] = mapped_column(String(200), nullable=False)
-    run_type: Mapped[str] = mapped_column(String(32), nullable=False, default="sft")
-    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
-    base_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
-    dataset_id: Mapped[str | None] = mapped_column(
-        String(32), ForeignKey("datasets.id", ondelete="SET NULL"), nullable=True, index=True
-    )
-    sweep_id: Mapped[str | None] = mapped_column(
-        String(32), ForeignKey("mlops_sweeps.id", ondelete="SET NULL"), nullable=True, index=True
-    )
-    parent_run_id: Mapped[str | None] = mapped_column(
-        String(32), ForeignKey("mlops_training_runs.id", ondelete="SET NULL"), nullable=True, index=True
-    )
-    hyperparams: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
-    summary_metrics: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
-    hardware_info: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
-    classic_eval: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
-    tags: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
-    total_steps: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
-    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-
-
-class Artifact(Base):
-    """Versioned binary artifact (checkpoint, LoRA adapter, dataset, model) backed by S3/LocalFS/external."""
-
-    __tablename__ = "mlops_artifacts"
-    __table_args__ = (
-        UniqueConstraint("project_id", "name", "version", name="uq_mlops_artifacts_name_version"),
+        UniqueConstraint("project_id", "name", "version", name="uq_model_artifacts_name_version"),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     run_id: Mapped[str | None] = mapped_column(
-        String(32), ForeignKey("mlops_training_runs.id", ondelete="SET NULL"), nullable=True, index=True
+        String(32), ForeignKey("runs.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    artifact_id: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("artifacts.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    external_uri: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     kind: Mapped[str] = mapped_column(String(32), nullable=False, default="checkpoint")
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
-    storage_backend: Mapped[str] = mapped_column(String(16), nullable=False, default="local")
-    storage_uri: Mapped[str] = mapped_column(String(1000), nullable=False)
     sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     content_type: Mapped[str | None] = mapped_column(String(200), nullable=True)
@@ -555,10 +598,10 @@ class ModelVersion(Base):
     )
     version: Mapped[int] = mapped_column(Integer, nullable=False)
     artifact_id: Mapped[str | None] = mapped_column(
-        String(32), ForeignKey("mlops_artifacts.id", ondelete="SET NULL"), nullable=True, index=True
+        String(32), ForeignKey("model_artifacts.id", ondelete="SET NULL"), nullable=True, index=True
     )
     run_id: Mapped[str | None] = mapped_column(
-        String(32), ForeignKey("mlops_training_runs.id", ondelete="SET NULL"), nullable=True, index=True
+        String(32), ForeignKey("runs.id", ondelete="SET NULL"), nullable=True, index=True
     )
     eval_experiment_id: Mapped[str | None] = mapped_column(
         String(32), ForeignKey("experiments.id", ondelete="SET NULL"), nullable=True
@@ -817,3 +860,8 @@ class SandboxTaskTranscript(Base):
     sandbox_run: Mapped[SandboxRun] = relationship(back_populates="transcripts")
 
 
+# --- Model modules registered here (one import per module, appended by each task) ------------
+# Keeps Base.metadata complete for Alembic and create_all without every task editing this file.
+import matrix_server.artifacts.models
+import matrix_server.egress.models
+import matrix_server.runs.models  # noqa: F401  (all of these only register tables)

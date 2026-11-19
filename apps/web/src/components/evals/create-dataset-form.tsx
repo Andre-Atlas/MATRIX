@@ -3,11 +3,13 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { proxy } from "@/lib/proxy-client";
+import { useCan } from "@/components/auth/role-context";
 import type { Dataset } from "@/lib/types";
 import { field, label, primaryBtn } from "./ui";
 
 export function CreateDatasetForm() {
   const router = useRouter();
+  const canWrite = useCan("member");
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [busy, setBusy] = useState(false);
@@ -28,6 +30,8 @@ export function CreateDatasetForm() {
       setBusy(false);
     }
   }
+
+  if (!canWrite) return null;
 
   return (
     <form onSubmit={submit} aria-label="Create dataset" className="mb-4 flex flex-wrap items-end gap-2">

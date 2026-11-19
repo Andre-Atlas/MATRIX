@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from matrix_server.auth import AuthContext, require_role
+from matrix_server.auth import Principal, Role, require
 from matrix_server.benchmarks.catalog import VALID_SUITES, list_catalog, validate_tasks
 from matrix_server.benchmarks.runner import run_benchmark_job, validate_runner_url
 from matrix_server.storage import jobs
@@ -26,8 +26,8 @@ from matrix_server.storage.models import (
 )
 
 DbSession = Annotated[Session, Depends(get_db)]
-ViewerAuth = Annotated[AuthContext, Depends(require_role("viewer"))]
-MemberAuth = Annotated[AuthContext, Depends(require_role("member"))]
+ViewerAuth = Annotated[Principal, Depends(require(Role.VIEWER))]
+MemberAuth = Annotated[Principal, Depends(require(Role.MEMBER))]
 
 router = APIRouter(prefix="/api/v1/benchmarks", tags=["benchmarks"])
 
@@ -138,7 +138,7 @@ def _run_out(run: BenchmarkRun, task_results: list[BenchmarkTaskResult] | None =
 
 @router.get("/catalog")
 def get_catalog(
-    ctx: ViewerAuth,
+    principal: ViewerAuth,
     suite: str | None = Query(default=None),
 ) -> dict[str, Any]:
     """Retrieve catalog of supported benchmark tasks (filtered optionally by suite)."""
@@ -154,7 +154,7 @@ def get_catalog(
 def create_run(
     raw_body: Annotated[Any, Body()],
     db: DbSession,
-    ctx: MemberAuth,
+    principal: MemberAuth,
     sync_exec: bool | None = Query(default=None),
 ) -> Response:
     """Create a new benchmark run and dispatch for execution."""
@@ -202,7 +202,7 @@ def create_run(
         mv = db.scalars(
             select(ModelVersion).where(
                 ModelVersion.id == body.model_version_id,
-                ModelVersion.project_id == ctx.project_id,
+                ModelVersion.project_id == principal.project_id,
             )
         ).first()
         if mv is None:
@@ -212,7 +212,7 @@ def create_run(
         ds = db.scalars(
             select(Dataset).where(
                 Dataset.id == body.dataset_id,
-                Dataset.project_id == ctx.project_id,
+                Dataset.project_id == principal.project_id,
             )
         ).first()
         if ds is None:
@@ -222,14 +222,14 @@ def create_run(
         dc = db.scalars(
             select(DatasetCommit).where(
                 DatasetCommit.id == body.dataset_commit_id,
-                DatasetCommit.project_id == ctx.project_id,
+                DatasetCommit.project_id == principal.project_id,
             )
         ).first()
         if dc is None:
             raise HTTPException(status_code=404, detail="dataset commit not found")
 
     run = BenchmarkRun(
-        project_id=ctx.project_id,
+        project_id=principal.project_id,
         name=body.name,
         suite=body.suite,
         tasks=body.tasks,
@@ -263,7 +263,7 @@ def create_run(
             media_type="application/json",
         )
 
-    job = jobs.enqueue(db, ctx.project_id, "benchmark.run", {"benchmark_run_id": run.id})
+    job = jobs.enqueue(db, principal.project_id, "benchmark.run", {"benchmark_run_id": run.id})
     run.job_id = job.id
     db.commit()
     db.refresh(run)
@@ -278,14 +278,14 @@ def create_run(
 @router.get("/runs")
 def list_runs(
     db: DbSession,
-    ctx: ViewerAuth,
+    principal: ViewerAuth,
     suite: str | None = Query(default=None),
     status: str | None = Query(default=None),
     model_version_id: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=200),
 ) -> dict[str, Any]:
     """List benchmark runs in the current project with optional filtering."""
-    query = select(BenchmarkRun).where(BenchmarkRun.project_id == ctx.project_id)
+    query = select(BenchmarkRun).where(BenchmarkRun.project_id == principal.project_id)
     if suite is not None:
         query = query.where(BenchmarkRun.suite == suite)
     if status is not None:
@@ -302,13 +302,13 @@ def list_runs(
 def get_run(
     run_id: str,
     db: DbSession,
-    ctx: ViewerAuth,
+    principal: ViewerAuth,
 ) -> dict[str, Any]:
     """Get benchmark run details including per-task results."""
     run = db.scalars(
         select(BenchmarkRun).where(
             BenchmarkRun.id == run_id,
-            BenchmarkRun.project_id == ctx.project_id,
+            BenchmarkRun.project_id == principal.project_id,
         )
     ).first()
     if run is None:
@@ -327,13 +327,13 @@ def get_run(
 def cancel_run(
     run_id: str,
     db: DbSession,
-    ctx: MemberAuth,
+    principal: MemberAuth,
 ) -> dict[str, Any]:
     """Cancel a queued or running benchmark run."""
     run = db.scalars(
         select(BenchmarkRun).where(
             BenchmarkRun.id == run_id,
-            BenchmarkRun.project_id == ctx.project_id,
+            BenchmarkRun.project_id == principal.project_id,
         )
     ).first()
     if run is None:

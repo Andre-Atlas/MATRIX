@@ -1,0 +1,20 @@
+{
+  "maxEffort": "high",
+  "levels": {
+    "C1": { "name": "mecânica", "model": "haiku", "effort": "low" },
+    "C2": { "name": "simples", "model": "sonnet", "effort": "low" },
+    "C3": { "name": "padrão", "model": "sonnet", "effort": "medium" },
+    "C4": { "name": "complexa", "model": "opus", "effort": "medium" },
+    "C5": { "name": "extrema", "model": "opus", "effort": "high" }
+  },
+  "roles": {
+    "implementer": { "floor": "C1" },
+    "reviewer": { "floor": "C2" },
+    "security-reviewer": { "floor": "C4" },
+    "adversarial-verifier": { "floor": "C4" },
+    "audit-lead": { "floor": "C4" },
+    "classifier": { "floor": "C4", "ceiling": "C4" },
+    "explorer": { "floor": "C1", "ceiling": "C2" }
+  },
+  "escalation": { "afterFailures": 2, "step": 1 }
+}

@@ -3,6 +3,7 @@ import threading
 
 import pytest
 from fastapi.testclient import TestClient
+from rbac_helpers import owner_project
 
 from matrix_server.api import prompts as prompts_api
 from matrix_server.app import create_app
@@ -15,9 +16,8 @@ ADMIN = {"Authorization": "Bearer adm"}
 
 
 def _project(client, name):
-    resp = client.post("/api/v1/admin/projects", json={"name": name}, headers=ADMIN)
-    assert resp.status_code == 201
-    return {"Authorization": f"Bearer {resp.json()['api_key']}"}
+    # Owner session: rules, online evals and the production label are admin-only (G0 RBAC).
+    return owner_project(client, name, ADMIN)
 
 
 def _build(url):

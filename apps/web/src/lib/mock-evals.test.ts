@@ -17,6 +17,15 @@ describe("mock evals", () => {
     expect(new Set(list.items.map((e) => e.status))).toEqual(new Set(["done", "running", "failed"]));
   });
 
+  it("exposes _meta without treating it as a variant, and an errored regression", () => {
+    const d = evalGet(`/api/v1/experiments/${MOCK_EXPERIMENT_ID}`) as ExperimentDetail;
+    const meta = d.summary._meta as { cells_total: number; cells_failed: number; partial: boolean; judge: string };
+    expect(meta).toMatchObject({ cells_total: 24, cells_failed: 1, partial: true, judge: "heuristic" });
+    expect(Object.keys(d.summary).filter((k) => k !== "_meta")).toEqual(d.experiment.variants.map((v) => v.label));
+    expect(d.regressions.some((r) => r.errored)).toBe(true);
+    expect(d.regressions.some((r) => r.errored === false)).toBe(true);
+  });
+
   it("creates datasets and items, deletes and exports them", () => {
     const ds = evalSend("POST", "/api/v1/datasets", { name: "x" }) as { id: string };
     const item = evalSend("POST", `/api/v1/datasets/${ds.id}/items`, { input: { q: 1 }, context: ["c"] }) as { id: string };

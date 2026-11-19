@@ -15,7 +15,7 @@ from collections.abc import Callable
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from starlette.concurrency import run_in_threadpool
 
-from matrix_server.auth import current_project_id
+from matrix_server.auth import Role, project_of
 from matrix_server.domain.spans import Span
 from matrix_server.ingest.openinference import normalize_partial
 from matrix_server.ingest.otlp import (
@@ -92,8 +92,12 @@ def run_hooks(project_id: str, spans: list[Span]) -> None:
             )
 
 
+# Any API key holding the `ingest` scope; users need role member (contract G0 section 1).
+IngestProjectId = Depends(project_of(Role.MEMBER, scope="ingest"))
+
+
 @router.post("/v1/traces")
-async def export_traces(request: Request, project_id: str = Depends(current_project_id)) -> Response:
+async def export_traces(request: Request, project_id: str = IngestProjectId) -> Response:
     settings = request.app.state.settings
     content_type = request.headers.get("content-type", "")
     if not is_supported(content_type):

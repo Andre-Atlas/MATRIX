@@ -11,7 +11,7 @@ from sqlalchemy import select, text
 
 from matrix_server import auth
 from matrix_server.api import admin as admin_api
-from matrix_server.auth import current_project_id
+from matrix_server.auth import Principal, Role, require
 from matrix_server.cli import admin as admin_cli
 from matrix_server.config import Settings
 from matrix_server.storage.db import Base, init_db, make_engine, make_session_factory, utcnow
@@ -57,8 +57,8 @@ def make_app(session_factory, admin_token=ADMIN_TOKEN):
     app.include_router(admin_api.router)
 
     @app.get("/whoami")
-    def whoami(project_id: Annotated[str, Depends(current_project_id)]):
-        return {"project_id": project_id}
+    def whoami(principal: Annotated[Principal, Depends(require(Role.VIEWER))]):
+        return {"project_id": principal.project_id}
 
     return app
 
@@ -174,7 +174,7 @@ def test_current_project_missing_or_invalid_does_not_leak(session_factory, proje
         resp = client.get("/whoami", headers=headers)
         assert resp.status_code == 401
         assert bad not in resp.text and key.split("_")[1] not in resp.text
-        assert resp.json() == {"detail": "invalid or missing API key"}
+        assert resp.json() == {"detail": "invalid or missing credentials"}
 
 
 def test_revoked_key_rejected_over_http(session_factory, project_key):

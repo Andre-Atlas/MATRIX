@@ -2,8 +2,10 @@
 import {
   metricKey,
   type DatasetItem,
+  type ExperimentMeta,
   type ExperimentResult,
   type ExperimentSummary,
+  type MetricAggregate,
   type MetricSpec,
   type Regression,
 } from "./types";
@@ -82,6 +84,25 @@ export function summarizeMatrix(
   }
 
   return { variants: order, metrics: names, cells, best, perf };
+}
+
+export const SUMMARY_META_KEY = "_meta";
+
+/** The summary's `_meta`, or null when absent (older backends). */
+export function summaryMeta(summary: ExperimentSummary | null | undefined): ExperimentMeta | null {
+  const m = summary?.[SUMMARY_META_KEY];
+  return m && typeof (m as ExperimentMeta).partial === "boolean" ? (m as ExperimentMeta) : null;
+}
+
+/** Variant entries of a summary, skipping the reserved `_meta` key. */
+export function summaryVariants(summary: ExperimentSummary | null | undefined): [string, Record<string, MetricAggregate>][] {
+  return Object.entries(summary ?? {}).filter(([k]) => k !== SUMMARY_META_KEY) as [string, Record<string, MetricAggregate>][];
+}
+
+/** True when `_meta.judge` is heuristic, or any cell score reports a heuristic judge in its details. */
+export function usesHeuristicJudge(summary: ExperimentSummary | null | undefined, results: ExperimentResult[] = []): boolean {
+  if (summaryMeta(summary)?.judge === "heuristic") return true;
+  return results.some((r) => Object.values(r.scores).some((s) => s?.details?.judge === "heuristic"));
 }
 
 /** Contract shape `Record<variant, Record<metric, {mean, pass_rate}>>`. */

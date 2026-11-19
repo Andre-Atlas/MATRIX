@@ -3,9 +3,12 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { proxy } from "@/lib/proxy-client";
+import { useCan } from "@/components/auth/role-context";
+import type { Role } from "@/lib/types";
 
-export function DeleteButton({ path, what }: { path: string; what: string }) {
+export function DeleteButton({ path, what, min = "member" }: { path: string; what: string; min?: Role }) {
   const router = useRouter();
+  const allowed = useCan(min);
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -22,6 +25,7 @@ export function DeleteButton({ path, what }: { path: string; what: string }) {
     }
   }
 
+  if (!allowed) return null;
   if (error) {
     return (
       <span role="alert" className="text-xs text-red-300" title={error}>

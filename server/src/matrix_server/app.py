@@ -1,19 +1,25 @@
 from fastapi import FastAPI
 
+from matrix_server import users
 from matrix_server.api import (
     admin,
     annotations,
+    artifacts,
     auth,
     benchmarks,
     datasets,
+    egress,
     experiments,
     gateway,
     ingest,
     mlops,
+    mlops_compat,
     online_evals,
+    projects,
     prompts,
     query,
     rules,
+    runs,
     safety,
     sandboxes,
     vectors,
@@ -22,8 +28,7 @@ from matrix_server.config import Settings, get_settings
 from matrix_server.gateway.router import GatewayRouter
 from matrix_server.hooks import install_api_hooks
 from matrix_server.limits import BodyLimitMiddleware
-from matrix_server.mlops.artifact_store import build_artifact_store
-from matrix_server.mlops.metrics_store import build_training_metric_store
+from matrix_server.runs.store import build_metric_store
 from matrix_server.storage.db import init_db, make_engine, make_session_factory
 from matrix_server.storage.spans import build_span_store
 
@@ -32,11 +37,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="MATRIX")
     settings = settings or get_settings()
     app.state.settings = settings
+    users.configure_hash_concurrency(settings.password_hash_concurrency)
     app.add_middleware(
         BodyLimitMiddleware,
         max_body_bytes=settings.max_body_bytes,
         max_json_body_bytes=settings.max_json_body_bytes,
-        max_artifact_bytes=settings.max_artifact_bytes,
+        raw_upload_limit=settings.max_artifact_bytes,
     )
 
     engine = make_engine(settings.database_url)
@@ -44,8 +50,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.db_engine = engine
     app.state.session_factory = make_session_factory(engine)
     app.state.span_store = build_span_store(settings)
-    app.state.training_metric_store = build_training_metric_store(settings)
-    app.state.artifact_store = build_artifact_store(settings)
+    app.state.metric_store = build_metric_store(settings)
     app.state.gateway_router = GatewayRouter()
 
     install_api_hooks(app.state.session_factory, app.state.span_store)
@@ -55,7 +60,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"status": "ok"}
 
     for module in (
-        auth,
         ingest,
         admin,
         query,
@@ -64,11 +68,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         experiments,
         annotations,
         rules,
-        safety,
         online_evals,
+        egress,
+        artifacts,
+        auth,
+        projects,
+        runs,
+        # modules merged from main (ADR-013; ported to require(...) in T3)
+        safety,
         vectors,
         gateway,
         mlops,
+        mlops_compat,  # deprecated /mlops/runs* and /mlops/artifacts* adapters over runs/artifacts (T4)
         benchmarks,
         sandboxes,
     ):

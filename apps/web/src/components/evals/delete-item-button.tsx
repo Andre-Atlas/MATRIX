@@ -3,9 +3,11 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { proxy } from "@/lib/proxy-client";
+import { useCan } from "@/components/auth/role-context";
 
 export function DeleteItemButton({ datasetId, itemId }: { datasetId: string; itemId: string }) {
   const router = useRouter();
+  const canWrite = useCan("member");
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -21,6 +23,8 @@ export function DeleteItemButton({ datasetId, itemId }: { datasetId: string; ite
       setBusy(false);
     }
   }
+
+  if (!canWrite) return null;
 
   if (error) {
     return (

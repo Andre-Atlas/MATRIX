@@ -30,7 +30,12 @@ from matrix_server.evals import (
     evaluate_case,
     get_provider,
 )
-from matrix_server.evals.runner import judge_base_url
+from matrix_server.evals.runner import (
+    JUDGE_METRIC_TYPES,
+    judge_base_url,
+    judge_kind,
+    warn_heuristic_judge_once,
+)
 from matrix_server.online_evals import JOB_KIND
 from matrix_server.storage.models import Job, OnlineEval, Score
 from matrix_server.workers.runner import register
@@ -39,6 +44,10 @@ logger = logging.getLogger(__name__)
 
 MAX_COMMENT_CHARS = 1000
 MAX_CONTEXTS = 100
+# Scores from the offline heuristic judge keep `source="llm"` (the score contract accepts only
+# human|llm|rule|sdk) but are marked with this label and a comment prefix.
+HEURISTIC_LABEL = "heuristic"
+HEURISTIC_COMMENT_PREFIX = "[heuristic judge] "
 
 _span_store: Any = None
 _span_store_lock = threading.Lock()
@@ -112,8 +121,10 @@ def build_deps(model: dict[str, Any] | None) -> EvalDeps:
     if model:
         provider_name, model_name = str(model.get("provider", "")), str(model.get("name", ""))
     else:
-        provider_name = os.environ.get("MATRIX_JUDGE_PROVIDER", "fake")
+        provider_name = os.environ.get("MATRIX_JUDGE_PROVIDER", "")
         model_name = os.environ.get("MATRIX_JUDGE_MODEL", "")
+        if not provider_name.strip():
+            warn_heuristic_judge_once()
     provider_name = provider_name.strip().lower() or "fake"
     if provider_name == "fake":
         return EvalDeps.offline()
@@ -188,19 +199,25 @@ def handle_online_eval_score(session: Session, job: Job) -> None:
 
     metric = build_metric({"type": ev.metric, "params": ev.params or {}})
     case = build_case(span, spans, summary.total_cost_usd)
-    result = evaluate_case([metric], case, build_deps(ev.model))[metric.name]
+    deps = build_deps(ev.model)
+    result = evaluate_case([metric], case, deps)[metric.name]
     if result.details.get("error"):
         raise RuntimeError(f"metric evaluation failed: {result.reason[:200]}")
     if result.value is None:
         return  # not applicable (e.g. no contexts): nothing to record
 
+    heuristic = metric.type in JUDGE_METRIC_TYPES and judge_kind(deps) == "heuristic"
+    comment = result.reason or ""
+    if heuristic:
+        comment = HEURISTIC_COMMENT_PREFIX + comment
     score = Score(
         project_id=project_id,
         trace_id=trace_id,
         span_id=span_id,
         name=ev.name,
         value=float(result.value),
-        comment=(result.reason or "")[:MAX_COMMENT_CHARS] or None,
+        label=HEURISTIC_LABEL if heuristic else None,
+        comment=comment[:MAX_COMMENT_CHARS] or None,
         source="llm",
         dedup_key=dedup_key(online_eval_id, trace_id, span_id),
     )

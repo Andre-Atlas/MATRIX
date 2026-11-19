@@ -346,6 +346,8 @@ class TrainingRun:
                 "Content-Type": content_type,
                 "Content-Length": str(size_bytes),
             }
+            # Signed headers of a presigned S3 PUT (e.g. x-amz-checksum-sha256) must be sent as is.
+            headers.update({str(k): str(v) for k, v in (presign_resp.get("upload_headers") or {}).items()})
             if _is_internal_relative_url(upload_url_str):
                 put_resp = self._client._http.put(
                     upload_url_str,

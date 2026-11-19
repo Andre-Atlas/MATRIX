@@ -35,6 +35,25 @@ export function ExperimentStatusBadge({ status }: { status: ExperimentStatus }) 
   );
 }
 
+export function HeuristicJudgeBadge() {
+  return (
+    <span
+      title="notas lexicais para testes/demo, não vêm de um modelo"
+      className="inline-flex items-center rounded border border-amber-800/60 bg-amber-950/40 px-1.5 text-[11px] leading-4 text-amber-300"
+    >
+      juiz heurístico
+    </span>
+  );
+}
+
+export function PartialBadge({ meta }: { meta: { cells_failed: number; cells_total: number } }) {
+  return (
+    <span className="inline-flex items-center rounded border border-red-800/70 bg-red-950/50 px-1.5 text-[11px] leading-4 text-red-300">
+      parcial: {meta.cells_failed} de {meta.cells_total} células com erro
+    </span>
+  );
+}
+
 export function formatMetricValue(v: number | null | undefined): string {
   return typeof v === "number" && Number.isFinite(v) ? v.toFixed(2) : "n/a";
 }

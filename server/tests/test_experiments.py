@@ -161,12 +161,19 @@ def test_end_to_end_matrix(env):
                           "output_tokens", "error", "scores"}
         assert r["error"] is None and r["output"] and r["latency_ms"] > 0 and r["output_tokens"] > 0
         assert set(r["scores"]) == metric_names
-        assert all(set(s) == {"value", "passed", "reason"} for s in r["scores"].values())
+        for name, s in r["scores"].items():
+            if name in ("faithfulness", "answer_relevancy"):  # judge metrics name the judge used
+                assert set(s) == {"value", "passed", "reason", "details"}
+                assert s["details"] == {"judge": "heuristic"}
+            else:
+                assert set(s) == {"value", "passed", "reason"}
         assert r["scores"]["contains"]["passed"] is True  # fake echoes the question
         assert r["scores"]["equals"]["passed"] is False
         assert r["scores"]["latency"]["passed"] is True
         assert 0 <= r["scores"]["faithfulness"]["value"] <= 1
         assert 0 <= r["scores"]["answer_relevancy"]["value"] <= 1
+    meta = body["summary"].pop(eval_runner.SUMMARY_META_KEY)
+    assert meta == {"cells_total": 4 * len(ITEMS), "cells_failed": 0, "partial": False, "judge": "heuristic"}
     assert set(body["summary"]) == labels
     for per_metric in body["summary"].values():
         assert set(per_metric) == metric_names
@@ -178,7 +185,7 @@ def test_end_to_end_matrix(env):
     assert outputs["inline/model-a"].split(":")[0] != outputs["inline/model-b"].split(":")[0]
 
     listed = env["client"].get("/api/v1/experiments", headers=env["auth"]).json()["items"]
-    assert listed[0]["id"] == exp_id and listed[0]["summary"] == body["summary"]
+    assert listed[0]["id"] == exp_id and listed[0]["summary"] == {**body["summary"], "_meta": meta}
     assert set(listed[0]) == {"id", "name", "dataset_id", "status", "created_at", "finished_at", "summary"}
 
 
@@ -197,7 +204,8 @@ def test_baseline_regressions(env):
     assert len(contains) == len(ITEMS)
     assert all(r["variant"] == "p/m" and r["baseline"] == 1.0 and r["current"] == 0.0 for r in contains)
     assert {r["item_id"] for r in contains} == {r["item_id"] for r in current["results"]}
-    assert all(set(r) == {"item_id", "variant", "metric", "baseline", "current"} for r in regs)
+    assert all(set(r) == {"item_id", "variant", "metric", "baseline", "current", "errored"} for r in regs)
+    assert not any(r["errored"] for r in regs)
 
 
 def test_provider_error_in_one_cell(env, monkeypatch):
@@ -222,6 +230,7 @@ def test_provider_error_in_one_cell(env, monkeypatch):
     assert all(s["value"] is None and s["passed"] is None for s in failed["scores"].values())
     summary = body["summary"]["p/m"]
     assert summary["contains"] == {"mean": 1.0, "pass_rate": 1.0}  # only the non-null cell counts
+    assert body["summary"]["_meta"]["cells_failed"] == 1 and body["summary"]["_meta"]["partial"] is True
 
     # A non-provider exception in a cell keeps only the type name.
     env["client"].post(f"/api/v1/datasets/{env['dataset_id']}/items", json={"input": {"question": "x"}},
@@ -303,3 +312,113 @@ def test_render_messages():
     assert msgs[-1] == {"role": "user", "content": '{"a": 1, "b": [2]}'}
     msgs, _ = eval_runner.render_messages("chat", [{"role": "user", "content": "{{b}}"}], {"b": [2]})
     assert msgs == [{"role": "user", "content": "[2]"}]
+
+
+# --------------------------------------------------------------------------- audit H3/H4
+
+
+class _AlwaysDown:
+    def complete(self, messages, model, params=None):
+        raise ProviderError(401, "down", "invalid api key")
+
+
+def test_all_cells_failing_marks_experiment_failed(env, monkeypatch):
+    monkeypatch.setitem(providers._PROVIDERS, "down", lambda **_: _AlwaysDown())
+    body = _run(env, variants=_variants(prompts={"p": {"template": "{{question}}", "type": "text"}},
+                                        models=["m"], provider="down"))
+    exp = body["experiment"]
+    n = len(ITEMS)
+    assert exp["status"] == "failed" and exp["finished_at"]
+    assert exp["error"].startswith(f"all {n} cells failed: ") and "invalid api key" in exp["error"]
+    assert "Traceback" not in exp["error"] and len(exp["error"]) < 300
+    assert body["summary"]["_meta"] == {"cells_total": n, "cells_failed": n, "partial": False,
+                                        "judge": "heuristic"}
+    assert len(body["results"]) == n and all(r["error"] for r in body["results"])
+    # Recorded outcome, not a systemic error: the job succeeded and is not retried in a loop.
+    factory = env["client"].app.state.session_factory
+    with factory() as s:
+        assert s.scalars(select(Job.status)).all() == ["done"]
+    assert _drain(env) == 0
+
+
+def test_partial_failure_is_done_but_flagged(env, monkeypatch):
+    class Half:
+        def complete(self, messages, model, params=None):
+            if "return window" in messages[-1]["content"]:
+                raise ProviderError(503, "half", "upstream overloaded")
+            return Completion(text=messages[-1]["content"], input_tokens=1, output_tokens=1,
+                              latency_ms=1.0, cost_usd=0.0, model=model)
+
+    monkeypatch.setitem(providers._PROVIDERS, "half", lambda **_: Half())
+    body = _run(env, variants=_variants(prompts={"p": {"template": "{{question}}", "type": "text"}},
+                                        models=["m"], provider="half"))
+    assert body["experiment"]["status"] == "done" and body["experiment"]["error"] is None
+    assert body["summary"]["_meta"] == {"cells_total": 2, "cells_failed": 1, "partial": True,
+                                        "judge": "heuristic"}
+
+
+def test_errored_cell_is_a_regression(env, monkeypatch):
+    good = {"p": {"template": "{{question}}", "type": "text"}}
+    baseline = _run(env, variants=_variants(prompts=good, models=["m"]))
+    assert baseline["experiment"]["status"] == "done"
+
+    class Half:
+        def complete(self, messages, model, params=None):
+            if "return window" in messages[-1]["content"]:
+                raise ProviderError(401, "half", "invalid api key")
+            return Completion(text=messages[-1]["content"], input_tokens=1, output_tokens=1,
+                              latency_ms=1.0, cost_usd=0.0, model=model)
+
+    monkeypatch.setitem(providers._PROVIDERS, "half", lambda **_: Half())
+    variants = _variants(prompts=good, models=["m"], provider="half")
+    current = _run(env, variants=variants, baseline_experiment_id=baseline["experiment"]["id"])
+    assert current["experiment"]["status"] == "done"
+    errored_item = next(r["item_id"] for r in current["results"] if r["error"])
+    regs = current["regressions"]
+    errored = [r for r in regs if r["errored"]]
+    assert errored and {r["item_id"] for r in errored} == {errored_item}
+    contains = next(r for r in errored if r["metric"] == "contains")
+    assert contains["baseline"] == 1.0 and contains["current"] is None
+    # The healthy cell (same output as the baseline) is not reported.
+    assert not [r for r in regs if r["item_id"] != errored_item]
+
+
+def test_llm_judge_is_labelled_llm(env, monkeypatch):
+    from matrix_server.evals import EvalDeps, HashingEmbedder, LLMJudge, get_provider
+
+    class StubJudge(LLMJudge):
+        def extract_statements(self, question, answer):
+            return [answer]
+
+        def verify(self, statement, contexts):
+            return True, "ok"
+
+        def generate_questions(self, answer, n):
+            return [answer] * n
+
+    monkeypatch.setattr(eval_runner, "build_eval_deps",
+                        lambda: EvalDeps(judge=StubJudge(get_provider("fake"), "judge-m"),
+                                         embedder=HashingEmbedder()))
+    body = _run(env, variants=_variants(prompts={"p": {"template": "{{question}}", "type": "text"}},
+                                        models=["m"]))
+    assert body["summary"]["_meta"]["judge"] == "llm"
+    for r in body["results"]:
+        assert r["scores"]["faithfulness"]["details"] == {"judge": "llm"}
+        assert "details" not in r["scores"]["contains"]
+
+
+def test_default_judge_warns_once(monkeypatch, caplog):
+    monkeypatch.delenv("MATRIX_JUDGE_PROVIDER", raising=False)
+    monkeypatch.setattr(eval_runner, "_heuristic_warned", False)
+    with caplog.at_level("WARNING", logger="matrix_server.evals.runner"):
+        eval_runner.build_eval_deps()
+        eval_runner.build_eval_deps()
+    hits = [r for r in caplog.records if r.getMessage() == eval_runner.HEURISTIC_JUDGE_WARNING]
+    assert len(hits) == 1
+    # An explicit choice of the fake judge is not warned about.
+    monkeypatch.setattr(eval_runner, "_heuristic_warned", False)
+    monkeypatch.setenv("MATRIX_JUDGE_PROVIDER", "fake")
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="matrix_server.evals.runner"):
+        eval_runner.build_eval_deps()
+    assert not [r for r in caplog.records if r.getMessage() == eval_runner.HEURISTIC_JUDGE_WARNING]

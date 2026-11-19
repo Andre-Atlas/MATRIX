@@ -2,8 +2,10 @@
 
 import pytest
 from fastapi.testclient import TestClient
+from rbac_helpers import add_membership, api_key_headers, make_user, session_token
 
 from matrix_server.app import create_app
+from matrix_server.auth import Role, create_project
 from matrix_server.config import Settings
 from matrix_server.safety.categories import (
     OWASP_CATEGORIES,
@@ -37,84 +39,34 @@ def client(app):
 
 @pytest.fixture
 def auth_setup(client):
-    """Sets up an admin, a member, and a viewer in the same project."""
-    # 1. Register admin and get token & project
-    admin_res = client.post(
-        "/api/v1/auth/register",
-        json={
-            "email": "admin@defense.local",
-            "password": "Password123!",
-            "name": "Admin SecOps",
-            "project_name": "Defensive AI Project",
-        },
-    ).json()
-    admin_token = admin_res["token"]
-    project_id = admin_res["project"]["id"]
-
-    # 2. Register member user
-    client.post(
-        "/api/v1/auth/register",
-        json={
-            "email": "member@defense.local",
-            "password": "Password123!",
-            "name": "Member Engineer",
-            "project_name": "Member Alt Project",
-        },
-    )
-    # Invite member to project
-    client.post(
-        f"/api/v1/projects/{project_id}/members",
-        headers={"Authorization": f"Bearer {admin_token}"},
-        json={"email": "member@defense.local", "role": "member"},
-    )
-    # Login member and get context
-    member_login = client.post(
-        "/api/v1/auth/login",
-        json={"email": "member@defense.local", "password": "Password123!"},
-    ).json()
-    member_token = member_login["token"]
-
-    # 3. Register viewer user
-    client.post(
-        "/api/v1/auth/register",
-        json={
-            "email": "viewer@defense.local",
-            "password": "Password123!",
-            "name": "Viewer Auditor",
-            "project_name": "Viewer Alt Project",
-        },
-    )
-    # Invite viewer to project
-    client.post(
-        f"/api/v1/projects/{project_id}/members",
-        headers={"Authorization": f"Bearer {admin_token}"},
-        json={"email": "viewer@defense.local", "role": "viewer"},
-    )
-    viewer_login = client.post(
-        "/api/v1/auth/login",
-        json={"email": "viewer@defense.local", "password": "Password123!"},
-    ).json()
-    viewer_token = viewer_login["token"]
-
-    # 4. Another independent project for tenant isolation checks
-    other_res = client.post(
-        "/api/v1/auth/register",
-        json={
-            "email": "other@defense.local",
-            "password": "Password123!",
-            "name": "Other Admin",
-            "project_name": "Isolated Project",
-        },
-    ).json()
-
-    return {
+    """An admin, a member and a viewer in the same project (sessions of the branch's RBAC, G0)."""
+    factory = client.app.state.session_factory
+    with factory() as db:
+        project, _ = create_project(db, "Test Project", with_key=False)
+        db.commit()
+        project_id = project.id
+    tokens = {}
+    for role in (Role.ADMIN, Role.MEMBER, Role.VIEWER):
+        user_id = make_user(factory)
+        add_membership(factory, user_id, project_id, role)
+        tokens[role.label] = session_token(factory, user_id)
+    result = {
         "project_id": project_id,
-        "admin_token": admin_token,
-        "member_token": member_token,
-        "viewer_token": viewer_token,
-        "other_token": other_res["token"],
-        "other_project_id": other_res["project"]["id"],
+        "admin_token": tokens["admin"],
+        "member_token": tokens["member"],
+        "viewer_token": tokens["viewer"],
+        "key_headers": api_key_headers(factory, project_id),
     }
+    # Another independent project for tenant isolation checks
+    with factory() as db:
+        other_project, _ = create_project(db, "Isolated Project", with_key=False)
+        db.commit()
+        other_id = other_project.id
+    other_user = make_user(factory)
+    add_membership(factory, other_user, other_id, Role.ADMIN)
+    result["other_token"] = session_token(factory, other_user)
+    result["other_project_id"] = other_id
+    return result
 
 
 # ============================================================================
@@ -379,7 +331,7 @@ def test_api_categories_unauthenticated(client):
 def test_api_categories_viewer_authorized(client, auth_setup):
     headers = {
         "Authorization": f"Bearer {auth_setup['viewer_token']}",
-        "x-matrix-project-id": auth_setup["project_id"],
+        "X-Matrix-Project": auth_setup["project_id"],
     }
     res = client.get("/api/v1/safety/categories", headers=headers)
     assert res.status_code == 200
@@ -397,7 +349,7 @@ def test_api_scans_rbac_permissions(client, auth_setup):
     # 1. Viewer tries to POST a scan -> 403 Forbidden (requires member)
     viewer_headers = {
         "Authorization": f"Bearer {auth_setup['viewer_token']}",
-        "x-matrix-project-id": project_id,
+        "X-Matrix-Project": project_id,
     }
     post_res = client.post(
         "/api/v1/safety/scans",
@@ -405,12 +357,12 @@ def test_api_scans_rbac_permissions(client, auth_setup):
         json={"categories": ["LLM01"]},
     )
     assert post_res.status_code == 403
-    assert "insufficient" in post_res.json()["detail"]
+    assert post_res.json()["detail"] == "requires role member"
 
     # 2. Member tries to POST a scan -> 201 Created
     member_headers = {
         "Authorization": f"Bearer {auth_setup['member_token']}",
-        "x-matrix-project-id": project_id,
+        "X-Matrix-Project": project_id,
     }
     create_res = client.post(
         "/api/v1/safety/scans",
@@ -448,7 +400,7 @@ def test_api_scans_tenant_isolation(client, auth_setup):
     # Member in Project A creates a scan
     headers_a = {
         "Authorization": f"Bearer {auth_setup['member_token']}",
-        "x-matrix-project-id": auth_setup["project_id"],
+        "X-Matrix-Project": auth_setup["project_id"],
     }
     scan_res = client.post(
         "/api/v1/safety/scans",
@@ -461,7 +413,7 @@ def test_api_scans_tenant_isolation(client, auth_setup):
     # Other tenant in Project B tries to access scan from Project A -> 404 Not Found
     headers_b = {
         "Authorization": f"Bearer {auth_setup['other_token']}",
-        "x-matrix-project-id": auth_setup["other_project_id"],
+        "X-Matrix-Project": auth_setup["other_project_id"],
     }
     res_b = client.get(f"/api/v1/safety/scans/{scan_id}", headers=headers_b)
     assert res_b.status_code == 404

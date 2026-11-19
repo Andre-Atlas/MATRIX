@@ -23,7 +23,7 @@ from otlp_payloads import (
 )
 
 from matrix_server.api import ingest
-from matrix_server.auth import current_project_id
+from matrix_server.auth import Role, project_of
 from matrix_server.config import Settings
 from matrix_server.ingest import openinference
 from matrix_server.storage.spans import MemorySpanStore
@@ -38,7 +38,7 @@ def app():
     app.include_router(ingest.router)
     app.state.settings = Settings(max_body_bytes=200_000, max_attribute_chars=1000)
     app.state.span_store = MemorySpanStore()
-    app.dependency_overrides[current_project_id] = lambda: "p1"
+    app.dependency_overrides[project_of(Role.MEMBER, scope="ingest")] = lambda: "p1"
     return app
 
 

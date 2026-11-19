@@ -6,114 +6,49 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from rbac_helpers import api_key_headers, project_with_roles
 from sqlalchemy import select
 
 from matrix_server.app import create_app
-from matrix_server.auth import create_jwt
 from matrix_server.benchmarks.runner import run_benchmark_job, validate_runner_url
 from matrix_server.config import Settings
 from matrix_server.storage.models import (
     ArtifactLineage,
     Dataset,
     ModelVersion,
-    ProjectMember,
     RegisteredModel,
 )
 
 
 @pytest.fixture
 def env(tmp_path):
+    # Users, memberships and sessions of the branch's RBAC (G0); `main`'s JWT/register flow is gone.
     settings = Settings(
         database_url=f"sqlite:///{tmp_path}/benchmarks_test.db",
         span_store="memory",
-        artifact_store="local",
-        artifact_dir=str(tmp_path / "artifacts"),
-        jwt_secret="test-benchmark-jwt-secret",
+        artifact_backend="local",
+        artifact_local_dir=str(tmp_path / "artifacts"),
     )
     app = create_app(settings)
     client = TestClient(app)
-
-    # Register Project A (Alice = Admin)
-    resp_a = client.post(
-        "/api/v1/auth/register",
-        json={
-            "email": "alice@example.com",
-            "password": "alice-password-123",
-            "name": "Alice Admin",
-            "project_name": "Project A",
-        },
-    )
-    assert resp_a.status_code == 201
-    data_a = resp_a.json()
-    project_a = data_a["project"]["id"]
-    admin_token_a = data_a["token"]
-
-    # Register Project B (Bob = Admin)
-    resp_b = client.post(
-        "/api/v1/auth/register",
-        json={
-            "email": "bob@example.com",
-            "password": "bob-password-123",
-            "name": "Bob Admin",
-            "project_name": "Project B",
-        },
-    )
-    assert resp_b.status_code == 201
-    data_b = resp_b.json()
-    project_b = data_b["project"]["id"]
-    admin_token_b = data_b["token"]
-
-    # Register Member
-    resp_mem = client.post(
-        "/api/v1/auth/register",
-        json={
-            "email": "member@example.com",
-            "password": "member-password-123",
-            "name": "Project Member",
-            "project_name": "Member Project",
-        },
-    )
-    assert resp_mem.status_code == 201
-    member_id = resp_mem.json()["user"]["id"]
-
-    # Register Viewer
-    resp_view = client.post(
-        "/api/v1/auth/register",
-        json={
-            "email": "viewer@example.com",
-            "password": "viewer-password-123",
-            "name": "Project Viewer",
-            "project_name": "Viewer Project",
-        },
-    )
-    assert resp_view.status_code == 201
-    viewer_id = resp_view.json()["user"]["id"]
-
-    # Add member and viewer to Project A
-    with app.state.session_factory() as db:
-        db.add(ProjectMember(project_id=project_a, user_id=member_id, role="member"))
-        db.add(ProjectMember(project_id=project_a, user_id=viewer_id, role="viewer"))
-        db.commit()
-
-    member_token_a = create_jwt({"sub": member_id}, settings.jwt_secret)
-    viewer_token_a = create_jwt({"sub": viewer_id}, settings.jwt_secret)
-
-    def headers(token: str, project_id: str) -> dict[str, str]:
-        return {"Authorization": f"Bearer {token}", "x-matrix-project-id": project_id}
+    factory = app.state.session_factory
+    project_a, roles_a = project_with_roles(factory, "Project A")
+    project_b, roles_b = project_with_roles(factory, "Project B")
 
     return {
         "app": app,
         "client": client,
         "project_a": project_a,
         "project_b": project_b,
-        "admin_a": headers(admin_token_a, project_a),
-        "member_a": headers(member_token_a, project_a),
-        "viewer_a": headers(viewer_token_a, project_a),
-        "admin_b": headers(admin_token_b, project_b),
-        "viewer_token_a": headers(viewer_token_a, project_a),
-        "member_token_a": headers(member_token_a, project_a),
-        "admin_token_a": headers(admin_token_a, project_a),
-        "admin_token_b": headers(admin_token_b, project_b),
+        "admin_a": roles_a["admin"],
+        "member_a": roles_a["member"],
+        "viewer_a": roles_a["viewer"],
+        "admin_b": roles_b["admin"],
+        "viewer_token_a": roles_a["viewer"],
+        "member_token_a": roles_a["member"],
+        "admin_token_a": roles_a["admin"],
+        "admin_token_b": roles_b["admin"],
+        "key_a": api_key_headers(factory, project_a),
     }
 
 

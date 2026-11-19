@@ -6,9 +6,12 @@ import os
 
 import pytest
 from fastapi.testclient import TestClient
+from rbac_helpers import member_headers
+from sqlalchemy import select
 
 from matrix_server.api import datasets
 from matrix_server.app import create_app
+from matrix_server.auth import Role
 from matrix_server.config import Settings
 from matrix_server.datasets.versioning import (
     BranchExistsError,
@@ -27,7 +30,7 @@ from matrix_server.datasets.versioning import (
     validate_branch_name,
 )
 from matrix_server.storage.db import Base, init_db, make_engine, make_session_factory
-from matrix_server.storage.models import Dataset, DatasetItem
+from matrix_server.storage.models import Dataset, DatasetItem, Project
 
 ADMIN = {"Authorization": "Bearer adm"}
 PG_URL = os.environ.get("MATRIX_TEST_DATABASE_URL")
@@ -527,27 +530,13 @@ def test_rbac_and_multitenant_isolation(client_env):
         headers=auth_beta,
     ).status_code == 404
 
-    # 2. RBAC: User with 'viewer' role can read but cannot mutate
-    # Register and invite a viewer to Alpha
-    user_resp = client.post(
-        "/api/v1/auth/register",
-        json={"email": "viewer@alpha.com", "password": "password123", "name": "Alpha Viewer"},
-    )
-    assert user_resp.status_code == 201
-    viewer_token = user_resp.json()["token"]
-
-    # Get Alpha project ID
-    me_alpha = client.get("/api/v1/auth/me", headers=auth_alpha).json()
-    alpha_proj_id = me_alpha["current_project"]["id"]
-
-    # Add viewer to Alpha project
-    client.post(
-        f"/api/v1/projects/{alpha_proj_id}/members",
-        json={"email": "viewer@alpha.com", "role": "viewer"},
-        headers=auth_alpha,
-    )
-
-    viewer_auth = {"Authorization": f"Bearer {viewer_token}", "x-matrix-project-id": alpha_proj_id}
+    # 2. RBAC: a user with the 'viewer' role in Alpha can read but cannot mutate (memberships of
+    # the branch's RBAC; `main`'s open /auth/register no longer exists).
+    assert client.post("/api/v1/auth/register", json={"email": "v@alpha.com", "password": "x" * 12}).status_code in (404, 405)
+    factory = client.app.state.session_factory
+    with factory() as db:
+        alpha_proj_id = db.scalar(select(Project.id).where(Project.name == "proj_alpha"))
+    viewer_auth = member_headers(factory, alpha_proj_id, Role.VIEWER)
 
     # Viewer can GET branches, commits, items
     assert client.get(f"/api/v1/datasets/{ds_id}/branches", headers=viewer_auth).status_code == 200

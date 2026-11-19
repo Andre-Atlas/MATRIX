@@ -266,8 +266,13 @@ export type ExperimentStatus = "queued" | "running" | "done" | "failed";
 
 export type MetricAggregate = { mean: number | null; pass_rate: number | null };
 
-/** variant label → metric name → aggregate. */
-export type ExperimentSummary = Record<string, Record<string, MetricAggregate>>;
+export type JudgeKind = "heuristic" | "llm";
+
+/** Reserved `_meta` key of a summary; every other key is a variant label. */
+export type ExperimentMeta = { cells_total: number; cells_failed: number; partial: boolean; judge: JudgeKind | null };
+
+/** variant label → metric name → aggregate, plus the reserved `_meta` entry (never a variant). */
+export type ExperimentSummary = Record<string, Record<string, MetricAggregate> | ExperimentMeta>;
 
 export type Experiment = {
   id: string;
@@ -286,7 +291,7 @@ export type Experiment = {
 
 export type ExperimentListItem = Pick<
   Experiment,
-  "id" | "name" | "dataset_id" | "status" | "created_at" | "finished_at" | "summary"
+  "id" | "name" | "dataset_id" | "status" | "created_at" | "finished_at" | "summary" | "error"
 >;
 
 export type FaithfulnessStatement = { statement: string; supported: boolean; reason: string };
@@ -317,6 +322,8 @@ export type Regression = {
   metric: string;
   baseline: number | null;
   current: number | null;
+  /** The current cell errored where the baseline had a value. */
+  errored: boolean;
 };
 
 export type ExperimentDetail = {
@@ -465,6 +472,71 @@ export type Alert = {
   created_at: string;
 };
 
+// ── G0: users, projects, RBAC (contract g0.md section 1) ─────────────────────────────────
+
+export const ROLES = ["viewer", "member", "admin", "owner"] as const;
+export type Role = (typeof ROLES)[number];
+export const roleRank = (r: Role | null | undefined): number => (r ? ROLES.indexOf(r) + 1 : 0);
+export const roleAtLeast = (r: Role | null | undefined, min: Role): boolean => roleRank(r) >= roleRank(min);
+
+export type User = { id: string; email: string; name: string; created_at: string; last_login_at: string | null };
+export type Membership = { project: { id: string; name: string }; role: Role };
+export type MeResponse = { user: User; memberships: Membership[] };
+
+export type AuthSession = {
+  id: string;
+  created_at: string;
+  last_seen_at: string | null;
+  expires_at: string;
+  user_agent: string | null;
+  ip: string | null;
+  current: boolean;
+};
+
+export type ProjectMember = { user: User; role: Role; added_at: string };
+
+export const KEY_SCOPES = ["ingest", "read", "write"] as const;
+export type KeyScope = (typeof KEY_SCOPES)[number];
+export type ApiKeyItem = {
+  id: string;
+  prefix: string;
+  name: string | null;
+  scopes: KeyScope[];
+  created_at: string;
+  created_by: string | null;
+  last_used_at: string | null;
+  revoked_at: string | null;
+};
+export type CreatedApiKey = { id: string; prefix: string; api_key: string };
+
+export type EgressHost = { id: string; host: string; created_at: string; created_by: string | null };
+
+export type AuditEntry = {
+  id: string;
+  ts: string;
+  actor: { kind: string; id: string | null };
+  action: string;
+  target: string | null;
+  detail: Record<string, unknown>;
+};
+export const AUDIT_ACTIONS = [
+  "auth.login",
+  "auth.login_failed",
+  "auth.logout",
+  "auth.password_change",
+  "auth.session_revoke",
+  "member.add",
+  "member.update",
+  "member.remove",
+  "key.create",
+  "key.revoke",
+  "project.create",
+  "project.delete",
+  "egress.host_add",
+  "egress.host_remove",
+  "egress.request",
+  "artifact.delete",
+] as const;
 // ── Vector Space & Drift Observatory (Module 5) ──
 
 export type VectorPointType = "query" | "document" | "gap";
