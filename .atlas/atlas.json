@@ -2,6 +2,7 @@
   "version": 1,
   "scope": "project",
   "harnesses": [
+    "antigravity",
     "claude-code"
   ],
   "profile": "web",
