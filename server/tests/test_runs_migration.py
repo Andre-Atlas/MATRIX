@@ -15,6 +15,11 @@ from matrix_server.storage.models import Project
 
 FRAGMENT = Path(__file__).resolve().parents[1] / "migrations" / "fragments" / "g1_runs.py"
 PG_URL = os.environ.get("MATRIX_TEST_DATABASE_URL")
+# Indexes added later by T6 (revision 0009, fragment t6_registry.py), not by G1 (revision 0003).
+_T6_LINEAGE_RUN_INDEXES = frozenset({
+    "ix_runs_project_dataset_version",
+    "ix_runs_project_parent_run",
+})
 
 
 def _fragment():
@@ -47,6 +52,10 @@ def test_fragment_matches_models(engine):
     target = MetaData()
     for name in ("projects", *fragment.TABLES):
         Base.metadata.tables[name].to_metadata(target)
+    runs_target = target.tables["runs"]
+    for idx in list(runs_target.indexes):
+        if idx.name in _T6_LINEAGE_RUN_INDEXES:
+            runs_target.indexes.remove(idx)
     with engine.connect() as conn:
         diff = compare_metadata(MigrationContext.configure(conn, opts={"compare_type": True}), target)
     assert diff == []

@@ -768,12 +768,14 @@ def test_t6_migration_fragment_upgrade_and_downgrade(tmp_path):
 
     eng = make_engine(f"sqlite:///{tmp_path}/frag.db")
     try:
-        # Simulate pre-T6 (0008) schema: create all tables except the 3 new T6 tables and T6 partial index.
+        # Simulate pre-T6 (0008) schema: create all tables except the 3 new T6 tables, T6 partial index, and T6 lineage indexes.
         t6_tables = {"model_stage_history", "model_webhooks", "webhook_deliveries"}
         pre_tables = [t for t in Base.metadata.sorted_tables if t.name not in t6_tables]
         Base.metadata.create_all(eng, tables=pre_tables)
         with eng.begin() as conn:
             conn.execute(sa.text("DROP INDEX IF EXISTS uq_mlops_model_versions_one_production"))
+            for idx_name, _table_name, _cols in mod.LINEAGE_INDEXES:
+                conn.execute(sa.text(f"DROP INDEX IF EXISTS {idx_name}"))
             # Seed a model with 2 duplicate production versions to test deduplication during upgrade
             conn.execute(
                 sa.insert(RegisteredModel.__table__).values(
@@ -821,5 +823,8 @@ def test_t6_migration_fragment_upgrade_and_downgrade(tmp_path):
         assert t6_tables.isdisjoint(set(insp2.get_table_names()))
         mv_indexes2 = {idx["name"] for idx in insp2.get_indexes("mlops_model_versions")}
         assert "uq_mlops_model_versions_one_production" not in mv_indexes2
+        assert "ix_mlops_mv_project_eval_exp" not in mv_indexes2
+        runs_indexes2 = {idx["name"] for idx in insp2.get_indexes("runs")}
+        assert "ix_runs_project_dataset_version" not in runs_indexes2
     finally:
         eng.dispose()
