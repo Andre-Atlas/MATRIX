@@ -52,3 +52,8 @@ T2 (auth, migração de usuários), T3 (auth/rotas), T6 (webhooks → SSRF), T7 
 - **Limite de uso** (cortou 5 vezes): commit `wip` por tarefa, retomada por `SendMessage` pedindo `git diff` antes de reler; no máximo 3 agentes em paralelo.
 - **`main` continua andando** (é a linha de trabalho do usuário): `git fetch` antes de cada tarefa e antes do PR; se aparecer commit novo, ele é incorporado na T2 ou reportado.
 - **Tamanho:** o merge toca ~290 arquivos; por isso T2 vem antes e a suíte do branch precisa ficar verde a cada tarefa.
+
+## Status (2026-11-19)
+
+- **Feitas:** T1, T2, T3, T4.
+- **Pendentes (passadas ao Antigravity):** T5, T6, T7, T8, T9, T10, T11, T12, T13. Especificações em `tasks/` e visão geral em `HANDOFF.md`.
