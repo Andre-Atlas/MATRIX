@@ -178,9 +178,9 @@ def test_deprecated_routes_are_marked_in_openapi(env):
     spec = client.app.openapi()
     for path, ops in spec["paths"].items():
         for op in ops.values():
-            legacy = path.startswith(("/api/v1/mlops/runs", "/api/v1/mlops/artifacts"))
+            legacy = path.startswith(("/api/v1/mlops/runs", "/api/v1/mlops/artifacts", "/api/v1/mlops/sweeps"))
             if legacy and not path.endswith("/lineage"):
                 assert op.get("deprecated") is True, path
-            if path.startswith(("/api/v1/runs", "/api/v1/artifacts", "/api/v1/mlops/models", "/api/v1/mlops/sweeps")):
+            if path.startswith(("/api/v1/runs", "/api/v1/artifacts", "/api/v1/sweeps", "/api/v1/mlops/models")):
                 assert not op.get("deprecated"), path
     assert not any(p.startswith("/api/v1/mlops/artifacts/local") for p in spec["paths"])

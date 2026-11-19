@@ -8,24 +8,14 @@ import math
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from matrix_server.api.runs import _check_tags, capacity_http
 from matrix_server.auth import Principal, Role, ensure_role, require
 from matrix_server.mlops.compat import status_out
-from matrix_server.mlops.sweeps import (
-    InvalidSearchSpaceError,
-    SweepExhaustedError,
-    build_sweep_analysis,
-    suggest_next_params,
-    validate_search_space,
-)
-from matrix_server.mlops.views import render_run, render_runs
-from matrix_server.runs import service
 from matrix_server.runs.models import Run
 from matrix_server.storage.db import as_utc, get_db, utcnow
 from matrix_server.storage.jobs import enqueue
@@ -33,7 +23,6 @@ from matrix_server.storage.models import (
     ArtifactLineage,
     Dataset,
     Experiment,
-    MLOpsSweep,
     ModelAlias,
     ModelVersion,
     RegisteredModel,
@@ -124,30 +113,11 @@ def _get_dataset_or_404(db: Session, project_id: str, dataset_id: str) -> Datase
     return row
 
 
-def _get_sweep_or_404(db: Session, project_id: str, sweep_id: str) -> MLOpsSweep:
-    row = db.scalars(select(MLOpsSweep).where(MLOpsSweep.id == sweep_id, MLOpsSweep.project_id == project_id)).first()
-    if row is None:
-        raise HTTPException(status_code=404, detail="sweep not found")
-    return row
-
-
 def _get_run_or_404(db: Session, project_id: str, run_id: str) -> Run:
     row = db.scalars(select(Run).where(Run.id == run_id, Run.project_id == project_id)).first()
     if row is None:
         raise HTTPException(status_code=404, detail="training run not found")
     return row
-
-
-def _sweep_trials(request: Request, db: Session, project_id: str, sweep_id: str) -> list[dict[str, Any]]:
-    """The sweep's runs in `main`'s shape (hyperparams, summary_metrics): what the sweep engine reads."""
-    runs = list(
-        db.scalars(
-            select(Run)
-            .where(Run.project_id == project_id, Run.sweep_id == sweep_id)
-            .order_by(Run.started_at.asc(), Run.id.asc())
-        )
-    )
-    return render_runs(db, request.app.state.metric_store, runs)
 
 
 def _get_artifact_or_404(db: Session, project_id: str, artifact_id: str) -> Artifact:
@@ -240,26 +210,6 @@ def _add_lineage_edge(
 # ---------------------------------------------------------------------------
 
 
-def _sweep_out(sweep: MLOpsSweep) -> dict[str, Any]:
-    return {
-        "id": sweep.id,
-        "project_id": sweep.project_id,
-        "name": sweep.name,
-        "description": sweep.description,
-        "method": sweep.method,
-        "metric_name": sweep.metric_name,
-        "metric_goal": sweep.metric_goal,
-        "search_space": dict(sweep.search_space or {}),
-        "early_stopping": sweep.early_stopping,
-        "max_trials": sweep.max_trials,
-        "status": sweep.status,
-        "best_run_id": sweep.best_run_id,
-        "best_metric_value": sweep.best_metric_value,
-        "created_at": _iso_utc(sweep.created_at),
-        "stopped_at": _iso_utc(sweep.stopped_at),
-    }
-
-
 def _model_out(model: RegisteredModel) -> dict[str, Any]:
     return {
         "id": model.id,
@@ -297,29 +247,6 @@ def _version_out(mv: ModelVersion) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Pydantic Schemas
 # ---------------------------------------------------------------------------
-
-
-class SweepCreate(BaseModel):
-    model_config = ConfigDict(allow_inf_nan=False, extra="ignore")
-
-    name: str = Field(min_length=1, max_length=200)
-    description: str | None = Field(default=None, max_length=10_000)
-    method: Literal["grid", "random", "bayes"] = "random"
-    metric_name: str = Field(min_length=1, max_length=200)
-    metric_goal: Literal["minimize", "maximize"] = "minimize"
-    search_space: dict[str, Any]
-    early_stopping: dict[str, Any] | None = None
-    max_trials: int | None = Field(default=None, ge=1)
-
-
-class SweepNextTrialIn(BaseModel):
-    model_config = ConfigDict(allow_inf_nan=False, extra="ignore")
-
-    name: str | None = Field(default=None, min_length=1, max_length=200)
-    run_type: str = Field(default="sft", min_length=1, max_length=32)
-    base_model: str | None = Field(default=None, max_length=200)
-    dataset_id: str | None = Field(default=None, max_length=32)
-    tags: list[str] = Field(default_factory=list, max_length=50)
 
 
 class ModelCreate(BaseModel):
@@ -540,155 +467,6 @@ def get_run_lineage(run_id: str, db: DbSession, principal: ViewerAuth) -> dict[s
     _get_run_or_404(db, principal.project_id, run_id)
     nodes, edges = _build_lineage_graph(db, principal.project_id, [("run", run_id)])
     return {"run_id": run_id, "nodes": nodes, "edges": edges}
-
-
-# ---------------------------------------------------------------------------
-# Sweeps
-# ---------------------------------------------------------------------------
-
-
-@router.post("/sweeps", status_code=201)
-def create_sweep(
-    db: DbSession,
-    principal: MemberAuth,
-    payload: Annotated[dict[str, Any], Body()],
-) -> dict[str, Any]:
-    body: SweepCreate = _parse_body(SweepCreate, payload)
-    name = body.name.strip()
-    if not name:
-        raise HTTPException(status_code=422, detail="name must not be blank")
-
-    exists = db.scalar(
-        select(MLOpsSweep.id).where(MLOpsSweep.project_id == principal.project_id, MLOpsSweep.name == name)
-    )
-    if exists is not None:
-        raise HTTPException(status_code=409, detail="sweep name already exists")
-
-    try:
-        normalized_space = validate_search_space(body.search_space)
-    except InvalidSearchSpaceError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    if body.early_stopping is not None:
-        strat = body.early_stopping.get("strategy", "none")
-        if strat not in {"none", "median", "asha"}:
-            raise HTTPException(status_code=422, detail=f"unsupported early stopping strategy '{strat}'")
-
-    sweep = MLOpsSweep(
-        project_id=principal.project_id,
-        name=name,
-        description=body.description,
-        method=body.method,
-        metric_name=body.metric_name.strip(),
-        metric_goal=body.metric_goal,
-        search_space=normalized_space,
-        early_stopping=body.early_stopping,
-        max_trials=body.max_trials,
-        status="running",
-    )
-    db.add(sweep)
-    db.flush()
-    return _sweep_out(sweep)
-
-
-@router.get("/sweeps")
-def list_sweeps(db: DbSession, principal: ViewerAuth) -> dict[str, Any]:
-    rows = list(
-        db.scalars(
-            select(MLOpsSweep)
-            .where(MLOpsSweep.project_id == principal.project_id)
-            .order_by(MLOpsSweep.created_at.desc())
-        )
-    )
-    return {"items": [_sweep_out(s) for s in rows]}
-
-
-@router.get("/sweeps/{sweep_id}")
-def get_sweep(sweep_id: str, request: Request, db: DbSession, principal: ViewerAuth) -> dict[str, Any]:
-    sweep = _get_sweep_or_404(db, principal.project_id, sweep_id)
-    trials = _sweep_trials(request, db, principal.project_id, sweep.id)
-    analysis = build_sweep_analysis(sweep, trials)
-    out = _sweep_out(sweep)
-    out["trials"] = trials
-    out["analysis"] = analysis
-    return out
-
-
-@router.post("/sweeps/{sweep_id}/trials/next", status_code=201)
-def suggest_sweep_trial(
-    sweep_id: str,
-    request: Request,
-    db: DbSession,
-    principal: MemberAuth,
-    payload: Annotated[dict[str, Any] | None, Body()] = None,
-) -> dict[str, Any]:
-    sweep = _get_sweep_or_404(db, principal.project_id, sweep_id)
-    if sweep.status in {"cancelled", "stopped", "completed"}:
-        raise HTTPException(status_code=409, detail=f"sweep is {sweep.status}")
-
-    body: SweepNextTrialIn = _parse_body(SweepNextTrialIn, payload or {})
-    if body.dataset_id is not None:
-        _get_dataset_or_404(db, principal.project_id, body.dataset_id)
-
-    existing_runs = _sweep_trials(request, db, principal.project_id, sweep.id)
-    try:
-        suggested = suggest_next_params(
-            method=sweep.method,
-            search_space=sweep.search_space,
-            completed_or_existing_trials=existing_runs,
-            metric_goal=sweep.metric_goal,
-            seed=sweep.id,
-            max_trials=sweep.max_trials,
-            metric_name=sweep.metric_name,
-        )
-    except SweepExhaustedError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-    trial_idx = len(existing_runs)
-    run_name = body.name.strip() if body.name else f"{sweep.name}-trial-{trial_idx + 1}"
-    tags = list(dict.fromkeys(body.tags))
-    try:
-        _check_tags(tags)
-        service.check_capacity(db, request.app.state.settings, principal.project_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from None
-    except service.CapacityError as exc:
-        raise capacity_http(exc) from None
-    run = service.new_run(
-        db,
-        principal.project_id,
-        name=run_name,
-        tags=tags,
-        params=suggested,
-        run_type=body.run_type,
-        base_model=body.base_model,
-        dataset_version_id=body.dataset_id,
-        sweep_id=sweep.id,
-        created_by=principal.user_id,
-    )
-    sweep.status = "running"
-    db.flush()
-
-    if body.dataset_id is not None:
-        _add_lineage_edge(db, principal.project_id, "dataset", body.dataset_id, "run", run.id, "trained_on")
-
-    return {
-        "sweep_id": sweep.id,
-        "trial_index": trial_idx,
-        "hyperparams": suggested,
-        "run": render_run(db, request.app.state.metric_store, run),
-    }
-
-
-@router.post("/sweeps/{sweep_id}/stop")
-def stop_sweep(sweep_id: str, db: DbSession, principal: MemberAuth) -> dict[str, Any]:
-    sweep = _get_sweep_or_404(db, principal.project_id, sweep_id)
-    sweep.status = "cancelled"
-    sweep.stopped_at = utcnow()
-    db.flush()
-    out = _sweep_out(sweep)
-    out["stopped"] = True
-    return out
 
 
 # ---------------------------------------------------------------------------

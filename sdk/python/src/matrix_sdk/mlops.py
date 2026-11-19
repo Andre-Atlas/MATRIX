@@ -522,6 +522,12 @@ class MLOpsClient:
         max_concurrent: int = 4,
         description: str | None = None,
     ) -> dict[str, Any]:
+        """Deprecated: use `matrix_sdk.sweep(config, name)` instead."""
+        warnings.warn(
+            "MLOpsClient.create_sweep() is deprecated; use matrix_sdk.sweep(config, name) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         _validate_finite(search_space, label="search_space")
         body: dict[str, Any] = {
             "name": name,
@@ -545,6 +551,12 @@ class MLOpsClient:
         *,
         count: int | None = None,
     ) -> None:
+        """Deprecated: use `matrix_sdk.agent(sweep_id, function, count=...)` instead."""
+        warnings.warn(
+            "MLOpsClient.run_sweep_agent() is deprecated; use matrix_sdk.agent(sweep_id, function, count=...) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         executed = 0
         while count is None or executed < count:
             try:

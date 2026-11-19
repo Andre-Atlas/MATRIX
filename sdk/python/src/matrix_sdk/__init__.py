@@ -4,6 +4,7 @@ from .datasets import DatasetsClient
 from .mlops import MatrixTrainerCallback, MLOpsClient, SweepExhausted, TrainingRun
 from .prompts import Prompt
 from .sandboxes import SandboxesClient
+from .sweeps import agent, sweep
 from .tracing import (
     SpanHelper,
     current_trace_id,
@@ -31,6 +32,7 @@ __all__ = [
     "SpanHelper",
     "SweepExhausted",
     "TrainingRun",
+    "agent",
     "current_run",
     "current_trace_id",
     "finish",
@@ -39,6 +41,7 @@ __all__ = [
     "log_params",
     "session",
     "start_run",
+    "sweep",
     "trace_agent",
     "trace_chain",
     "trace_llm",

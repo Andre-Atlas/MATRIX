@@ -585,7 +585,7 @@ def test_rbac_multi_tenant_isolation_and_security(env):
 
 
 def test_bayes_sweep_api_passes_metric_name_with_heartbeat(env, monkeypatch: pytest.MonkeyPatch) -> None:
-    from matrix_server.mlops import sweeps as sweeps_mod
+    from matrix_server.sweeps import engine as engine_mod
 
     client: TestClient = env["client"]
     hdrs = env["member_a"]
@@ -605,6 +605,7 @@ def test_bayes_sweep_api_passes_metric_name_with_heartbeat(env, monkeypatch: pyt
         },
     )
     assert sweep_resp.status_code == 201
+    assert sweep_resp.headers.get("deprecation") == "true"
     sweep_id = sweep_resp.json()["id"]
 
     for idx in range(6):
@@ -620,23 +621,17 @@ def test_bayes_sweep_api_passes_metric_name_with_heartbeat(env, monkeypatch: pyt
         )
         assert m_resp.status_code == 202
 
-    seen_metric_names: list[str | None] = []
-    real_suggest_bayes = sweeps_mod._suggest_bayes
+    seen_scored_counts: list[int] = []
+    real_suggest_tpe = engine_mod._suggest_tpe
 
-    def spy_suggest_bayes(space, trials, metric_goal, rng, **kwargs):
-        seen_metric_names.append(kwargs.get("metric_name"))
-        # Ensure at least warmup_trials have non-None extracted metric
-        extracted = [
-            sweeps_mod._extract_trial_metric(t, metric_name=kwargs.get("metric_name"))
-            for t in trials
-        ]
-        assert sum(1 for m in extracted if m is not None) == 6
-        return real_suggest_bayes(space, trials, metric_goal, rng, **kwargs)
+    def spy_suggest_tpe(parameters, scored_trials, metric_goal, rng, **kwargs):
+        seen_scored_counts.append(len(scored_trials))
+        return real_suggest_tpe(parameters, scored_trials, metric_goal, rng, **kwargs)
 
-    monkeypatch.setattr(sweeps_mod, "_suggest_bayes", spy_suggest_bayes)
+    monkeypatch.setattr(engine_mod, "_suggest_tpe", spy_suggest_tpe)
     t7 = client.post(f"/api/v1/mlops/sweeps/{sweep_id}/trials/next", headers=hdrs, json={})
     assert t7.status_code == 201
-    assert seen_metric_names == ["val_loss"]
+    assert seen_scored_counts == [6]
 
 
 def test_local_artifact_upload_bypasses_json_limit_and_validates_sha256(tmp_path) -> None:

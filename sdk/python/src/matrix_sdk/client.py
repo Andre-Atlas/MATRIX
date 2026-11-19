@@ -193,12 +193,25 @@ class MatrixClient:
             body["metadata"] = metadata
         return self._request("POST", f"/api/v1/datasets/{_seg(dataset_id)}/items", json=body)
 
-    # -- training runs
+    # -- training runs & sweeps
     def start_run(self, *args: Any, **kwargs: Any):
         """Same as `matrix_sdk.start_run(...)`, bound to this client."""
         from .tracking import start_run
 
         return start_run(*args, client=self, **kwargs)
+
+    def sweep(self, config: Any, name: str, **kwargs: Any) -> str:
+        """Same as `matrix_sdk.sweep(...)`, bound to this client."""
+        from .sweeps import sweep
+
+        return sweep(config, name, client=self, **kwargs)
+
+    def agent(self, sweep_id: str, function: Any, count: int | None = None, agent_id: str | None = None,
+              **kwargs: Any) -> int:
+        """Same as `matrix_sdk.agent(...)`, bound to this client."""
+        from .sweeps import agent
+
+        return agent(sweep_id, function, count=count, agent_id=agent_id, client=self, **kwargs)
 
     # -- datasets (versioning, from main)
     @property

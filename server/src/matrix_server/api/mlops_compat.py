@@ -11,7 +11,7 @@ through the G0 artifact store (`/api/v1/artifacts*`: dedup, quota, verified sha2
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
@@ -26,7 +26,7 @@ from matrix_server.api.mlops import (
     _decode_cursor,
     _encode_cursor,
     _get_dataset_or_404,
-    _get_sweep_or_404,
+    _iso_utc,
     _parse_body,
     _same_tz,
 )
@@ -41,13 +41,16 @@ from matrix_server.artifacts.service import (
 )
 from matrix_server.auth import Principal, Role, require
 from matrix_server.mlops import compat
-from matrix_server.mlops.sweeps import evaluate_early_stopping
+from matrix_server.mlops.sweeps import build_sweep_analysis
 from matrix_server.mlops.views import artifact_out, render_run, render_runs
 from matrix_server.runs import service
 from matrix_server.runs.models import Run, RunReport
 from matrix_server.runs.store import MAX_MAX_POINTS, MIN_MAX_POINTS, SYS_PREFIX, MetricStore
 from matrix_server.storage.db import as_utc, get_db, new_id, utcnow
-from matrix_server.storage.models import MLOpsSweep, ModelArtifact
+from matrix_server.storage.models import ModelArtifact
+from matrix_server.sweeps import service as sweep_service
+from matrix_server.sweeps.engine import SweepValidationError
+from matrix_server.sweeps.models import Sweep
 
 
 def _deprecation_header(response: Response) -> None:
@@ -217,7 +220,7 @@ def create_run(
     if body.dataset_id is not None:
         _get_dataset_or_404(db, pid, body.dataset_id)
     if body.sweep_id is not None:
-        _get_sweep_or_404(db, pid, body.sweep_id)
+        _get_compat_sweep_or_404(db, pid, body.sweep_id)
     if body.parent_run_id is not None:
         get_run_or_404(db, pid, body.parent_run_id)
     try:
@@ -371,42 +374,25 @@ def ingest_run_metrics(
             latest[p.key] = (p.step, p.value)
 
     should_stop, stop_reason = False, None
-    sweep = None
     if run.sweep_id is not None:
-        sweep = db.scalars(select(MLOpsSweep).where(MLOpsSweep.id == run.sweep_id, MLOpsSweep.project_id == pid)).first()
-    if sweep is not None:  # `main`'s ask/tell early stopping, kept until T5 redoes the sweeps
-        if sweep.status in {"cancelled", "stopped", "completed"}:
-            should_stop, stop_reason = True, f"Sweep is {sweep.status}"
-        elif sweep.metric_name in latest:
-            cur_step, cur_val = latest[sweep.metric_name]
-            if (
-                sweep.best_metric_value is None
-                or (sweep.metric_goal == "minimize" and cur_val < sweep.best_metric_value)
-                or (sweep.metric_goal == "maximize" and cur_val > sweep.best_metric_value)
-            ):
-                sweep.best_metric_value, sweep.best_run_id = cur_val, run.id
-            es_cfg = sweep.early_stopping if isinstance(sweep.early_stopping, dict) else None
-            strategy = es_cfg.get("strategy") if es_cfg else None
-            if strategy and strategy != "none":
-                peers = list(
-                    db.scalars(select(Run.id).where(Run.project_id == pid, Run.sweep_id == sweep.id, Run.id != run.id))
+        sweep = sweep_service.get_sweep(db, pid, run.sweep_id)
+        if sweep is not None:
+            if sweep.status in {"stopped", "finished"}:
+                should_stop, stop_reason = True, f"Sweep is {sweep.status}"
+            elif sweep.metric_key in latest:
+                cur_step, cur_val = latest[sweep.metric_key]
+                rep = sweep_service.report_metric(
+                    db,
+                    _store(request),
+                    request.app.state.settings,
+                    sweep,
+                    run,
+                    step=cur_step,
+                    value=cur_val,
+                    record_point=False,
                 )
-                series, _ = _store(request).read_series(pid, peers, [sweep.metric_name], max_points=MAX_MAX_POINTS)
-                peer_series = [
-                    [{"step": s, "value": v} for s, v in zip(by_key[sweep.metric_name].steps, by_key[sweep.metric_name].values, strict=True) if v is not None]
-                    for by_key in series.values()
-                    if sweep.metric_name in by_key
-                ]
-                decision = evaluate_early_stopping(
-                    strategy=strategy,
-                    metric_goal=sweep.metric_goal,
-                    early_stopping_cfg=es_cfg,
-                    current_step=cur_step,
-                    current_value=cur_val,
-                    peer_runs_metrics=[s for s in peer_series if s],
-                )
-                if decision.should_stop:
-                    should_stop, stop_reason = True, decision.reason
+                if rep.action == "stop":
+                    should_stop, stop_reason = True, rep.reason
     db.flush()
     return {
         "accepted": len(body.points) - len(value_rejected),
@@ -645,3 +631,236 @@ def get_artifact_download_url(
         "sha256": art.sha256,
         "size_bytes": art.size_bytes,
     }
+
+
+# --------------------------------------------------------------------------- sweeps (deprecated, T5)
+
+
+class SweepCreateCompat(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False, extra="ignore")
+
+    name: str = Field(min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=10_000)
+    method: Literal["grid", "random", "bayes", "tpe"] = "random"
+    metric_name: str = Field(min_length=1, max_length=200)
+    metric_goal: Literal["minimize", "maximize"] = "minimize"
+    search_space: dict[str, Any]
+    early_stopping: dict[str, Any] | None = None
+    max_trials: int | None = Field(default=None, ge=1)
+
+
+class SweepNextTrialCompat(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False, extra="ignore")
+
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    run_type: str = Field(default="sft", min_length=1, max_length=32)
+    base_model: str | None = Field(default=None, max_length=200)
+    dataset_id: str | None = Field(default=None, max_length=32)
+    tags: list[str] = Field(default_factory=list, max_length=50)
+
+
+def _get_compat_sweep_or_404(db: Session, project_id: str, sweep_id: str) -> Sweep:
+    row = sweep_service.get_sweep(db, project_id, sweep_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="sweep not found")
+    return row
+
+
+def _legacy_early_stop_to_g2(raw: dict[str, Any] | None) -> dict[str, Any] | None:
+    if raw is None:
+        return None
+    strat = str(raw.get("strategy") or raw.get("type") or raw.get("method") or "none").lower()
+    if strat == "none":
+        return None
+    if strat not in {"median", "asha", "hyperband"}:
+        raise HTTPException(status_code=422, detail=f"unsupported early stopping strategy '{strat}'")
+    out: dict[str, Any] = {
+        "type": strat,
+        "min_iter": int(raw.get("min_iter", raw.get("min_step", raw.get("min_t", 10)))),
+        "eta": int(raw.get("eta", raw.get("reduction_factor", 3))),
+    }
+    if raw.get("max_iter") is not None:
+        out["max_iter"] = int(raw["max_iter"])
+    return out
+
+
+def _g2_params_to_legacy(params: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for name, spec in params.items():
+        if isinstance(spec, dict) and spec.get("type") == "choice":
+            out[name] = {**spec, "type": "categorical"}
+        elif isinstance(spec, dict) and spec.get("type") == "constant":
+            out[name] = {"type": "categorical", "values": [spec.get("value")]}
+        else:
+            out[name] = dict(spec) if isinstance(spec, dict) else spec
+    return out
+
+
+def _compat_sweep_status(status: str) -> str:
+    if status == "stopped":
+        return "cancelled"
+    if status == "finished":
+        return "completed"
+    return status
+
+
+def _compat_sweep_out(sweep: Sweep) -> dict[str, Any]:
+    cfg = dict(sweep.config or {})
+    es = cfg.get("early_stop")
+    legacy_es = None
+    if isinstance(es, dict):
+        legacy_es = {
+            "strategy": es.get("type"),
+            "min_step": es.get("min_iter"),
+            "reduction_factor": es.get("eta", 3),
+        }
+        if "max_iter" in es:
+            legacy_es["max_iter"] = es["max_iter"]
+    return {
+        "id": sweep.id,
+        "project_id": sweep.project_id,
+        "name": sweep.name,
+        "description": sweep.description,
+        "method": cfg.get("method", "random"),
+        "metric_name": sweep.metric_key,
+        "metric_goal": sweep.metric_goal,
+        "search_space": _g2_params_to_legacy(cfg.get("parameters", {})),
+        "early_stopping": legacy_es,
+        "max_trials": cfg.get("max_runs"),
+        "status": _compat_sweep_status(sweep.status),
+        "best_run_id": sweep.best_run_id,
+        "best_metric_value": sweep.best_value,
+        "created_at": _iso_utc(sweep.created_at),
+        "stopped_at": _iso_utc(sweep.stopped_at),
+    }
+
+
+@router.post("/sweeps", status_code=201)
+def create_sweep_compat(
+    db: DbSession,
+    principal: MemberAuth,
+    payload: Annotated[dict[str, Any], Body()],
+) -> dict[str, Any]:
+    body: SweepCreateCompat = _parse_body(SweepCreateCompat, payload)
+    g2_config: dict[str, Any] = {
+        "method": body.method,
+        "metric": {"key": body.metric_name.strip(), "goal": body.metric_goal},
+        "parameters": body.search_space,
+    }
+    if body.max_trials is not None:
+        g2_config["max_runs"] = body.max_trials
+    es = _legacy_early_stop_to_g2(body.early_stopping)
+    if es is not None:
+        g2_config["early_stop"] = es
+    try:
+        sweep = sweep_service.create_sweep(
+            db,
+            principal.project_id,
+            name=body.name,
+            config=g2_config,
+            created_by=principal.user_id,
+            description=body.description,
+            unique_name=True,
+            allow_median=True,
+            allow_float_grid=True,
+        )
+    except sweep_service.SweepConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except SweepValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    return _compat_sweep_out(sweep)
+
+
+@router.get("/sweeps")
+def list_sweeps_compat(db: DbSession, principal: ViewerAuth) -> dict[str, Any]:
+    rows = list(
+        db.scalars(
+            select(Sweep)
+            .where(Sweep.project_id == principal.project_id)
+            .order_by(Sweep.created_at.desc(), Sweep.id.desc())
+        )
+    )
+    return {"items": [_compat_sweep_out(s) for s in rows]}
+
+
+@router.get("/sweeps/{sweep_id}")
+def get_sweep_compat(
+    sweep_id: str, request: Request, db: DbSession, principal: ViewerAuth
+) -> dict[str, Any]:
+    sweep = _get_compat_sweep_or_404(db, principal.project_id, sweep_id)
+    runs = list(
+        db.scalars(
+            select(Run)
+            .where(Run.project_id == principal.project_id, Run.sweep_id == sweep.id)
+            .order_by(Run.started_at.asc(), Run.id.asc())
+        )
+    )
+    trials = render_runs(db, _store(request), runs)
+    out = _compat_sweep_out(sweep)
+    out["trials"] = trials
+    out["analysis"] = build_sweep_analysis(out, trials)
+    return out
+
+
+@router.post("/sweeps/{sweep_id}/trials/next", status_code=201)
+def suggest_sweep_trial_compat(
+    sweep_id: str,
+    request: Request,
+    db: DbSession,
+    principal: MemberAuth,
+    payload: Annotated[dict[str, Any] | None, Body()] = None,
+) -> dict[str, Any]:
+    body: SweepNextTrialCompat = _parse_body(SweepNextTrialCompat, payload or {})
+    if body.dataset_id is not None:
+        _get_dataset_or_404(db, principal.project_id, body.dataset_id)
+
+    tags = list(dict.fromkeys(body.tags))
+    try:
+        _check_tags(tags)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+
+    try:
+        res = sweep_service.next_trial(
+            db,
+            _store(request),
+            request.app.state.settings,
+            principal.project_id,
+            sweep_id,
+            created_by=principal.user_id,
+            run_name=body.name,
+            run_type=body.run_type,
+            base_model=body.base_model,
+            dataset_version_id=body.dataset_id,
+            tags=tags,
+        )
+    except service.CapacityError as exc:
+        raise capacity_http(exc) from None
+    except sweep_service.SweepConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+
+    if res is None:
+        raise HTTPException(status_code=404, detail="sweep not found")
+    if res.outcome != "ok":
+        raise HTTPException(status_code=409, detail=f"sweep is {res.outcome}")
+
+    assert res.run is not None and res.sweep_run is not None and res.params is not None
+    if body.dataset_id is not None:
+        _add_lineage_edge(db, principal.project_id, "dataset", body.dataset_id, "run", res.run.id, "trained_on")
+
+    return {
+        "sweep_id": sweep_id,
+        "trial_index": res.sweep_run.trial_index,
+        "hyperparams": res.params,
+        "run": render_run(db, _store(request), res.run),
+    }
+
+
+@router.post("/sweeps/{sweep_id}/stop")
+def stop_sweep_compat(sweep_id: str, db: DbSession, principal: MemberAuth) -> dict[str, Any]:
+    sweep = _get_compat_sweep_or_404(db, principal.project_id, sweep_id)
+    sweep_service.patch_sweep_status(db, sweep, "stopped")
+    out = _compat_sweep_out(sweep)
+    out["stopped"] = True
+    return out
+
