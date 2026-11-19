@@ -53,7 +53,9 @@ T2 (auth, migração de usuários), T3 (auth/rotas), T6 (webhooks → SSRF), T7 
 - **`main` continua andando** (é a linha de trabalho do usuário): `git fetch` antes de cada tarefa e antes do PR; se aparecer commit novo, ele é incorporado na T2 ou reportado.
 - **Tamanho:** o merge toca ~290 arquivos; por isso T2 vem antes e a suíte do branch precisa ficar verde a cada tarefa.
 
-## Status (2026-11-19)
+## Status (2026-11-19 — pausado no branch `feat/reconciliacao-t5-t13`)
 
-- **Feitas:** T1, T2, T3, T4.
-- **Pendentes (passadas ao Antigravity):** T5, T6, T7, T8, T9, T10, T11, T12, T13. Especificações em `tasks/` e visão geral em `HANDOFF.md`.
+- **Feitas e verificadas:** T1, T2, T3, T4, **T5**, **T6**, **T7**, **T8**, migração **`0009`** (provada em PostgreSQL 15: `upgrade head`, `alembic check`, `downgrade base`, `upgrade head`), **T10 (SDK Python)**.
+- **Em andamento (WIP salvo em commit):** **T9 (Web)** — telas de Sweeps, Registry/Webhooks, Lineage limitada, selos `Simulado` e `Não avaliado` e migração para API canônica escritas; falta finalizar `tsc --noEmit`, `vitest run`, `next build`, `t9-notes.md` e então remover `api/mlops_compat.py` (inlining `mlops/compat.py` na `0008`).
+- **Pendentes:** finalização de T9 + remoção `mlops_compat`, T11 (CI/compose/e2e), T12 (revisão final), T13 (verificação final e Gate 2).
+
