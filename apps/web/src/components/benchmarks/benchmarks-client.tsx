@@ -22,7 +22,8 @@ import type {
   BenchmarkRun,
   BenchmarkSuite,
 } from "@/lib/types";
-import { Mono, PageHeader, scoreTone, Skeleton } from "@/components/ui";
+import { Mono, PageHeader, scoreTone, SimulatedBadge, Skeleton } from "@/components/ui";
+import { proxy } from "@/lib/proxy-client";
 import { LaunchBenchmarkModal } from "./launch-benchmark-modal";
 import { BreakdownDrawer } from "./breakdown-drawer";
 import { BenchmarkVisualComparison } from "./radar-chart";
@@ -138,10 +139,8 @@ export function BenchmarksClient({
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch("/api/proxy/api/v1/benchmarks/runs");
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = (await res.json()) as { items: BenchmarkRun[] };
-      setRuns(data.items || []);
+      const data = await proxy<{ items: BenchmarkRun[] }>("GET", "benchmarks/runs");
+      setRuns(data?.items || []);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load benchmark runs.");
     } finally {
@@ -600,9 +599,14 @@ export function BenchmarksClient({
 
                             {/* Runner Engine Column */}
                             <td className="px-3 py-2 text-zinc-300">
-                              <span className="rounded border border-zinc-700/80 bg-zinc-900 px-1.5 py-0.5 text-[10px] uppercase">
-                                {run.runner_backend || "vllm"}
-                              </span>
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                <span className="rounded border border-zinc-700/80 bg-zinc-900 px-1.5 py-0.5 text-[10px] uppercase">
+                                  {run.runner_backend || "vllm"}
+                                </span>
+                                {(run.simulated === true || run.runner_backend === "local_sim") && (
+                                  <SimulatedBadge reason={run.runner_backend || "local_sim"} />
+                                )}
+                              </div>
                             </td>
 
                             {/* Status Column */}

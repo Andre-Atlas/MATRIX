@@ -193,17 +193,28 @@ export function summarizeScan(
     };
   });
 
+  const isNotEvaluated =
+    scan.status === "not_evaluated" ||
+    scan.risk_level === "not_evaluated" ||
+    (scan.safety_score === null && (scan as any).global_score == null);
+
   const probesPassed = scan.probes_passed ?? (scan as any).passed_count ?? 0;
   const probesFailed = scan.probes_failed ?? (scan as any).failed_count ?? 0;
   const totalProbes = scan.total_probes ?? probesPassed + probesFailed;
-  const safetyScore =
-    scan.safety_score ??
-    (scan as any).global_score ??
-    calculateSafetyScore(totalProbes, probesPassed, scanFindings);
-  const riskLevel = scan.risk_level ?? getRiskLevel(safetyScore);
+  const safetyScore: number | null = isNotEvaluated
+    ? null
+    : scan.safety_score ??
+      (scan as any).global_score ??
+      calculateSafetyScore(totalProbes, probesPassed, scanFindings);
+  const riskLevel: RiskLevel = isNotEvaluated
+    ? "not_evaluated"
+    : scan.risk_level ?? getRiskLevel(safetyScore ?? 0);
 
-  const complianceRate =
-    totalProbes > 0 ? Math.round((probesPassed / totalProbes) * 100) : 100;
+  const complianceRate: number | null = isNotEvaluated
+    ? null
+    : totalProbes > 0
+      ? Math.round((probesPassed / totalProbes) * 100)
+      : 100;
 
   const summary: SafetyScanSummary = {
     total_probes: totalProbes,
@@ -216,6 +227,9 @@ export function summarizeScan(
     high_count: high,
     medium_count: medium,
     low_count: low,
+    not_evaluated: isNotEvaluated,
+    simulated: Boolean(scan.simulated),
+    message: scan.message ?? null,
   };
 
   return {
@@ -227,6 +241,7 @@ export function summarizeScan(
       probes_failed: probesFailed,
       safety_score: safetyScore,
       risk_level: riskLevel,
+      simulated: Boolean(scan.simulated),
     },
     category_scores: categoryScores,
     findings: scanFindings,
@@ -249,23 +264,37 @@ export function adaptSafetyCategories(rawCategories: any[] = []): SafetyCategory
 
 export function adaptSafetyScan(s: any): SafetyScan {
   const id = String(s?.id ?? s?.scan_id ?? "");
+  const status = s?.status ?? "completed";
+  const isNotEvaluated =
+    status === "not_evaluated" ||
+    s?.risk_level === "not_evaluated" ||
+    (s?.safety_score === null && s?.global_score === null);
   const probesPassed = s?.probes_passed ?? s?.passed_count ?? 0;
   const probesFailed = s?.probes_failed ?? s?.failed_count ?? 0;
   const totalProbes = s?.total_probes ?? probesPassed + probesFailed;
-  const safetyScore = s?.safety_score ?? s?.global_score ?? 100;
-  const riskLevel = s?.risk_level ?? getRiskLevel(safetyScore);
+  const rawScore = s?.safety_score ?? s?.global_score;
+  const safetyScore: number | null = isNotEvaluated
+    ? null
+    : typeof rawScore === "number"
+      ? rawScore
+      : 100;
+  const riskLevel: RiskLevel = isNotEvaluated
+    ? "not_evaluated"
+    : s?.risk_level ?? getRiskLevel(safetyScore ?? 0);
 
   return {
     ...s,
     id,
     name: s?.name || `Audit ${id.slice(0, 8)}`,
     target_model: s?.target_model ?? "gpt-4o-mini",
-    status: s?.status ?? "completed",
+    status,
     safety_score: safetyScore,
     probes_passed: probesPassed,
     probes_failed: probesFailed,
     total_probes: totalProbes,
     risk_level: riskLevel,
+    simulated: Boolean(s?.simulated),
+    message: s?.message ?? null,
     categories_tested: s?.categories_tested ?? [],
     findings_count: s?.findings_count ?? s?.failed_count ?? probesFailed,
     created_at: s?.created_at ?? new Date().toISOString(),
@@ -381,6 +410,13 @@ export function formatRiskLevel(risk?: RiskLevel | string) {
         badge: "bg-red-950/60 text-red-300 border-red-800/60",
         color: "text-red-400",
         stroke: "#ef4444",
+      };
+    case "not_evaluated":
+      return {
+        label: "Not evaluated",
+        badge: "bg-zinc-900 text-zinc-200 border-zinc-600",
+        color: "text-zinc-300",
+        stroke: "#71717a",
       };
     default:
       return {

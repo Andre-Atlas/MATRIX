@@ -2,6 +2,7 @@
 
 import React, { useEffect, useRef, useState } from "react";
 import { PRIMARY_BTN_CLASS } from "@/lib/mlops-tokens";
+import { proxy } from "@/lib/proxy-client";
 import type { DatasetCommit, RevertBranchRequest } from "@/lib/types";
 
 export interface RevertConfirmDialogProps {
@@ -61,18 +62,11 @@ export function RevertConfirmDialog({
         message: message.trim() || undefined,
       };
 
-      const res = await fetch(`/api/proxy/api/v1/datasets/${encodeURIComponent(datasetId)}/revert`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({ detail: "Failed to revert branch" }));
-        throw new Error(errData.detail || `Server returned HTTP ${res.status}`);
-      }
-
-      const newCommit: DatasetCommit = await res.json();
+      const newCommit = await proxy<DatasetCommit>(
+        "POST",
+        `datasets/${encodeURIComponent(datasetId)}/revert`,
+        payload,
+      );
       onReverted(newCommit);
       onClose();
     } catch (err) {

@@ -124,7 +124,7 @@ export function TrainingStudioClient({
       try {
         const res = await proxy<TrainingMetricSeries>(
           "GET",
-          `/api/v1/mlops/runs/${encodeURIComponent(runId)}/metrics`,
+          `runs/${encodeURIComponent(runId)}/metrics`,
         );
         setSeriesByRun((prev) => ({
           ...prev,
@@ -167,7 +167,7 @@ export function TrainingStudioClient({
       try {
         const detail = await proxy<SweepDetail>(
           "GET",
-          `/api/v1/mlops/sweeps/${encodeURIComponent(sweepId)}`,
+          `sweeps/${encodeURIComponent(sweepId)}`,
         );
         setSweepDetailById((prev) => ({ ...prev, [sweepId]: detail }));
       } catch (err) {
@@ -197,8 +197,8 @@ export function TrainingStudioClient({
     setError(null);
     try {
       const [runsResp, sweepsResp] = await Promise.all([
-        proxy<ListResponse<TrainingRun>>("GET", "/api/v1/mlops/runs?limit=100"),
-        proxy<ListResponse<MLOpsSweep>>("GET", "/api/v1/mlops/sweeps"),
+        proxy<ListResponse<TrainingRun>>("GET", "runs?limit=100"),
+        proxy<ListResponse<MLOpsSweep>>("GET", "sweeps"),
       ]);
       const nextRuns = Array.isArray(runsResp?.items) ? runsResp.items : [];
       const nextSweeps = Array.isArray(sweepsResp?.items) ? sweepsResp.items : [];

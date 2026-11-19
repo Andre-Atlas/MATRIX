@@ -73,7 +73,7 @@ export function RegisterModelModal({ open, run, onClose }: RegisterModelModalPro
 
     let cancelled = false;
     setLoadingModels(true);
-    proxy<ListResponse<RegisteredModel>>("GET", "/api/v1/mlops/models")
+    proxy<ListResponse<RegisteredModel>>("GET", "mlops/models")
       .then((res) => {
         if (cancelled) return;
         const items = Array.isArray(res?.items) ? res.items : [];
@@ -130,7 +130,7 @@ export function RegisterModelModal({ open, run, onClose }: RegisterModelModalPro
           base_model: run?.base_model ?? null,
           tags: run?.tags ?? [],
         };
-        const createdModel = await proxy<RegisteredModel>("POST", "/api/v1/mlops/models", createReq);
+        const createdModel = await proxy<RegisteredModel>("POST", "mlops/models", createReq);
         targetModelId = createdModel.id;
         targetModelName = createdModel.name;
       } else if (!targetModelId) {
@@ -148,7 +148,7 @@ export function RegisterModelModal({ open, run, onClose }: RegisterModelModalPro
       };
       const ver = await proxy<ModelVersion>(
         "POST",
-        `/api/v1/mlops/models/${encodeURIComponent(targetModelId)}/versions`,
+        `mlops/models/${encodeURIComponent(targetModelId)}/versions`,
         versionReq,
       );
 

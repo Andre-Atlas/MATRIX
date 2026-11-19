@@ -2,6 +2,7 @@
 
 import React, { useEffect, useRef, useState } from "react";
 import { PRIMARY_BTN_CLASS } from "@/lib/mlops-tokens";
+import { proxy } from "@/lib/proxy-client";
 import type { CreateDatasetBranchRequest, DatasetBranch } from "@/lib/types";
 
 export interface NewBranchModalProps {
@@ -76,18 +77,11 @@ export function NewBranchModal({
         from_branch: fromBranch,
       };
 
-      const res = await fetch(`/api/proxy/api/v1/datasets/${encodeURIComponent(datasetId)}/branches`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({ detail: "Failed to create branch" }));
-        throw new Error(errData.detail || `Server returned HTTP ${res.status}`);
-      }
-
-      const created: DatasetBranch = await res.json();
+      const created = await proxy<DatasetBranch>(
+        "POST",
+        `datasets/${encodeURIComponent(datasetId)}/branches`,
+        payload,
+      );
       onBranchCreated(created);
       onClose();
     } catch (err) {

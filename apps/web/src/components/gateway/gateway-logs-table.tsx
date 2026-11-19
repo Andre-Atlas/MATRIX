@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from "react";
 import type { GatewayLogEntry, GatewayLogStatus } from "@/lib/types";
+import { SimulatedBadge } from "@/components/ui";
 import {
   filterGatewayLogs,
   formatLatencyMs,
@@ -239,9 +240,14 @@ export function GatewayLogsTable({ logs }: GatewayLogsTableProps) {
 
                     {/* Provider */}
                     <td className="py-2.5 px-3 align-middle">
-                      <span className="rounded bg-zinc-800/90 px-1.5 py-0.5 text-[10px] text-zinc-300 uppercase">
-                        {log.provider}
-                      </span>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="rounded bg-zinc-800/90 px-1.5 py-0.5 text-[10px] text-zinc-300 uppercase">
+                          {log.provider}
+                        </span>
+                        {(log.simulated === true || log.provider.toLowerCase() === "mock") && (
+                          <SimulatedBadge reason="mock gateway" />
+                        )}
+                      </div>
                     </td>
 
                     {/* Tokens */}

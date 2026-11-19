@@ -179,6 +179,17 @@ export function LineageDagTab({ lineage, loading = false }: LineageDagTabProps) 
 
   return (
     <div className="space-y-3">
+      {lineage.truncated && (
+        <div
+          role="alert"
+          className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-600/80 bg-amber-950/50 px-3.5 py-2.5 text-xs text-amber-200"
+        >
+          <span>
+            <strong>Graph truncated:</strong> This lineage view reached the 500-node safety limit.
+            Open the full Lineage Explorer to narrow direction or depth.
+          </span>
+        </div>
+      )}
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-400">
           <span>

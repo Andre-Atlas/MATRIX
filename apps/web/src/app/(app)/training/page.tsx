@@ -26,8 +26,8 @@ export default async function TrainingPage({ searchParams }: TrainingPageProps) 
 
   try {
     const [runsResp, sweepsResp] = await Promise.all([
-      apiGet<ListResponse<TrainingRun>>("/api/v1/mlops/runs", { limit: 100 }),
-      apiGet<ListResponse<MLOpsSweep>>("/api/v1/mlops/sweeps"),
+      apiGet<ListResponse<TrainingRun>>("/api/v1/runs", { limit: 100 }),
+      apiGet<ListResponse<MLOpsSweep>>("/api/v1/sweeps"),
     ]);
     runs = Array.isArray(runsResp?.items) ? runsResp.items : [];
     sweeps = Array.isArray(sweepsResp?.items) ? sweepsResp.items : [];
@@ -51,7 +51,7 @@ export default async function TrainingPage({ searchParams }: TrainingPageProps) 
   if (candidateRunIds.length > 0) {
     const seriesResults = await Promise.allSettled(
       candidateRunIds.map((id) =>
-        apiGet<TrainingMetricSeries>(`/api/v1/mlops/runs/${encodeURIComponent(id)}/metrics`),
+        apiGet<TrainingMetricSeries>(`/api/v1/runs/${encodeURIComponent(id)}/metrics`),
       ),
     );
     for (const res of seriesResults) {
@@ -65,7 +65,7 @@ export default async function TrainingPage({ searchParams }: TrainingPageProps) 
   if (sweeps.length > 0) {
     try {
       initialSweepDetail = await apiGet<SweepDetail>(
-        `/api/v1/mlops/sweeps/${encodeURIComponent(sweeps[0].id)}`,
+        `/api/v1/sweeps/${encodeURIComponent(sweeps[0].id)}`,
       );
     } catch {
       initialSweepDetail = null;

@@ -46,6 +46,63 @@ export function StatusBadge({ status }: { status: "ok" | "error" | "unset" }) {
   );
 }
 
+/**
+ * Visible, accessible badge for simulated results (local_sim benchmarks, fake sandboxes,
+ * mock gateway, simulated_outputs safety scans, pca-lite/demo vectors).
+ * Never color-only: always renders an icon + explicit "Simulated" text label.
+ */
+export function SimulatedBadge({
+  reason,
+  label = "Simulated",
+  className = "",
+}: {
+  reason?: string;
+  label?: string;
+  className?: string;
+}) {
+  const fullLabel = reason ? `${label} (${reason})` : label;
+  return (
+    <span
+      role="status"
+      aria-label={fullLabel}
+      title={fullLabel}
+      className={`inline-flex shrink-0 items-center gap-1 rounded border border-amber-500/70 bg-amber-950/70 px-1.5 py-0.5 text-[11px] font-semibold leading-4 text-amber-200 ${className}`}
+    >
+      <svg
+        aria-hidden="true"
+        viewBox="0 0 16 16"
+        fill="currentColor"
+        className="h-3 w-3 shrink-0 text-amber-300"
+      >
+        <path d="M6 2a1 1 0 0 0 0 2h.5v2.764l-3.31 5.516A1.5 1.5 0 0 0 4.476 14.5h7.048a1.5 1.5 0 0 0 1.286-2.22L9.5 6.764V4h.5a1 1 0 1 0 0-2H6Zm2 5.236 2.758 4.597a.25.25 0 0 1-.214.37H5.456a.25.25 0 0 1-.214-.37L8 7.236Z" />
+      </svg>
+      <span>{label}</span>
+    </span>
+  );
+}
+
+/** Visible, accessible badge for scans or evaluations that were not evaluated (no target). */
+export function NotEvaluatedBadge({
+  label = "Not evaluated",
+  className = "",
+}: {
+  label?: string;
+  className?: string;
+}) {
+  return (
+    <span
+      role="status"
+      aria-label={label}
+      className={`inline-flex shrink-0 items-center gap-1 rounded border border-zinc-600 bg-zinc-900 px-2 py-0.5 text-[11px] font-semibold leading-4 text-zinc-200 ${className}`}
+    >
+      <span aria-hidden="true" className="font-mono text-zinc-400">
+        ⊘
+      </span>
+      <span>{label}</span>
+    </span>
+  );
+}
+
 /** Scores are 0..1 by convention: < 0.5 red, < 0.8 amber, otherwise neutral-good. */
 export function scoreTone(v: number): string {
   if (v < 0.5) return "text-red-300";

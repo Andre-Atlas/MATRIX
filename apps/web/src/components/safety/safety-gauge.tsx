@@ -2,13 +2,17 @@
 
 import { formatRiskLevel } from "@/lib/safety";
 import type { RiskLevel, SafetyScanSummary } from "@/lib/types";
+import { NotEvaluatedBadge, SimulatedBadge } from "@/components/ui";
 
 export interface SafetyGaugeProps {
-  score: number;
+  score: number | null;
   riskLevel: RiskLevel;
   summary: SafetyScanSummary;
   scanName?: string;
   targetModel?: string;
+  simulated?: boolean;
+  notEvaluated?: boolean;
+  message?: string | null;
 }
 
 export function SafetyGauge({
@@ -17,15 +21,20 @@ export function SafetyGauge({
   summary,
   scanName,
   targetModel,
+  simulated,
+  notEvaluated,
+  message,
 }: SafetyGaugeProps) {
-  const riskInfo = formatRiskLevel(riskLevel);
+  const isNotEvaluated = notEvaluated || score === null || riskLevel === "not_evaluated";
+  const riskInfo = formatRiskLevel(isNotEvaluated ? "not_evaluated" : riskLevel);
 
   // SVG Gauge calculations (semi-circular / 240 degree arc)
   const radius = 68;
   const circumference = 2 * Math.PI * radius;
   // Use a 240-degree gauge (from -210 deg to 30 deg)
   const arcLength = circumference * (240 / 360);
-  const strokeOffset = arcLength - (arcLength * Math.max(0, Math.min(100, score))) / 100;
+  const numericScore = isNotEvaluated ? 0 : Math.max(0, Math.min(100, score ?? 0));
+  const strokeOffset = arcLength - (arcLength * numericScore) / 100;
 
   return (
     <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-5 shadow-sm">
@@ -38,7 +47,8 @@ export function SafetyGauge({
               viewBox="0 0 160 160"
               role="meter"
               aria-label="Global Safety Score"
-              aria-valuenow={score}
+              aria-valuenow={isNotEvaluated ? undefined : numericScore}
+              aria-valuetext={isNotEvaluated ? "Not evaluated" : `${numericScore}%`}
               aria-valuemin={0}
               aria-valuemax={100}
             >
@@ -55,45 +65,65 @@ export function SafetyGauge({
                 transform="rotate(150 80 80)"
               />
               {/* Active colored score arc */}
-              <circle
-                cx="80"
-                cy="80"
-                r={radius}
-                stroke={riskInfo.stroke}
-                strokeWidth="12"
-                fill="transparent"
-                strokeDasharray={`${arcLength} ${circumference}`}
-                strokeDashoffset={strokeOffset}
-                strokeLinecap="round"
-                transform="rotate(150 80 80)"
-                className="transition-all duration-700 ease-out"
-              />
+              {!isNotEvaluated && (
+                <circle
+                  cx="80"
+                  cy="80"
+                  r={radius}
+                  stroke={riskInfo.stroke}
+                  strokeWidth="12"
+                  fill="transparent"
+                  strokeDasharray={`${arcLength} ${circumference}`}
+                  strokeDashoffset={strokeOffset}
+                  strokeLinecap="round"
+                  transform="rotate(150 80 80)"
+                  className="transition-all duration-700 ease-out"
+                />
+              )}
             </svg>
 
             {/* Inner Content */}
             <div className="absolute inset-0 flex flex-col items-center justify-center text-center">
-              <span className="font-mono text-3xl font-extrabold tracking-tight text-zinc-100">
-                {score}
-                <span className="text-lg font-medium text-zinc-400">%</span>
-              </span>
-              <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-400">
-                Safety Score
-              </span>
+              {isNotEvaluated ? (
+                <>
+                  <span className="font-mono text-2xl font-bold tracking-tight text-zinc-300">
+                    —
+                  </span>
+                  <span className="mt-0.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-400">
+                    Not evaluated
+                  </span>
+                </>
+              ) : (
+                <>
+                  <span className="font-mono text-3xl font-extrabold tracking-tight text-zinc-100">
+                    {score}
+                    <span className="text-lg font-medium text-zinc-400">%</span>
+                  </span>
+                  <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-400">
+                    Safety Score
+                  </span>
+                </>
+              )}
             </div>
           </div>
 
           <div className="mt-3 text-center sm:mt-0 sm:text-left">
-            <div className="flex items-center justify-center gap-2 sm:justify-start">
-              <span
-                className={`inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-semibold ${riskInfo.badge}`}
-              >
+            <div className="flex flex-wrap items-center justify-center gap-2 sm:justify-start">
+              {isNotEvaluated ? (
+                <NotEvaluatedBadge />
+              ) : (
                 <span
-                  className="mr-1.5 h-1.5 w-1.5 rounded-full"
-                  style={{ backgroundColor: riskInfo.stroke }}
-                  aria-hidden
-                />
-                {riskInfo.label}
-              </span>
+                  className={`inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-semibold ${riskInfo.badge}`}
+                >
+                  <span
+                    className="mr-1.5 h-1.5 w-1.5 rounded-full"
+                    style={{ backgroundColor: riskInfo.stroke }}
+                    aria-hidden
+                  />
+                  {riskInfo.label}
+                </span>
+              )}
+              {simulated && <SimulatedBadge reason="simulated_outputs" />}
               <span className="text-xs text-zinc-400">
                 OWASP LLM 2025
               </span>
@@ -111,11 +141,17 @@ export function SafetyGauge({
               </div>
             )}
 
+            {isNotEvaluated && message && (
+              <p className="mt-2 max-w-md rounded border border-zinc-700 bg-zinc-950/70 px-2.5 py-1.5 text-xs text-zinc-300">
+                {message}
+              </p>
+            )}
+
             <div className="mt-2 flex items-center justify-center gap-4 text-xs sm:justify-start">
               <div>
                 <span className="text-zinc-400">Compliance: </span>
                 <span className="font-mono font-semibold text-zinc-200">
-                  {summary.compliance_rate}%
+                  {summary.compliance_rate === null ? "Not evaluated" : `${summary.compliance_rate}%`}
                 </span>
               </div>
               <span className="text-zinc-700">•</span>

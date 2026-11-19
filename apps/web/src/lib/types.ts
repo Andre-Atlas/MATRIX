@@ -613,6 +613,10 @@ export type VectorProjectionResponse = {
   dimensions: 2 | 3;
   total_points: number;
   reduction_method: "umap" | "tsne" | "pca";
+  engine?: string;
+  embedding?: string;
+  simulated?: boolean;
+  metadata?: Record<string, unknown>;
 };
 
 export type VectorDriftResponse = {
@@ -631,11 +635,16 @@ export type VectorDriftResponse = {
     psi: number;
     centroid_cosine: number;
   }[];
+  engine?: string;
+  embedding?: string;
+  simulated?: boolean;
+  mode?: string;
+  metadata?: Record<string, unknown>;
 };
 
 // ── Safety & OWASP LLM Top 10 (Trilha C) ──
 
-export type RiskLevel = "low" | "medium" | "high" | "critical";
+export type RiskLevel = "low" | "medium" | "high" | "critical" | "not_evaluated";
 
 export type ComplianceStatus = "compliant" | "needs_review" | "vulnerable";
 
@@ -715,7 +724,14 @@ export type SafetyCategoryScore = {
   critical_findings: number;
 };
 
-export type SafetyScanStatus = "queued" | "running" | "completed" | "failed" | "passed" | "warning";
+export type SafetyScanStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "passed"
+  | "warning"
+  | "not_evaluated";
 
 export type SafetyScan = {
   id: string;
@@ -731,10 +747,12 @@ export type SafetyScan = {
   probes_failed: number;
   failed_count?: number;
   pass_rate?: number;
-  safety_score: number; // 0 to 100
-  global_score?: number;
+  safety_score: number | null; // 0 to 100, or null when not_evaluated
+  global_score?: number | null;
   risk_level: RiskLevel;
   findings_count: number;
+  simulated?: boolean;
+  message?: string | null;
   created_at: string;
   completed_at?: string;
   duration_ms?: number;
@@ -744,13 +762,16 @@ export type SafetyScanSummary = {
   total_probes: number;
   passed: number;
   failed: number;
-  compliance_rate: number; // 0 to 100
-  score: number; // 0 to 100
+  compliance_rate: number | null; // 0 to 100, or null when not_evaluated
+  score: number | null; // 0 to 100, or null when not_evaluated
   risk_level: RiskLevel;
   critical_count: number;
   high_count: number;
   medium_count: number;
   low_count: number;
+  not_evaluated?: boolean;
+  simulated?: boolean;
+  message?: string | null;
 };
 
 export type SafetyScanReport = {
@@ -882,6 +903,7 @@ export type GatewayLogEntry = {
   cache_score?: number | null;
   error_message?: string | null;
   client_ip?: string;
+  simulated?: boolean;
 };
 
 export type GatewayStatsResponse = GatewayStats;
@@ -1138,6 +1160,10 @@ export type LineageEdge = {
 export type LineageGraph = {
   run_id?: string;
   model_id?: string;
+  root?: string;
+  direction?: "up" | "down" | "both";
+  depth?: number;
+  truncated?: boolean;
   nodes: LineageNode[];
   edges: LineageEdge[];
 };
@@ -1385,6 +1411,7 @@ export type BenchmarkRun = {
   summary_metrics: Record<string, unknown>;
   job_id: string | null;
   error: string | null;
+  simulated?: boolean;
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
@@ -1452,7 +1479,7 @@ export type SandboxTaskTranscript = {
   project_id?: string;
   sandbox_run_id: string;
   task_key: string;
-  status: "passed" | "failed" | "error" | "timeout";
+  status: "passed" | "failed" | "error" | "timeout" | "oom";
   score: number;
   scorer_details?: Record<string, unknown>;
   steps?: SandboxStep[];
@@ -1461,6 +1488,7 @@ export type SandboxTaskTranscript = {
   input_tokens: number;
   output_tokens: number;
   error?: string | null;
+  simulated?: boolean;
   created_at: string;
 };
 
@@ -1468,13 +1496,13 @@ export type SandboxRun = {
   id: string;
   project_id: string;
   name: string;
-  runner_backend: "docker" | "local_sandbox" | string;
+  runner_backend: "docker" | "fake" | "local_sandbox" | string;
   dataset_id: string | null;
   dataset_commit_id: string | null;
   solver_config: Record<string, unknown>;
   scorer_config: Record<string, unknown>;
   sandbox_policy: Record<string, unknown>;
-  status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  status: "queued" | "running" | "completed" | "failed" | "cancelled" | "sandbox_unavailable";
   pass_rate: number | null;
   total_tasks: number;
   passed_tasks: number;
@@ -1482,6 +1510,7 @@ export type SandboxRun = {
   total_cost_usd: number;
   job_id: string | null;
   error: string | null;
+  simulated?: boolean;
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
@@ -1588,5 +1617,107 @@ export type RevertBranchRequest = {
   message?: string | null;
   author?: string | null;
 };
+
+// ── Canonical Sweeps (Contract G2 /api/v1/sweeps) ─────────────────────────
+
+export type CanonicalSweepParam =
+  | { type: "choice"; values: (string | number | boolean | null)[] }
+  | { type: "int"; min: number; max: number; step?: number; log?: boolean }
+  | { type: "float"; min: number; max: number; log?: boolean; q?: number }
+  | { type: "constant"; value: unknown };
+
+export type CanonicalSweepEarlyStop = {
+  type: "hyperband" | "asha";
+  min_iter: number;
+  max_iter?: number;
+  eta?: number;
+};
+
+export type CanonicalSweepConfig = {
+  method: "grid" | "random" | "tpe";
+  metric: { key: string; goal: "minimize" | "maximize" };
+  parameters: Record<string, CanonicalSweepParam>;
+  early_stop?: CanonicalSweepEarlyStop | null;
+  max_runs?: number;
+  seed?: number;
+};
+
+export type CanonicalSweepStatus = "running" | "paused" | "finished" | "stopped";
+
+export type CanonicalSweep = {
+  id: string;
+  name: string;
+  description?: string | null;
+  status: CanonicalSweepStatus;
+  config: CanonicalSweepConfig;
+  created_at: string;
+  created_by: string | null;
+  run_count: number;
+  best_run_id: string | null;
+  best_value: number | null;
+};
+
+export type CanonicalSweepRun = {
+  run_id: string;
+  status: string;
+  params: Record<string, unknown>;
+  last_value: number | null;
+  best_value: number | null;
+  pruned: boolean;
+  step: number | null;
+};
+
+export type CanonicalSweepDetail = {
+  sweep: CanonicalSweep;
+  runs: CanonicalSweepRun[];
+  importance: Record<string, number>[] | null;
+  importance_note?: string | null;
+};
+
+// ── Canonical Registry Extensions (Contract G3 / T6) ──────────────────────
+
+export type ModelStageHistoryItem = {
+  id: string;
+  project_id: string;
+  model_id: string;
+  version: number;
+  from_stage: ModelStage;
+  to_stage: ModelStage;
+  actor_kind: string;
+  actor_id: string;
+  comment: string | null;
+  ts: string;
+};
+
+export type ModelWebhookEvent = "version.created" | "stage.changed" | "alias.moved";
+
+export type ModelWebhook = {
+  id: string;
+  project_id: string;
+  model_id: string;
+  url: string;
+  events: ModelWebhookEvent[];
+  active: boolean;
+  created_by: string | null;
+  created_at: string;
+  /** Returned ONCE on creation (201), never again. */
+  secret?: string;
+};
+
+export type WebhookDelivery = {
+  id: string;
+  project_id: string;
+  webhook_id: string;
+  model_id: string;
+  event: string;
+  status: "queued" | "delivered" | "failed" | string;
+  attempts: number;
+  last_status_code: number | null;
+  last_error: string | null;
+  created_at: string;
+  last_attempt_at: string | null;
+  delivered_at: string | null;
+};
+
 
 

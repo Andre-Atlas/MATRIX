@@ -2,12 +2,14 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { adaptSafetyFindings, adaptSafetyScan, summarizeScan } from "@/lib/safety";
+import { proxy } from "@/lib/proxy-client";
 import type {
   SafetyCategory,
   SafetyFinding,
   SafetyScan,
   SafetyScanReport,
 } from "@/lib/types";
+import { NotEvaluatedBadge, SimulatedBadge } from "@/components/ui";
 import { FindingsTable } from "./findings-table";
 import { NewScanModal } from "./new-scan-modal";
 import { OwaspMatrix } from "./owasp-matrix";
@@ -48,8 +50,7 @@ export function SafetyDashboard({
     if (hasFindingsForScan) return;
 
     let cancelled = false;
-    fetch(`/api/proxy/safety/scans/${encodeURIComponent(selectedScanId)}`)
-      .then((res) => (res.ok ? res.json() : null))
+    proxy<any>("GET", `safety/scans/${encodeURIComponent(selectedScanId)}`)
       .then((data) => {
         if (cancelled || !data) return;
         const rawFindings = Array.isArray(data.findings) ? data.findings : [];
@@ -133,13 +134,21 @@ export function SafetyDashboard({
             }}
             className="rounded border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs font-semibold text-zinc-100 focus:border-emerald-500 focus:outline-none"
           >
-            {scans.map((s) => (
-              <option key={s.id} value={s.id}>
-                {s.name || s.id.slice(0, 8)} ({s.safety_score ?? (s as any).global_score ?? 100}% — {s.target_model})
-              </option>
-            ))}
+            {scans.map((s) => {
+              const scoreLabel =
+                s.status === "not_evaluated" || (s.safety_score ?? s.global_score) == null
+                  ? "Not evaluated"
+                  : `${s.safety_score ?? s.global_score}%`;
+              return (
+                <option key={s.id} value={s.id}>
+                  {s.name || s.id.slice(0, 8)} ({scoreLabel} — {s.target_model})
+                </option>
+              );
+            })}
           </select>
-          <span className="text-xs text-zinc-500 font-mono">
+          {activeScan.simulated === true && <SimulatedBadge reason="simulated_outputs" />}
+          {activeScan.status === "not_evaluated" && <NotEvaluatedBadge />}
+          <span className="text-xs text-zinc-400 font-mono">
             {new Date(activeScan.created_at).toLocaleDateString()}
           </span>
         </div>
@@ -161,6 +170,9 @@ export function SafetyDashboard({
         summary={activeReport.summary}
         scanName={activeScan.name || activeScan.id.slice(0, 8)}
         targetModel={activeScan.target_model}
+        simulated={activeScan.simulated}
+        notEvaluated={activeScan.status === "not_evaluated" || activeReport.summary.score === null}
+        message={activeScan.message}
       />
 
       {/* OWASP LLM Top 10 Matrix */}
