@@ -559,15 +559,18 @@ def test_model_version_files_download(env):
 
     blob = b"lora-adapter-safetensors-bytes"
     sha = hashlib.sha256(blob).hexdigest()
-    presign = client.post(
-        "/api/v1/mlops/artifacts/presign-upload",
-        headers=member_a,
-        json={"name": "adapter.safetensors", "kind": "lora_adapter", "sha256": sha, "size_bytes": len(blob)},
+    upload = client.post(
+        "/api/v1/artifacts",
+        content=blob,
+        headers={
+            **member_a,
+            "x-filename": "adapter.safetensors",
+            "content-type": "application/octet-stream",
+            "x-sha256": sha,
+        },
     )
-    assert presign.status_code == 201, presign.text
-    art = presign.json()
-    assert client.put(art["upload_url"], content=blob, headers=member_a).status_code == 204
-    assert client.post(f"/api/v1/mlops/artifacts/{art['id']}/commit", headers=member_a).status_code == 200
+    assert upload.status_code == 201, upload.text
+    art = upload.json()
 
     mid = _create_model(client, member_a, "files-model")["id"]
     _create_version(client, member_a, mid, artifact_id=art["id"])

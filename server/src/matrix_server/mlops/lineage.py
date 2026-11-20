@@ -14,7 +14,6 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from matrix_server.artifacts.models import Artifact as BlobArtifact
-from matrix_server.mlops.compat import status_out
 from matrix_server.runs.models import Run
 from matrix_server.storage.models import (
     ArtifactLineage,
@@ -47,6 +46,11 @@ MAX_LINEAGE_NODES = 500
 DEFAULT_LINEAGE_DEPTH = 3
 MAX_LINEAGE_DEPTH = 10
 _IN_CHUNK = 250
+_STATUS_OUT = {"running": "running", "finished": "completed", "failed": "failed", "killed": "cancelled"}
+
+
+def _status_out(value: str) -> str:
+    return _STATUS_OUT.get(value, value)
 
 Direction = Literal["up", "down", "both"]
 
@@ -538,7 +542,7 @@ def _enrich_nodes(
         elif ntype == "run" and nid in runs_by_id:
             r = runs_by_id[nid]
             label = r.name
-            status = status_out(r.status)
+            status = _status_out(r.status)
             meta = {"run_type": r.run_type, "status": status, "base_model": r.base_model}
         elif ntype == "artifact" and nid in artifacts_by_id:
             a = artifacts_by_id[nid]

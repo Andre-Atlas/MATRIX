@@ -5,8 +5,7 @@
 - `merge_params`: immutable params (equal value is a no-op, a different one is a conflict).
 - `artifact_exists` / `load_artifacts`: the only code that reads the G0 `artifacts` table.
 - `reap_stale_runs` and `ensure_reaper_scheduled`: the `runs.reaper` job and its self-rescheduling.
-- `check_capacity`, `new_run` and `ingest_points`: run creation and point ingestion shared by the
-  G1 API and the deprecated `/api/v1/mlops/runs*` adapters (one path, one set of caps).
+- `check_capacity`, `new_run` and `ingest_points`: canonical run creation and point ingestion.
 """
 
 from __future__ import annotations

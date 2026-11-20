@@ -74,18 +74,29 @@ def _ok(resp, *codes):
 
 
 def _populate(client: TestClient, h: dict[str, str]) -> None:
-    run = _ok(client.post("/api/v1/mlops/runs", json={"name": "r", "classic_eval": {"f1": 0.5}}, headers=h))
+    run = _ok(client.post("/api/v1/runs", json={"name": "r"}, headers=h))
+    _ok(client.post(f"/api/v1/runs/{run['id']}/reports", json={"kind": "custom", "name": "classic_eval", "data": {"f1": 0.5}}, headers=h))
+    sha = hashlib.sha256(b"w").hexdigest()
+    art = _ok(
+        client.post(
+            "/api/v1/artifacts",
+            content=b"w",
+            headers={**h, "x-filename": "w", "content-type": "application/octet-stream", "x-sha256": sha, "x-owner-kind": "run", "x-owner-id": run["id"]},
+        )
+    )
     model = _ok(client.post("/api/v1/mlops/models", json={"name": "m"}, headers=h))
-    _ok(client.post(f"/api/v1/mlops/models/{model['id']}/versions", json={"run_id": run["id"]}, headers=h))
+    _ok(client.post(f"/api/v1/mlops/models/{model['id']}/versions", json={"run_id": run["id"], "artifact_id": art["id"]}, headers=h))
     _ok(client.post(f"/api/v1/mlops/models/{model['id']}/aliases", json={"alias": "candidate", "version": 1}, headers=h))
     sweep = {
-        "name": "s", "method": "random", "metric_name": "loss", "metric_goal": "minimize",
-        "search_space": {"lr": {"type": "float", "min": 1e-5, "max": 1e-2}}, "max_trials": 2,
+        "name": "s",
+        "config": {
+            "method": "random",
+            "metric": {"key": "loss", "goal": "minimize"},
+            "parameters": {"lr": {"type": "float", "min": 1e-5, "max": 1e-2}},
+            "max_runs": 2,
+        },
     }
-    _ok(client.post("/api/v1/mlops/sweeps", json=sweep, headers=h))
-    sha = hashlib.sha256(b"w").hexdigest()
-    _ok(client.post("/api/v1/mlops/artifacts/presign-upload",
-                    json={"name": "w", "sha256": sha, "size_bytes": 1, "run_id": run["id"]}, headers=h))
+    _ok(client.post("/api/v1/sweeps", json=sweep, headers=h))
 
     ds = _ok(client.post("/api/v1/datasets", json={"name": "d"}, headers=h))
     _ok(client.post(f"/api/v1/datasets/{ds['id']}/items", json={"input": {"q": "1"}}, headers=h))
@@ -144,18 +155,22 @@ def test_delete_project_removes_rows_of_every_main_module(app, monkeypatch):
 
 
 def _mlops_data(client: TestClient, h: dict[str, str]) -> tuple[list[str], str]:
-    """A run of each API with points (adapter and G1) and a committed blob; returns (run ids, sha)."""
-    run = _ok(client.post("/api/v1/mlops/runs", json={"name": "m", "hardware_info": {"gpu_count": 2}}, headers=h))
-    pts = [{"category": "train", "metric_name": "loss", "step": i, "value": 1.0 / (i + 1), "epoch": 0.1} for i in range(5)]
-    _ok(client.post(f"/api/v1/mlops/runs/{run['id']}/metrics", json={"points": pts}, headers=h))
+    """Canonical runs with metric points and a ready G0 blob linked to the run."""
+    run = _ok(client.post("/api/v1/runs", json={"name": "m", "env": {"platform": "linux"}}, headers=h))
+    pts = [{"key": "loss", "step": i, "value": 1.0 / (i + 1)} for i in range(5)]
+    _ok(client.post(f"/api/v1/runs/{run['id']}/metrics", json={"points": pts}, headers=h))
     g1 = _ok(client.post("/api/v1/runs", json={"name": "g"}, headers=h))
     _ok(client.post(f"/api/v1/runs/{g1['id']}/metrics", json={"points": [{"key": "acc", "step": 0, "value": 0.9}]}, headers=h))
     data = os.urandom(64)
     sha = hashlib.sha256(data).hexdigest()
-    art = _ok(client.post("/api/v1/mlops/artifacts/presign-upload",
-                          json={"name": "ckpt", "sha256": sha, "size_bytes": len(data), "run_id": run["id"]}, headers=h))
-    assert client.put(art["upload_url"], content=data, headers=h).status_code == 204
-    _ok(client.post(f"/api/v1/mlops/artifacts/{art['id']}/commit", headers=h))
+    art = _ok(
+        client.post(
+            "/api/v1/artifacts",
+            content=data,
+            headers={**h, "x-filename": "ckpt", "content-type": "application/octet-stream", "x-sha256": sha, "x-owner-kind": "run", "x-owner-id": run["id"]},
+        )
+    )
+    _ok(client.post(f"/api/v1/runs/{run['id']}/artifacts", json={"artifact_id": art["id"], "name": "ckpt", "kind": "model"}, headers=h))
     return [run["id"], g1["id"]], sha
 
 

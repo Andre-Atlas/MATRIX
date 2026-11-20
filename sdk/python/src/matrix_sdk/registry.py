@@ -306,6 +306,7 @@ class RegistryClient:
 
         mv = self.create_version(
             str(model["id"]),
+            artifact_id=str(artifact["id"]),
             run_id=resolved_run_id,
             lora_config=lora_config,
             signature=signature,

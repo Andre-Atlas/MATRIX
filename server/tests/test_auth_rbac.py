@@ -47,9 +47,9 @@ def env(tmp_path):
 READS = [
     "/api/v1/benchmarks/catalog",
     "/api/v1/benchmarks/runs",
-    "/api/v1/mlops/runs",
-    "/api/v1/mlops/sweeps",
-    "/api/v1/mlops/artifacts",
+    "/api/v1/runs",
+    "/api/v1/sweeps",
+    "/api/v1/artifacts",
     "/api/v1/mlops/models",
     "/api/v1/sandboxes/runs",
     "/api/v1/safety/scans",
@@ -85,7 +85,7 @@ def test_reads_need_viewer_and_stay_in_the_project(env, path):
 def test_member_writes_viewer_and_read_key_cannot(env):
     client, roles = env["client"], env["roles"]
     writes = [
-        ("/api/v1/mlops/runs", {"name": "r1"}),
+        ("/api/v1/runs", {"name": "r1"}),
         ("/api/v1/mlops/models", {"name": "m1"}),
         ("/api/v1/safety/scans", {"categories": ["LLM01"]}),
         ("/api/v1/sandboxes/runs", {"name": "s1"}),

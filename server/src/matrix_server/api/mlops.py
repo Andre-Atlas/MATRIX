@@ -152,6 +152,67 @@ def _get_artifact_or_404(db: Session, project_id: str, artifact_id: str) -> Arti
     return row
 
 
+def _resolve_or_bridge_artifact(
+    db: Session,
+    project_id: str,
+    artifact_id: str,
+    run_id: str | None,
+) -> Artifact:
+    """Resolve a ModelArtifact by ID, or bridge a ready G0 BlobArtifact into a committed ModelArtifact."""
+    row = db.scalars(select(Artifact).where(Artifact.id == artifact_id, Artifact.project_id == project_id)).first()
+    if row is not None:
+        return row
+
+    blob = db.scalars(
+        select(BlobArtifact).where(BlobArtifact.id == artifact_id, BlobArtifact.project_id == project_id)
+    ).first()
+    if blob is None:
+        raise HTTPException(status_code=404, detail="artifact not found")
+    if blob.status != "ready":
+        raise HTTPException(status_code=409, detail="artifact is not ready")
+
+    existing = db.scalars(
+        select(Artifact)
+        .where(Artifact.project_id == project_id, Artifact.artifact_id == blob.id)
+        .order_by(Artifact.created_at.desc(), Artifact.id.desc())
+    ).first()
+    if existing is not None:
+        if existing.run_id is None and run_id is not None:
+            existing.run_id = run_id
+        return existing
+
+    name = (blob.name or "artifact")[:200]
+    for attempt in range(MAX_CREATE_ATTEMPTS):
+        try:
+            with db.begin_nested():
+                current_ver = db.scalar(
+                    select(func.max(Artifact.version)).where(
+                        Artifact.project_id == project_id,
+                        Artifact.name == name,
+                    )
+                )
+                bridged = Artifact(
+                    project_id=project_id,
+                    run_id=run_id,
+                    artifact_id=blob.id,
+                    name=name,
+                    kind="model",
+                    version=(current_ver or 0) + 1,
+                    sha256=blob.sha256,
+                    size_bytes=blob.size,
+                    content_type=blob.media_type,
+                    status="committed",
+                    committed_at=utcnow(),
+                )
+                db.add(bridged)
+                db.flush()
+            return bridged
+        except IntegrityError:
+            if attempt == MAX_CREATE_ATTEMPTS - 1:
+                raise HTTPException(status_code=409, detail="concurrent artifact registration, retry") from None
+    raise HTTPException(status_code=409, detail="concurrent artifact registration, retry")
+
+
 def _get_experiment_or_404(db: Session, project_id: str, experiment_id: str) -> Experiment:
     row = db.scalars(
         select(Experiment).where(Experiment.id == experiment_id, Experiment.project_id == project_id)
@@ -668,14 +729,17 @@ def create_model_version(
     if body.stage in ADMIN_ONLY_STAGES:
         ensure_role(principal, Role.ADMIN)
 
-    if body.artifact_id is not None:
-        _get_artifact_or_404(db, principal.project_id, body.artifact_id)
     if body.run_id is not None:
         _get_run_or_404(db, principal.project_id, body.run_id)
     if body.eval_experiment_id is not None:
         _get_experiment_or_404(db, principal.project_id, body.eval_experiment_id)
     if body.safety_scan_id is not None:
         _get_safety_scan_or_404(db, principal.project_id, body.safety_scan_id)
+    resolved_artifact_id: str | None = None
+    if body.artifact_id is not None:
+        resolved_artifact_id = _resolve_or_bridge_artifact(
+            db, principal.project_id, body.artifact_id, body.run_id
+        ).id
 
     _lock_model_row(db, principal.project_id, model.id)
 
@@ -703,7 +767,7 @@ def create_model_version(
                     project_id=principal.project_id,
                     model_id=model.id,
                     version=next_ver,
-                    artifact_id=body.artifact_id,
+                    artifact_id=resolved_artifact_id,
                     run_id=body.run_id,
                     eval_experiment_id=body.eval_experiment_id,
                     safety_scan_id=body.safety_scan_id,
@@ -752,8 +816,8 @@ def create_model_version(
                 },
             )
 
-    if body.artifact_id is not None:
-        _add_lineage_edge(db, principal.project_id, "artifact", body.artifact_id, "model_version", mv.id, "packaged_as")
+    if resolved_artifact_id is not None:
+        _add_lineage_edge(db, principal.project_id, "artifact", resolved_artifact_id, "model_version", mv.id, "packaged_as")
     if body.run_id is not None:
         _add_lineage_edge(db, principal.project_id, "run", body.run_id, "model_version", mv.id, "registered_as")
     if body.eval_experiment_id is not None:

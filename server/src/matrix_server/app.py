@@ -13,7 +13,6 @@ from matrix_server.api import (
     gateway,
     ingest,
     mlops,
-    mlops_compat,
     online_evals,
     projects,
     prompts,
@@ -81,7 +80,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         vectors,
         gateway,
         mlops,
-        mlops_compat,  # deprecated /mlops/runs*, /mlops/artifacts* and /mlops/sweeps* adapters (T4/T5)
         benchmarks,
         sandboxes,
     ):

@@ -129,9 +129,9 @@ def test_log_model_uploads_artifact_links_run_and_handles_existing_model(tmp_pat
         if m == "POST" and p == "/api/v1/mlops/models/mod_42/versions":
             body = json.loads(request.content.decode())
             assert body["run_id"] == "run_42"
-            assert "artifact_id" not in body
+            assert body["artifact_id"] == "blob_1"
             ver = 2 if seen.count(("POST", "/api/v1/mlops/models/mod_42/versions")) > 1 else 1
-            return httpx.Response(201, json={"id": f"mv_{ver}", "model_id": "mod_42", "version": ver, "stage": body["stage"]})
+            return httpx.Response(201, json={"id": f"mv_{ver}", "model_id": "mod_42", "version": ver, "stage": body["stage"], "artifact_id": f"ma_{ver}"})
         raise AssertionError(f"Unexpected request: {m} {request.url}")
 
     client = _make_client(handler)
@@ -327,3 +327,57 @@ def test_examples_train_sklearn_and_train_pytorch_run_cleanly(client: mx.MatrixC
     assert len(server.calls("POST", "/api/v1/runs/r1/reports")) >= 1
     assert len(server.calls("POST", "/api/v1/artifacts")) >= 1
     assert len(server.points()) > 0
+
+
+def test_log_model_links_artifact_id_and_downloads(tmp_path: Path) -> None:
+    weights = tmp_path / "adapter.bin"
+    payload = b"safetensors-weights-v1"
+    weights.write_bytes(payload)
+    sha = hashlib.sha256(payload).hexdigest()
+    captured_create: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        m, p = request.method, request.url.path
+        if m == "POST" and p == "/api/v1/artifacts":
+            return httpx.Response(201, json={"id": "blob_99", "name": "adapter.bin", "size": len(payload), "sha256": sha})
+        if m == "POST" and p == "/api/v1/mlops/models":
+            return httpx.Response(201, json={"id": "mod_99", "name": "adapter-model"})
+        if m == "GET" and p == "/api/v1/mlops/models/mod_99":
+            return httpx.Response(200, json={"id": "mod_99", "name": "adapter-model", "aliases": {}, "versions": []})
+        if m == "POST" and p == "/api/v1/mlops/models/mod_99/versions":
+            body = json.loads(request.content.decode())
+            captured_create.append(body)
+            return httpx.Response(201, json={"id": "mv_99", "model_id": "mod_99", "version": 1, "artifact_id": "ma_99"})
+        if m == "GET" and p == "/api/v1/models/mod_99/versions/1/files":
+            return httpx.Response(
+                200,
+                json={
+                    "model_id": "mod_99",
+                    "version": 1,
+                    "files": [
+                        {
+                            "artifact_id": "blob_99",
+                            "model_artifact_id": "ma_99",
+                            "path": "adapter.bin",
+                            "size": len(payload),
+                            "sha256": sha,
+                            "url": "/api/v1/artifacts/blob_99/download",
+                        }
+                    ],
+                },
+            )
+        if m == "GET" and p == "/api/v1/artifacts/blob_99/download":
+            return httpx.Response(200, content=payload)
+        raise AssertionError(f"Unexpected request: {m} {request.url}")
+
+    client = _make_client(handler)
+    try:
+        logged = client.registry.log_model(weights, "adapter-model")
+        assert captured_create == [{"stage": "none", "metrics_snapshot": {}, "artifact_id": "blob_99"}]
+        assert logged["model_version"]["artifact_id"] == "ma_99"
+
+        out_dir = tmp_path / "dl"
+        downloaded = client.registry.download("mod_99", version=1, dest_dir=out_dir)
+        assert downloaded.read_bytes() == payload
+    finally:
+        client._http.close()
