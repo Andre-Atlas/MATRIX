@@ -252,6 +252,9 @@ export function adaptVectorsData(rawProj: any, rawDrift: any): { projection: any
     dimensions: rawProj?.dimensions || 3,
     total_points: rawProj?.total_points || rawProj?.metadata?.total_points || points.length,
     reduction_method: rawProj?.reduction_method || "umap",
+    engine: rawProj?.engine,
+    embedding: rawProj?.embedding,
+    simulated: rawProj?.simulated,
   };
 
   const jsdVal =
@@ -319,6 +322,8 @@ export function adaptVectorsData(rawProj: any, rawDrift: any): { projection: any
     status: driftStatus,
     clusters_drifting: clustersDriftingCount,
     top_drifting_clusters: computedTopDrifting,
+    mode: rawDrift?.mode,
+    simulated: rawDrift?.simulated,
     metrics: {
       overall_status: rawDrift?.metrics?.overall_status || driftStatus,
       baseline_period: rawDrift?.metrics?.baseline_period || "Last 7 days",

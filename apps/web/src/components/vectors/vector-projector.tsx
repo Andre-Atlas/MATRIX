@@ -155,6 +155,7 @@ export function VectorProjector({
           <div className="inline-flex rounded-md border border-zinc-700/80 bg-zinc-950 p-0.5">
             <button
               type="button"
+              aria-pressed={projectionMode === "2d"}
               onClick={() => setProjectionMode("2d")}
               className={`rounded px-2.5 py-1 font-mono text-xs font-medium transition-colors ${
                 projectionMode === "2d" ? "bg-zinc-800 text-zinc-100" : "text-zinc-400 hover:text-zinc-200"
@@ -164,6 +165,7 @@ export function VectorProjector({
             </button>
             <button
               type="button"
+              aria-pressed={projectionMode === "3d"}
               onClick={() => setProjectionMode("3d")}
               className={`rounded px-2.5 py-1 font-mono text-xs font-medium transition-colors ${
                 projectionMode === "3d" ? "bg-zinc-800 text-zinc-100" : "text-zinc-400 hover:text-zinc-200"
@@ -176,7 +178,7 @@ export function VectorProjector({
           {/* 3D Yaw Rotation Slider */}
           {projectionMode === "3d" && (
             <div className="flex items-center gap-1.5 pl-2 text-xs text-zinc-400">
-              <span className="font-mono text-[11px] text-zinc-500">Yaw:</span>
+              <span className="font-mono text-[11px] text-zinc-400">Yaw:</span>
               <input
                 type="range"
                 min="0"
@@ -198,7 +200,7 @@ export function VectorProjector({
             value={activeClusterFilter ?? "all"}
             onChange={(e) => handleClusterChange(e.target.value)}
             aria-label="Filter by cluster"
-            className="rounded border border-zinc-700 bg-zinc-950 px-2.5 py-1 text-xs text-zinc-200 focus:border-zinc-500 focus:outline-none"
+            className="rounded border border-zinc-700 bg-zinc-950 px-2.5 py-1 text-xs text-zinc-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
           >
             <option value="all">All Clusters ({clusters.length})</option>
             {clusters.map((c) => (
@@ -212,6 +214,7 @@ export function VectorProjector({
           <div className="inline-flex rounded-md border border-zinc-700/80 bg-zinc-950 p-0.5">
             <button
               type="button"
+              aria-pressed={selectedType === "all"}
               onClick={() => setSelectedType("all")}
               className={`rounded px-2 py-0.5 font-mono text-[11px] ${
                 selectedType === "all" ? "bg-zinc-800 text-zinc-100" : "text-zinc-400 hover:text-zinc-200"
@@ -221,6 +224,7 @@ export function VectorProjector({
             </button>
             <button
               type="button"
+              aria-pressed={selectedType === "query"}
               onClick={() => setSelectedType("query")}
               className={`rounded px-2 py-0.5 font-mono text-[11px] ${
                 selectedType === "query" ? "bg-sky-950/80 text-sky-300 font-semibold" : "text-zinc-400 hover:text-zinc-200"
@@ -230,6 +234,7 @@ export function VectorProjector({
             </button>
             <button
               type="button"
+              aria-pressed={selectedType === "document"}
               onClick={() => setSelectedType("document")}
               className={`rounded px-2 py-0.5 font-mono text-[11px] ${
                 selectedType === "document"
@@ -241,6 +246,7 @@ export function VectorProjector({
             </button>
             <button
               type="button"
+              aria-pressed={selectedType === "gap"}
               onClick={() => setSelectedType("gap")}
               className={`rounded px-2 py-0.5 font-mono text-[11px] ${
                 selectedType === "gap" ? "bg-red-950/80 text-red-300 font-semibold" : "text-zinc-400 hover:text-zinc-200"
@@ -253,10 +259,11 @@ export function VectorProjector({
           {/* Search Input */}
           <input
             type="search"
+            aria-label="Search vectors"
             placeholder="Search vectors..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-36 rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-xs text-zinc-200 placeholder-zinc-500 focus:border-zinc-500 focus:outline-none"
+            className="w-36 rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-xs text-zinc-200 placeholder:text-zinc-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
           />
         </div>
       </div>
@@ -296,7 +303,7 @@ export function VectorProjector({
             type="button"
             onClick={handleReset}
             title="Reset View"
-            aria-label="Reset zoom and position"
+            aria-label="Reset zoom to 1x"
             className="flex h-7 w-7 items-center justify-center rounded font-mono text-[10px] text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
           >
             1x
@@ -326,6 +333,8 @@ export function VectorProjector({
         {/* SVG Drawing Canvas */}
         <svg
           className="h-full w-full"
+          role="group"
+          aria-label="Vector embedding projection scatter plot"
           viewBox="0 0 800 500"
           preserveAspectRatio="xMidYMid meet"
           onMouseDown={handleMouseDown}
@@ -442,12 +451,24 @@ export function VectorProjector({
               return (
                 <g
                   key={point.id}
-                  className="cursor-pointer transition-transform"
+                  tabIndex={0}
+                  role="button"
+                  aria-label={`${point.type}: ${point.label}${point.cluster_name ? ` (${point.cluster_name})` : ""}`}
+                  className="cursor-pointer transition-transform focus:outline-none"
+                  onFocus={() => setHoveredPoint(point)}
+                  onBlur={() => setHoveredPoint(null)}
                   onMouseEnter={() => setHoveredPoint(point)}
                   onMouseLeave={() => setHoveredPoint(null)}
                   onClick={(e) => {
                     e.stopPropagation();
                     setActivePoint(point);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setActivePoint(point);
+                    }
                   }}
                 >
                   {/* Outer pulse aura for Knowledge Gaps */}
@@ -540,7 +561,7 @@ export function VectorProjector({
                   {activePoint.type}
                 </span>
                 <span className="text-xs font-semibold text-zinc-100">{activePoint.label}</span>
-                <span className="text-xs text-zinc-500">•</span>
+                <span className="text-xs text-zinc-400">•</span>
                 <span className="text-xs text-zinc-400">{activePoint.cluster_name}</span>
               </div>
               {activePoint.preview && (
@@ -548,7 +569,7 @@ export function VectorProjector({
                   {activePoint.preview}
                 </p>
               )}
-              <div className="mt-2 flex flex-wrap items-center gap-4 text-xs text-zinc-500">
+              <div className="mt-2 flex flex-wrap items-center gap-4 text-xs text-zinc-400">
                 <span>
                   ID: <code className="font-mono text-zinc-400">{activePoint.id}</code>
                 </span>

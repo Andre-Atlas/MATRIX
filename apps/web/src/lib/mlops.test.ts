@@ -15,17 +15,16 @@ import {
 } from "./mlops";
 import { getAliasStyle, getModelStageStyle, getRunStatusStyle, RUN_STATUS_STYLE } from "./mlops-tokens";
 import type {
+  CanonicalSweep,
+  CanonicalSweepDetail,
   LineageGraph,
   ListResponse,
-  MLOpsSweep,
   ModelAlias,
   ModelVersion,
   RegisteredModel,
   RegisteredModelDetail,
-  SweepDetail,
-  TrainingMetricSeries,
-  TrainingRun,
 } from "./types";
+import type { Run, SeriesResponse } from "./runs/types";
 
 describe("mlops helpers", () => {
   it("smoothEma smooths series with exponential moving average", () => {
@@ -166,45 +165,49 @@ describe("mlops helpers", () => {
   });
 });
 
-describe("mock-api MLOps Studio routes", () => {
+describe("mock-api canonical MLOps, Sweeps, Registry & Lineage routes", () => {
   beforeEach(() => {
     resetMockMlops();
   });
 
-  it("lists runs, run detail, metrics, and run lineage", async () => {
-    const runsResp = await mockGet<ListResponse<TrainingRun>>("/api/v1/mlops/runs");
-    expect(runsResp.items).toHaveLength(5);
-    expect(runsResp.items.some((r) => r.run_type === "classic_ml" && r.classic_eval?.roc_auc === 0.942)).toBe(true);
+  it("lists canonical runs, metrics, and bounded run lineage", async () => {
+    const runsResp = await mockGet<ListResponse<Run>>("/api/v1/runs");
+    expect(runsResp.items.length).toBeGreaterThanOrEqual(5);
     expect(runsResp.items.some((r) => r.status === "failed")).toBe(true);
 
-    const dpoRun = await mockGet<TrainingRun>("/api/v1/mlops/runs/run-dpo-02");
-    expect(dpoRun.status).toBe("running");
+    const dpoRun = await mockGet<Run>("/api/v1/runs/run_llama3_dpo");
+    expect(dpoRun.id).toBe("run_llama3_dpo");
 
-    const metrics = await mockGet<TrainingMetricSeries>("/api/v1/mlops/runs/run-dpo-02/metrics");
-    expect(metrics.series["dpo/reward_margin"].length).toBeGreaterThan(5);
-    expect(metrics.series["gpu/utilization"].length).toBeGreaterThan(5);
+    const metrics = await mockGet<SeriesResponse>("/api/v1/runs/run_llama3_dpo/metrics", {
+      keys: "train/loss,sys/gpu.0.utilization",
+    });
+    expect(metrics.series["train/loss"].steps.length).toBeGreaterThan(5);
+    expect(metrics.series["sys/gpu.0.utilization"].steps.length).toBeGreaterThan(5);
 
-    const lineage = await mockGet<LineageGraph>("/api/v1/mlops/runs/run-lora-01/lineage");
+    const lineage = await mockGet<LineageGraph>("/api/v1/lineage", {
+      node: "run:run-lora-01",
+      direction: "both",
+      depth: 3,
+    });
     expect(lineage.nodes.length).toBeGreaterThanOrEqual(5);
     expect(lineage.edges.some((e) => e.relation === "trained_on")).toBe(true);
   });
 
-  it("lists sweeps and sweep detail with parallel coordinates and importance", async () => {
-    const sweepsResp = await mockGet<{ items: MLOpsSweep[] }>("/api/v1/mlops/sweeps");
+  it("lists canonical sweeps and sweep detail with runs and importance", async () => {
+    const sweepsResp = await mockGet<{ items: CanonicalSweep[] }>("/api/v1/sweeps");
     expect(sweepsResp.items).toHaveLength(2);
 
-    const bayes = await mockGet<SweepDetail>("/api/v1/mlops/sweeps/sweep-bayes-01");
-    expect(bayes.method).toBe("bayes");
-    expect(bayes.trials).toHaveLength(10);
-    expect(bayes.analysis.parallel_coordinates.axes.length).toBeGreaterThan(0);
-    expect(bayes.analysis.importance.length).toBeGreaterThan(0);
+    const tpe = await mockGet<CanonicalSweepDetail>("/api/v1/sweeps/swp-tpe-01");
+    expect(tpe.sweep.config.method).toBe("tpe");
+    expect(tpe.runs).toHaveLength(6);
+    expect(tpe.importance && tpe.importance.length).toBeGreaterThan(0);
 
-    const grid = await mockGet<SweepDetail>("/api/v1/mlops/sweeps/sweep-grid-02");
-    expect(grid.method).toBe("grid");
-    expect(grid.trials).toHaveLength(6);
+    const grid = await mockGet<CanonicalSweepDetail>("/api/v1/sweeps/swp-grid-02");
+    expect(grid.sweep.config.method).toBe("grid");
+    expect(grid.runs).toHaveLength(3);
   });
 
-  it("lists models, model detail, lineage, and updates aliases & stages via mockSend", async () => {
+  it("lists models, model detail, canonical stage/alias updates, and canonical lineage", async () => {
     const modelsResp = await mockGet<{ items: RegisteredModel[] }>("/api/v1/mlops/models");
     expect(modelsResp.items).toHaveLength(3);
 
@@ -212,8 +215,7 @@ describe("mock-api MLOps Studio routes", () => {
     expect(loraModel.versions).toHaveLength(3);
     expect(loraModel.aliases).toEqual({ champion: 3, challenger: 2 });
 
-    const movedAlias = await mockSend<ModelAlias>("POST", "/api/v1/mlops/models/model-lora-01/aliases", {
-      alias: "@champion",
+    const movedAlias = await mockSend<ModelAlias>("PUT", "/api/v1/models/model-lora-01/aliases/champion", {
       version: 2,
     });
     expect(movedAlias).toEqual({ model_id: "model-lora-01", alias: "champion", version: 2 });
@@ -222,15 +224,27 @@ describe("mock-api MLOps Studio routes", () => {
     expect(updatedModel.aliases.champion).toBe(2);
 
     const promoted = await mockSend<ModelVersion>(
-      "PATCH",
-      "/api/v1/mlops/models/model-lora-01/versions/2/stage",
+      "POST",
+      "/api/v1/models/model-lora-01/versions/2/stage",
       { stage: "production" },
     );
     expect(promoted.stage).toBe("production");
 
-    const modelLineage = await mockGet<LineageGraph>("/api/v1/mlops/models/model-lora-01/lineage");
+    const modelLineage = await mockGet<LineageGraph>("/api/v1/lineage", {
+      node: "model_version:mv-lora-v3",
+      direction: "both",
+      depth: 3,
+    });
     expect(modelLineage.nodes.some((n) => n.node_type === "dataset")).toBe(true);
     expect(modelLineage.nodes.some((n) => n.node_type === "safety_scan")).toBe(true);
     expect(modelLineage.edges.some((e) => e.relation === "audited_by")).toBe(true);
+
+    const truncatedLineage = await mockGet<LineageGraph>("/api/v1/lineage", {
+      node: "model_version:mv-lora-v3",
+      direction: "both",
+      depth: 1,
+    });
+    expect(truncatedLineage.truncated).toBe(true);
+    expect(adaptLineageGraph(truncatedLineage).truncated).toBe(true);
   });
 });

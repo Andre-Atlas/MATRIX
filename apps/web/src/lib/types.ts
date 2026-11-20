@@ -646,7 +646,7 @@ export type VectorDriftResponse = {
 
 export type RiskLevel = "low" | "medium" | "high" | "critical" | "not_evaluated";
 
-export type ComplianceStatus = "compliant" | "needs_review" | "vulnerable";
+export type ComplianceStatus = "compliant" | "needs_review" | "vulnerable" | "not_evaluated";
 
 export type SafetySeverity = "info" | "low" | "medium" | "high" | "critical";
 
@@ -718,7 +718,7 @@ export type SafetyCategoryScore = {
   probes_tested: number;
   probes_passed: number;
   probes_failed: number;
-  pass_rate: number; // 0.0 to 1.0
+  pass_rate: number | null; // 0.0 to 1.0, or null when not_evaluated
   status: ComplianceStatus;
   findings_count: number;
   critical_findings: number;
@@ -1048,7 +1048,7 @@ export type TrainingMetricSeries = {
 
 export type SweepMethod = "grid" | "random" | "bayes";
 export type SweepGoal = "minimize" | "maximize";
-export type SweepStatus = "running" | "completed" | "cancelled" | "stopped";
+export type SweepStatus = "running" | "paused" | "completed" | "cancelled" | "stopped";
 
 export type SearchSpaceParam =
   | {

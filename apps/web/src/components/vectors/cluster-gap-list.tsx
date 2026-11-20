@@ -59,6 +59,7 @@ export function ClusterGapList({
           <div className="inline-flex rounded-md border border-zinc-700/80 bg-zinc-950 p-0.5">
             <button
               type="button"
+              aria-pressed={activeTab === "clusters"}
               onClick={() => setActiveTab("clusters")}
               className={`rounded px-3 py-1 font-mono text-xs font-medium transition-colors ${
                 activeTab === "clusters"
@@ -70,6 +71,7 @@ export function ClusterGapList({
             </button>
             <button
               type="button"
+              aria-pressed={activeTab === "gaps"}
               onClick={() => setActiveTab("gaps")}
               className={`rounded px-3 py-1 font-mono text-xs font-medium transition-colors ${
                 activeTab === "gaps"
@@ -87,7 +89,7 @@ export function ClusterGapList({
               className="inline-flex items-center gap-1 rounded border border-zinc-700 bg-zinc-800 px-2 py-0.5 text-xs text-zinc-300 hover:text-zinc-100"
             >
               <span>Clear cluster filter</span>
-              <span className="text-zinc-500">✕</span>
+              <span className="text-zinc-400">✕</span>
             </button>
           )}
         </div>
@@ -107,10 +109,11 @@ export function ClusterGapList({
             </select>
             <input
               type="search"
+              aria-label="Search knowledge gaps"
               placeholder="Search gaps..."
               value={searchGaps}
               onChange={(e) => setSearchGaps(e.target.value)}
-              className="w-36 rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-xs text-zinc-200 placeholder-zinc-500 focus:border-zinc-500 focus:outline-none"
+              className="w-36 rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-xs text-zinc-200 placeholder:text-zinc-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
             />
           </div>
         )}
@@ -118,9 +121,14 @@ export function ClusterGapList({
 
       {/* Tab 1: Clusters Table */}
       {activeTab === "clusters" && (
-        <div className="overflow-x-auto">
+        <div
+          tabIndex={0}
+          role="region"
+          aria-label="Clusters summary table"
+          className="overflow-x-auto focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
+        >
           <table className="w-full text-left text-xs">
-            <thead className="border-b border-zinc-800 bg-zinc-950/40 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
+            <thead className="border-b border-zinc-800 bg-zinc-950/40 text-[11px] font-semibold uppercase tracking-wider text-zinc-400">
               <tr>
                 <th className="px-4 py-3">Cluster</th>
                 <th className="px-3 py-3">Assertividade</th>
@@ -187,7 +195,7 @@ export function ClusterGapList({
                           {cluster.gap_count} gaps
                         </span>
                       ) : (
-                        <span className="font-mono text-zinc-500">0</span>
+                        <span className="font-mono text-zinc-400">0</span>
                       )}
                     </td>
 
@@ -215,6 +223,7 @@ export function ClusterGapList({
                     <td className="px-4 py-3 text-right">
                       <button
                         type="button"
+                        aria-pressed={isSelected}
                         onClick={() =>
                           onSelectCluster &&
                           onSelectCluster(isSelected ? null : cluster.id)
@@ -240,7 +249,7 @@ export function ClusterGapList({
       {activeTab === "gaps" && (
         <div className="divide-y divide-zinc-800/60">
           {filteredGaps.length === 0 ? (
-            <div className="p-8 text-center text-xs text-zinc-500">
+            <div className="p-8 text-center text-xs text-zinc-400">
               Nenhum gap de conhecimento encontrado com os filtros atuais.
             </div>
           ) : (
@@ -272,7 +281,7 @@ export function ClusterGapList({
                     </div>
 
                     <div className="rounded-md border border-zinc-800 bg-zinc-950/70 p-2 text-xs">
-                      <span className="font-mono text-zinc-500">Query frequente: </span>
+                      <span className="font-mono text-zinc-400">Query frequente: </span>
                       <span className="italic text-zinc-300">&ldquo;{gap.query_text}&rdquo;</span>
                     </div>
 
@@ -287,7 +296,7 @@ export function ClusterGapList({
                       <div className="font-mono font-medium text-red-300">
                         {gap.frequency} queries sem resposta
                       </div>
-                      <div className="font-mono text-[11px] text-zinc-500">
+                      <div className="font-mono text-[11px] text-zinc-400">
                         Detectado: {formattedDate}
                       </div>
                     </div>

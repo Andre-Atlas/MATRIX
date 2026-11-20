@@ -1552,44 +1552,6 @@ export function mlopsGet(path: string, params: Params = {}): unknown {
   const s = state();
   let m: RegExpExecArray | null;
 
-  if (path === "/api/v1/mlops/runs") {
-    let items = [...s.runs];
-    if (params.status) items = items.filter((r) => r.status === String(params.status));
-    if (params.sweep_id) items = items.filter((r) => r.sweep_id === String(params.sweep_id));
-    if (params.run_type) items = items.filter((r) => r.run_type === String(params.run_type));
-    if (params.base_model) items = items.filter((r) => r.base_model === String(params.base_model));
-    const limit = Math.min(500, Math.max(1, Number(params.limit ?? 50)));
-    const offset = Number(params.cursor ?? 0) || 0;
-    const slice = items.slice(offset, offset + limit);
-    return {
-      items: slice,
-      next_cursor: offset + limit < items.length ? String(offset + limit) : null,
-    };
-  }
-
-  if ((m = /^\/api\/v1\/mlops\/runs\/([^/]+)\/metrics$/.exec(path))) {
-    const runId = m[1];
-    const run = s.runs.find((r) => r.id === runId);
-    if (!run) throw new ApiError(404, "training run not found");
-    const allSeries = s.seriesByRun[runId] ?? {};
-    const requestedNames = params.metric_names
-      ? String(params.metric_names)
-          .split(",")
-          .map((x) => x.trim())
-          .filter(Boolean)
-      : null;
-    const minStep = params.min_step !== undefined ? Number(params.min_step) : -Infinity;
-    const maxStep = params.max_step !== undefined ? Number(params.max_step) : Infinity;
-
-    const series: Record<string, TrainingMetricPoint[]> = {};
-    for (const [k, pts] of Object.entries(allSeries)) {
-      if (requestedNames && !requestedNames.includes(k)) continue;
-      series[k] = pts.filter((pt) => pt.step >= minStep && pt.step <= maxStep);
-    }
-    const resp: TrainingMetricSeries = { run_id: runId, series };
-    return resp;
-  }
-
   if ((m = /^\/api\/v1\/mlops\/runs\/([^/]+)\/lineage$/.exec(path))) {
     const runId = m[1];
     const run = s.runs.find((r) => r.id === runId);
@@ -1609,57 +1571,6 @@ export function mlopsGet(path: string, params: Params = {}): unknown {
         edges: [],
       }
     );
-  }
-
-  if ((m = /^\/api\/v1\/mlops\/runs\/([^/]+)$/.exec(path))) {
-    const runId = m[1];
-    const run = s.runs.find((r) => r.id === runId);
-    if (!run) throw new ApiError(404, "training run not found");
-    const artifacts = s.artifacts.filter((a) => a.run_id === run.id);
-    return { ...run, artifacts };
-  }
-
-  if (path === "/api/v1/mlops/sweeps") {
-    return { items: [...s.sweeps] };
-  }
-
-  if ((m = /^\/api\/v1\/mlops\/sweeps\/([^/]+)$/.exec(path))) {
-    const sweepId = m[1];
-    const sweep = s.sweeps.find((sw) => sw.id === sweepId);
-    if (!sweep) throw new ApiError(404, "sweep not found");
-    const detail: SweepDetail = {
-      ...sweep,
-      trials: s.sweepTrials[sweepId] ?? [],
-      analysis: s.sweepAnalysis[sweepId] ?? {
-        metric_name: sweep.metric_name,
-        metric_goal: sweep.metric_goal,
-        importance: [],
-        parallel_coordinates: { axes: [], trials: [] },
-      },
-    };
-    return detail;
-  }
-
-  if (path === "/api/v1/mlops/artifacts") {
-    let items = [...s.artifacts];
-    if (params.run_id) items = items.filter((a) => a.run_id === String(params.run_id));
-    if (params.kind) items = items.filter((a) => a.kind === String(params.kind));
-    if (params.status) items = items.filter((a) => a.status === String(params.status));
-    if (params.name) items = items.filter((a) => a.name === String(params.name));
-    return { items };
-  }
-
-  if ((m = /^\/api\/v1\/mlops\/artifacts\/([^/]+)\/download-url$/.exec(path))) {
-    const art = s.artifacts.find((a) => a.id === m![1]);
-    if (!art) throw new ApiError(404, "artifact not found");
-    const resp: ArtifactDownloadUrlResponse = {
-      artifact_id: art.id,
-      download_url: `https://mock-storage.matrix.local/download/${art.id}?sha256=${art.sha256}`,
-      storage_backend: art.storage_backend,
-      sha256: art.sha256,
-      size_bytes: art.size_bytes,
-    };
-    return resp;
   }
 
   if (path === "/api/v1/mlops/models") {
@@ -1769,7 +1680,13 @@ export function mlopsGet(path: string, params: Params = {}): unknown {
   // ── Canonical Bounded Lineage (/api/v1/lineage) ────────────────────────
   if (path === "/api/v1/lineage") {
     const nodeRef = String(params.node ?? "model_version:mv-lora-v3");
-    const direction = String(params.direction ?? "both") as "upstream" | "downstream" | "both";
+    const rawDirection = String(params.direction ?? "both");
+    const direction: "up" | "down" | "both" =
+      rawDirection === "up" || rawDirection === "upstream"
+        ? "up"
+        : rawDirection === "down" || rawDirection === "downstream"
+          ? "down"
+          : "both";
     const depth = Math.min(5, Math.max(1, Number(params.depth ?? 3) || 3));
     // Match against known model or run lineage graphs, falling back to lora lineage
     const baseGraph =
@@ -1792,196 +1709,6 @@ export function mlopsGet(path: string, params: Params = {}): unknown {
 export function mlopsSend(method: string, path: string, body?: unknown): unknown {
   const s = state();
   let m: RegExpExecArray | null;
-
-  if (method === "POST" && path === "/api/v1/mlops/runs") {
-    const req = (body ?? {}) as CreateTrainingRunRequest;
-    const now = new Date().toISOString();
-    const run: TrainingRun = {
-      id: nextId("run"),
-      project_id: "proj-default",
-      name: req.name || "untitled-run",
-      run_type: req.run_type ?? "sft",
-      status: req.status ?? "running",
-      base_model: req.base_model ?? null,
-      dataset_id: req.dataset_id ?? null,
-      sweep_id: req.sweep_id ?? null,
-      parent_run_id: req.parent_run_id ?? null,
-      hyperparams: req.hyperparams ?? {},
-      summary_metrics: {},
-      latest_metrics: {},
-      hardware_info: req.hardware_info ?? null,
-      classic_eval: req.classic_eval ?? null,
-      tags: req.tags ?? [],
-      total_steps: 0,
-      error: null,
-      last_heartbeat_at: now,
-      created_at: now,
-      started_at: (req.status ?? "running") === "running" ? now : null,
-      finished_at: null,
-    };
-    s.runs.unshift(run);
-    s.seriesByRun[run.id] = {};
-    return run;
-  }
-
-  if (method === "PATCH" && (m = /^\/api\/v1\/mlops\/runs\/([^/]+)$/.exec(path))) {
-    const run = s.runs.find((r) => r.id === m![1]);
-    if (!run) throw new ApiError(404, "training run not found");
-    const req = (body ?? {}) as UpdateTrainingRunRequest;
-    if (req.status !== undefined) run.status = req.status;
-    if (req.total_steps !== undefined) run.total_steps = req.total_steps;
-    if (req.hardware_info !== undefined) run.hardware_info = req.hardware_info;
-    if (req.classic_eval !== undefined) run.classic_eval = req.classic_eval;
-    if (req.summary_metrics !== undefined) {
-      run.summary_metrics = { ...run.summary_metrics, ...req.summary_metrics };
-      run.latest_metrics = { ...run.summary_metrics };
-    }
-    if (req.error !== undefined) run.error = req.error;
-    if (req.finished_at !== undefined) run.finished_at = req.finished_at;
-    return run;
-  }
-
-  if (method === "POST" && (m = /^\/api\/v1\/mlops\/runs\/([^/]+)\/metrics$/.exec(path))) {
-    const run = s.runs.find((r) => r.id === m![1]);
-    if (!run) throw new ApiError(404, "training run not found");
-    const req = (body ?? { points: [] }) as IngestMetricsRequest;
-    const series = (s.seriesByRun[run.id] ??= {});
-    let accepted = 0;
-    for (const pt of req.points ?? []) {
-      const arr = (series[pt.metric_name] ??= []);
-      arr.push({
-        step: pt.step,
-        value: pt.value,
-        epoch: pt.epoch ?? null,
-        recorded_at: pt.recorded_at ?? new Date().toISOString(),
-      });
-      run.summary_metrics[pt.metric_name] = pt.value;
-      run.latest_metrics[pt.metric_name] = pt.value;
-      run.total_steps = Math.max(run.total_steps ?? 0, pt.step);
-      accepted += 1;
-    }
-    run.last_heartbeat_at = new Date().toISOString();
-    const resp: IngestMetricsResponse = { accepted, should_stop: false, stop_reason: null };
-    return resp;
-  }
-
-  if (method === "POST" && path === "/api/v1/mlops/sweeps") {
-    const req = (body ?? {}) as CreateSweepRequest;
-    const sweep: MLOpsSweep = {
-      id: nextId("sweep"),
-      project_id: "proj-default",
-      name: req.name || "untitled-sweep",
-      description: req.description ?? null,
-      method: req.method ?? "random",
-      metric_name: req.metric_name || "eval/loss",
-      metric_goal: req.metric_goal ?? "minimize",
-      search_space: req.search_space ?? {},
-      early_stopping: req.early_stopping ?? null,
-      max_trials: req.max_trials ?? null,
-      status: "running",
-      best_run_id: null,
-      best_metric_value: null,
-      created_at: new Date().toISOString(),
-      stopped_at: null,
-    };
-    s.sweeps.unshift(sweep);
-    s.sweepTrials[sweep.id] = [];
-    s.sweepAnalysis[sweep.id] = {
-      metric_name: sweep.metric_name,
-      metric_goal: sweep.metric_goal,
-      importance: [],
-      parallel_coordinates: { axes: [], trials: [] },
-    };
-    return sweep;
-  }
-
-  if (method === "POST" && (m = /^\/api\/v1\/mlops\/sweeps\/([^/]+)\/trials\/next$/.exec(path))) {
-    const sweep = s.sweeps.find((sw) => sw.id === m![1]);
-    if (!sweep) throw new ApiError(404, "sweep not found");
-    const req = (body ?? {}) as SuggestNextTrialRequest;
-    const existing = s.sweepTrials[sweep.id] ?? [];
-    const idx = existing.length;
-    const now = new Date().toISOString();
-    const hyperparams = { learning_rate: 1.5e-4, r: 16 };
-    const run: TrainingRun = {
-      id: nextId("run"),
-      project_id: "proj-default",
-      name: req.name || `${sweep.name}-trial-${idx + 1}`,
-      run_type: req.run_type ?? "lora",
-      status: "running",
-      base_model: req.base_model ?? "meta-llama/Llama-3.1-8B-Instruct",
-      dataset_id: req.dataset_id ?? null,
-      sweep_id: sweep.id,
-      parent_run_id: null,
-      hyperparams,
-      summary_metrics: {},
-      latest_metrics: {},
-      hardware_info: null,
-      classic_eval: null,
-      tags: req.tags ?? ["sweep"],
-      total_steps: 0,
-      error: null,
-      last_heartbeat_at: now,
-      created_at: now,
-      started_at: now,
-      finished_at: null,
-    };
-    existing.push(run);
-    s.sweepTrials[sweep.id] = existing;
-    s.runs.unshift(run);
-    const resp: SuggestNextTrialResponse = {
-      sweep_id: sweep.id,
-      trial_index: idx,
-      hyperparams,
-      run,
-    };
-    return resp;
-  }
-
-  if (method === "POST" && (m = /^\/api\/v1\/mlops\/sweeps\/([^/]+)\/stop$/.exec(path))) {
-    const sweep = s.sweeps.find((sw) => sw.id === m![1]);
-    if (!sweep) throw new ApiError(404, "sweep not found");
-    sweep.status = "cancelled";
-    sweep.stopped_at = new Date().toISOString();
-    return { ...sweep, stopped: true };
-  }
-
-  if (method === "POST" && path === "/api/v1/mlops/artifacts/presign-upload") {
-    const req = (body ?? {}) as PresignArtifactUploadRequest;
-    const existing = s.artifacts.find(
-      (a) => a.sha256 === req.sha256 && a.status === "committed",
-    );
-    const now = new Date().toISOString();
-    const art: ArtifactRecord = {
-      id: nextId("art"),
-      project_id: "proj-default",
-      run_id: req.run_id ?? null,
-      name: req.name,
-      kind: req.kind ?? "checkpoint",
-      version: s.artifacts.filter((a) => a.name === req.name).length + 1,
-      storage_backend: req.external_uri ? "external" : "local",
-      storage_uri: req.external_uri ?? existing?.storage_uri ?? `local://proj-default/${req.sha256}`,
-      sha256: req.sha256,
-      size_bytes: req.size_bytes,
-      content_type: req.content_type ?? "application/octet-stream",
-      status: existing ? "committed" : "pending_upload",
-      metadata: req.metadata ?? {},
-      created_at: now,
-      committed_at: existing ? now : null,
-      deduplicated: Boolean(existing),
-      upload_url: existing || req.external_uri ? null : `https://mock-storage.matrix.local/upload/${req.sha256}`,
-    };
-    s.artifacts.unshift(art);
-    return art;
-  }
-
-  if (method === "POST" && (m = /^\/api\/v1\/mlops\/artifacts\/([^/]+)\/commit$/.exec(path))) {
-    const art = s.artifacts.find((a) => a.id === m![1]);
-    if (!art) throw new ApiError(404, "artifact not found");
-    art.status = "committed";
-    art.committed_at = art.committed_at ?? new Date().toISOString();
-    return art;
-  }
 
   if (method === "POST" && path === "/api/v1/mlops/models") {
     const req = (body ?? {}) as CreateModelRequest;

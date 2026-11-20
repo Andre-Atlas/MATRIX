@@ -4,7 +4,17 @@ import React, { useCallback, useMemo, useRef, useState } from "react";
 import { PageHeader } from "@/components/ui";
 import { PRIMARY_BTN_CLASS } from "@/lib/mlops-tokens";
 import { proxy } from "@/lib/proxy-client";
+import {
+  canonicalRunMetricKeys,
+  canonicalRunToTrainingRun,
+  canonicalSeriesToTrainingSeries,
+  canonicalSweepDetailToSweepDetail,
+  canonicalSweepToMLOpsSweep,
+} from "@/lib/training-canonical";
+import type { MetricKeyStat, Report, Run, SeriesResponse } from "@/lib/runs/types";
 import type {
+  CanonicalSweep,
+  CanonicalSweepDetail,
   ListResponse,
   MLOpsSweep,
   SweepDetail,
@@ -122,13 +132,24 @@ export function TrainingStudioClient({
       if (seriesByRun[runId]) return;
       setLoadingRunIds((prev) => (prev.includes(runId) ? prev : [...prev, runId]));
       try {
-        const res = await proxy<TrainingMetricSeries>(
+        const targetRun = runs.find((r) => r.id === runId);
+        const keyStats = await proxy<{ keys: MetricKeyStat[] }>(
           "GET",
-          `runs/${encodeURIComponent(runId)}/metrics`,
+          `runs/${encodeURIComponent(runId)}/metric-keys`,
+        )
+          .then((r) => r.keys)
+          .catch(() => undefined);
+        const keys = canonicalRunMetricKeys(
+          targetRun ?? { summary_metrics: {} },
+          keyStats,
+        );
+        const res = await proxy<SeriesResponse | TrainingMetricSeries>(
+          "GET",
+          `runs/${encodeURIComponent(runId)}/metrics?keys=${encodeURIComponent(keys.join(","))}`,
         );
         setSeriesByRun((prev) => ({
           ...prev,
-          [runId]: res?.series ?? {},
+          [runId]: canonicalSeriesToTrainingSeries(res),
         }));
       } catch {
         // Non-fatal: leave empty series if metric store has no data
@@ -137,26 +158,25 @@ export function TrainingStudioClient({
         setLoadingRunIds((prev) => prev.filter((id) => id !== runId));
       }
     },
-    [seriesByRun],
+    [seriesByRun, runs],
   );
 
   const handleToggleRun = useCallback(
     (runId: string) => {
-      setSelectedRunIds((prev) => {
-        const exists = prev.includes(runId);
-        let next: string[];
-        if (exists) {
-          next = prev.filter((id) => id !== runId);
-        } else {
-          if (prev.length >= 6) return prev;
-          next = [...prev, runId];
-          void fetchRunSeriesIfNeeded(runId);
-        }
+      const exists = selectedRunIds.includes(runId);
+      if (exists) {
+        const next = selectedRunIds.filter((id) => id !== runId);
+        setSelectedRunIds(next);
         syncUrlParams(activeTab, next[0]);
-        return next;
-      });
+        return;
+      }
+      if (selectedRunIds.length >= 6) return;
+      const next = [...selectedRunIds, runId];
+      setSelectedRunIds(next);
+      void fetchRunSeriesIfNeeded(runId);
+      syncUrlParams(activeTab, next[0]);
     },
-    [activeTab, fetchRunSeriesIfNeeded, syncUrlParams],
+    [selectedRunIds, activeTab, fetchRunSeriesIfNeeded, syncUrlParams],
   );
 
   const handleSelectSweep = useCallback(
@@ -165,10 +185,11 @@ export function TrainingStudioClient({
       if (sweepDetailById[sweepId]) return;
       setLoadingSweep(true);
       try {
-        const detail = await proxy<SweepDetail>(
+        const rawDetail = await proxy<CanonicalSweepDetail | SweepDetail>(
           "GET",
           `sweeps/${encodeURIComponent(sweepId)}`,
         );
+        const detail = canonicalSweepDetailToSweepDetail(rawDetail);
         setSweepDetailById((prev) => ({ ...prev, [sweepId]: detail }));
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to load sweep detail.");
@@ -185,23 +206,58 @@ export function TrainingStudioClient({
         const next = prev.includes(runId) ? prev : [runId, ...prev].slice(0, 6);
         return next;
       });
+      if (!runs.some((r) => r.id === runId)) {
+        void Promise.all([
+          proxy<Run>("GET", `runs/${encodeURIComponent(runId)}`),
+          proxy<{ items: Report[] }>("GET", `runs/${encodeURIComponent(runId)}/reports`).catch(() => ({
+            items: [] as Report[],
+          })),
+        ])
+          .then(([rawRun, repResp]) => {
+            if (!rawRun?.id) return;
+            const adapted = canonicalRunToTrainingRun(rawRun, repResp.items ?? []);
+            setRuns((prev) => (prev.some((r) => r.id === adapted.id) ? prev : [adapted, ...prev]));
+          })
+          .catch(() => {
+            /* Keep fallback selection if run endpoint is unavailable */
+          });
+      }
       void fetchRunSeriesIfNeeded(runId);
       setActiveTab("runs");
       syncUrlParams("runs", runId);
     },
-    [fetchRunSeriesIfNeeded, syncUrlParams],
+    [runs, fetchRunSeriesIfNeeded, syncUrlParams],
   );
+
+  const handleCloseCompare = useCallback(() => setCompareOpen(false), []);
+  const handleCloseRegister = useCallback(() => setRegisterRun(null), []);
 
   const handleRefresh = useCallback(async () => {
     setRefreshing(true);
     setError(null);
     try {
       const [runsResp, sweepsResp] = await Promise.all([
-        proxy<ListResponse<TrainingRun>>("GET", "runs?limit=100"),
-        proxy<ListResponse<MLOpsSweep>>("GET", "sweeps"),
+        proxy<ListResponse<Run | TrainingRun>>("GET", "runs?limit=100"),
+        proxy<ListResponse<CanonicalSweep | MLOpsSweep>>("GET", "sweeps"),
       ]);
-      const nextRuns = Array.isArray(runsResp?.items) ? runsResp.items : [];
-      const nextSweeps = Array.isArray(sweepsResp?.items) ? sweepsResp.items : [];
+      const rawRuns = Array.isArray(runsResp?.items) ? runsResp.items : [];
+      const reportSlice = rawRuns.slice(0, 12);
+      const reportResults = await Promise.allSettled(
+        reportSlice.map((r) =>
+          proxy<{ items: Report[] }>("GET", `runs/${encodeURIComponent(r.id)}/reports`),
+        ),
+      );
+      const reportsByRun: Record<string, Report[]> = {};
+      reportResults.forEach((res, idx) => {
+        if (res.status === "fulfilled" && Array.isArray(res.value?.items)) {
+          reportsByRun[reportSlice[idx].id] = res.value.items;
+        }
+      });
+
+      const nextRuns = rawRuns.map((r) => canonicalRunToTrainingRun(r, reportsByRun[r.id]));
+      const nextSweeps = (Array.isArray(sweepsResp?.items) ? sweepsResp.items : []).map((s) =>
+        canonicalSweepToMLOpsSweep(s),
+      );
       setRuns(nextRuns);
       setSweeps(nextSweeps);
       if (nextSweeps.length > 0 && !selectedSweepId) {
@@ -355,7 +411,7 @@ export function TrainingStudioClient({
           <p className="text-sm font-medium text-zinc-200">No training runs recorded yet</p>
           <p className="mx-auto mt-1 max-w-lg text-xs text-zinc-400">
             Start logging runs with{" "}
-            <code className="font-mono text-emerald-300">matrix_sdk.mlops.start_run()</code> or{" "}
+            <code className="font-mono text-emerald-300">matrix_sdk.start_run()</code> or{" "}
             <code className="font-mono text-emerald-300">MatrixTrainerCallback</code> to stream loss
             curves, GPU telemetry, and sweeps.
           </p>
@@ -440,13 +496,13 @@ export function TrainingStudioClient({
       <CompareDrawer
         open={compareOpen}
         runs={selectedRuns}
-        onClose={() => setCompareOpen(false)}
+        onClose={handleCloseCompare}
       />
 
       <RegisterModelModal
         open={registerRun !== null}
         run={registerRun}
-        onClose={() => setRegisterRun(null)}
+        onClose={handleCloseRegister}
       />
     </div>
   );

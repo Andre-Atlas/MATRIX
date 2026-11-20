@@ -1,7 +1,6 @@
 import { PageHeader } from "@/components/ui";
 import { SafetyDashboard } from "@/components/safety/safety-dashboard";
 import { apiGet } from "@/lib/api";
-import { MOCK_FINDINGS } from "@/lib/mock-data";
 import { adaptSafetyData } from "@/lib/safety";
 import type {
   SafetyCategoriesResponse,
@@ -38,8 +37,7 @@ export default async function SafetyPage() {
     rawReport,
   );
 
-  const allFindings =
-    adapted.findings.length > 0 ? adapted.findings : MOCK_FINDINGS;
+  const allFindings = adapted.findings;
 
   return (
     <div className="space-y-6">

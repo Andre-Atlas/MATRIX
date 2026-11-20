@@ -83,6 +83,7 @@ export default async function ModelsPage({
 
   return (
     <ModelsRegistryClient
+      key={`${sp.tab ?? "versions"}:${initialSelectedId ?? ""}`}
       initialModels={initialModels}
       initialDetail={initialDetail}
       initialLineage={initialLineage}

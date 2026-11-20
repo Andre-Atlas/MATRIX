@@ -22,19 +22,7 @@ export default async function DatasetPage({ params }: { params: Promise<{ datase
     );
     branches = brRes.items || [];
   } catch {
-    branches = [
-      {
-        id: "br-main",
-        project_id: "proj-default",
-        dataset_id: datasetId,
-        name: "main",
-        head_commit_id: "c-main-02",
-        is_default: true,
-        created_by: "system",
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      },
-    ];
+    branches = [];
   }
 
   let commits: DatasetCommit[] = [];

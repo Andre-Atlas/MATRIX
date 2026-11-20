@@ -61,7 +61,7 @@ function ThresholdBar({
 
   return (
     <div className="mt-2.5">
-      <div className="flex items-center justify-between text-[11px] text-zinc-500 font-mono">
+      <div className="flex items-center justify-between text-[11px] text-zinc-400 font-mono">
         <span>0</span>
         <span className="text-amber-400/90">warn: {thresholdWarning.toFixed(2)}</span>
         <span className="text-red-400/90">crit: {thresholdCritical.toFixed(2)}</span>
@@ -104,13 +104,13 @@ function MetricCard({
           </h3>
           <DriftStatusBadge status={metric.status} />
         </div>
-        {sublabel && <p className="mt-0.5 text-[11px] text-zinc-500">{sublabel}</p>}
+        {sublabel && <p className="mt-0.5 text-[11px] text-zinc-400">{sublabel}</p>}
 
         <div className="mt-3 flex items-baseline gap-2">
           <span className="font-mono text-2xl font-semibold tabular-nums text-zinc-100">
             {formatDriftMetric(metric.value, { decimals: 3 })}
           </span>
-          <span className="text-xs text-zinc-500 font-mono">drift</span>
+          <span className="text-xs text-zinc-400 font-mono">drift</span>
         </div>
 
         {metric.description && (
@@ -172,7 +172,7 @@ export function DriftMonitor({ driftData }: DriftMonitorProps) {
       <div className="flex flex-wrap items-center justify-between gap-4 rounded-lg border border-zinc-800 bg-zinc-900/60 p-4">
         <div className="flex items-center gap-3">
           <div className="flex flex-col">
-            <span className="text-xs uppercase tracking-wider text-zinc-500">Drift Observatory</span>
+            <span className="text-xs uppercase tracking-wider text-zinc-400">Drift Observatory</span>
             <div className="mt-1 flex items-center gap-2">
               <span className="text-base font-semibold text-zinc-100">Embedding Distribution Drift</span>
               <DriftStatusBadge status={metrics.overall_status} />
@@ -182,21 +182,21 @@ export function DriftMonitor({ driftData }: DriftMonitorProps) {
 
         <div className="flex flex-wrap items-center gap-6 text-xs">
           <div>
-            <span className="text-zinc-500">Baseline Window:</span>
+            <span className="text-zinc-400">Baseline Window:</span>
             <div className="font-mono text-zinc-300">{metrics.baseline_period}</div>
           </div>
           <div>
-            <span className="text-zinc-500">Evaluation Target:</span>
+            <span className="text-zinc-400">Evaluation Target:</span>
             <div className="font-mono text-zinc-300">{metrics.target_period}</div>
           </div>
           <div>
-            <span className="text-zinc-500">Analyzed Queries:</span>
+            <span className="text-zinc-400">Analyzed Queries:</span>
             <div className="font-mono text-zinc-300">
               {(metrics.total_queries_analyzed ?? 0).toLocaleString()}
             </div>
           </div>
           <div>
-            <span className="text-zinc-500">Drifting Clusters:</span>
+            <span className="text-zinc-400">Drifting Clusters:</span>
             <div className="font-mono font-medium text-amber-300">
               {clusters_drifting} clusters
             </div>
@@ -215,10 +215,10 @@ export function DriftMonitor({ driftData }: DriftMonitorProps) {
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
         {/* Top Drifting Clusters */}
         <div className="rounded-lg border border-zinc-800 bg-zinc-900/60 p-4 lg:col-span-1">
-          <h4 className="text-xs font-semibold uppercase tracking-wider text-zinc-400">
+          <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-400">
             Cluster Drift Ranking
-          </h4>
-          <p className="mt-0.5 text-xs text-zinc-500">
+          </h3>
+          <p className="mt-0.5 text-xs text-zinc-400">
             Clusters com maior taxa de descolamento semântico
           </p>
 
@@ -230,7 +230,7 @@ export function DriftMonitor({ driftData }: DriftMonitorProps) {
               >
                 <div className="min-w-0 pr-2">
                   <div className="truncate font-medium text-zinc-200">{c.cluster_name}</div>
-                  <div className="font-mono text-[11px] text-zinc-500">{c.cluster_id}</div>
+                  <div className="font-mono text-[11px] text-zinc-400">{c.cluster_id}</div>
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
                   <span className="font-mono text-xs tabular-nums text-zinc-200">
@@ -247,10 +247,10 @@ export function DriftMonitor({ driftData }: DriftMonitorProps) {
         <div className="rounded-lg border border-zinc-800 bg-zinc-900/60 p-4 lg:col-span-2">
           <div className="flex items-center justify-between">
             <div>
-              <h4 className="text-xs font-semibold uppercase tracking-wider text-zinc-400">
+              <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-400">
                 Drift Progression Timeline
-              </h4>
-              <p className="mt-0.5 text-xs text-zinc-500">
+              </h3>
+              <p className="mt-0.5 text-xs text-zinc-400">
                 Evolução diária da Divergência Jensen-Shannon (7 dias)
               </p>
             </div>
@@ -294,7 +294,7 @@ export function DriftMonitor({ driftData }: DriftMonitorProps) {
                       title={`PSI: ${point.psi.toFixed(3)}`}
                     />
                   </div>
-                  <span className="font-mono text-[10px] text-zinc-500">{dateStr}</span>
+                  <span className="font-mono text-[10px] text-zinc-400">{dateStr}</span>
                 </div>
               );
             })}

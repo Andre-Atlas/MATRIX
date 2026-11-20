@@ -55,6 +55,8 @@ export function RegisterModelModal({ open, run, onClose }: RegisterModelModalPro
 
   const firstInputRef = useRef<HTMLInputElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
 
   useEffect(() => {
     if (!open) return;
@@ -92,18 +94,19 @@ export function RegisterModelModal({ open, run, onClose }: RegisterModelModalPro
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
-        onClose();
+        onCloseRef.current();
       }
     };
     window.addEventListener("keydown", onKeyDown);
-    setTimeout(() => firstInputRef.current?.focus(), 0);
+    const focusTimer = window.setTimeout(() => firstInputRef.current?.focus(), 0);
 
     return () => {
       cancelled = true;
+      window.clearTimeout(focusTimer);
       window.removeEventListener("keydown", onKeyDown);
       previousFocusRef.current?.focus();
     };
-  }, [open, run, onClose]);
+  }, [open, run]);
 
   if (!open) return null;
 

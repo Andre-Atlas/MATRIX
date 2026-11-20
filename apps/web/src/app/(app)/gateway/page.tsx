@@ -21,16 +21,20 @@ export default async function GatewayPage() {
   let providers = MOCK_GATEWAY_PROVIDERS;
   let logs = MOCK_GATEWAY_LOGS;
   let rules = MOCK_GATEWAY_ROUTING_RULES;
+  let isSimulated = process.env.MATRIX_MOCK === "1";
 
   try {
     const [statsData, providersData, logsData, rulesData] = await Promise.all([
       apiGet<GatewayStatsResponse>("/api/v1/gateway/stats"),
       apiGet<GatewayProvidersResponse>("/api/v1/gateway/providers"),
       apiGet<GatewayLogsResponse>("/api/v1/gateway/logs"),
-      apiGet<GatewayRulesResponse>("/api/v1/gateway/rules").catch(() => ({
-        rules: MOCK_GATEWAY_ROUTING_RULES,
-        total: MOCK_GATEWAY_ROUTING_RULES.length,
-      })),
+      apiGet<GatewayRulesResponse>("/api/v1/gateway/rules").catch(() => {
+        isSimulated = true;
+        return {
+          rules: MOCK_GATEWAY_ROUTING_RULES,
+          total: MOCK_GATEWAY_ROUTING_RULES.length,
+        };
+      }),
     ]);
 
     if (statsData) stats = statsData;
@@ -38,16 +42,16 @@ export default async function GatewayPage() {
     if (logsData?.logs) logs = logsData.logs;
     if (rulesData?.rules) rules = rulesData.rules;
   } catch (error) {
-    // If running in an environment without the gateway backend running,
-    // gracefully fall back to initialized mock fixtures.
+    // Graceful mock fallback when backend gateway routes are unavailable.
     console.warn("Using fallback mock data for Gateway Page:", error);
+    isSimulated = true;
   }
 
   return (
     <div className="space-y-6">
       <PageHeader
-        title="AI Gateway & Proxy de Inferência"
-        subtitle="Roteamento dinâmico multi-provedor, Circuit Breakers automáticos, cache semântico de embeddings e fallback resiliente."
+        title="AI Gateway & Inference Proxy"
+        subtitle="Multi-provider dynamic routing, automatic circuit breakers, semantic embedding cache, and resilient fallbacks."
       />
 
       <GatewayDashboard
@@ -55,6 +59,7 @@ export default async function GatewayPage() {
         providers={providers}
         rules={rules}
         logs={logs}
+        isSimulated={isSimulated}
       />
     </div>
   );

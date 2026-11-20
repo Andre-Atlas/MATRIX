@@ -3,11 +3,21 @@ import React from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { mockGet } from "@/lib/mock-api";
+import {
+  canonicalRunMetricKeys,
+  canonicalRunToTrainingRun,
+  canonicalSeriesToTrainingSeries,
+  canonicalSweepDetailToSweepDetail,
+  canonicalSweepToMLOpsSweep,
+} from "@/lib/training-canonical";
+import type { MetricKeyStat, Report, Run, SeriesResponse } from "@/lib/runs/types";
 import type {
+  CanonicalSweep,
+  CanonicalSweepDetail,
   ListResponse,
   MLOpsSweep,
   SweepDetail,
-  TrainingMetricSeries,
+  TrainingMetricPoint,
   TrainingRun,
 } from "@/lib/types";
 import { TrainingStudioClient } from "./training-studio-client";
@@ -37,17 +47,29 @@ afterEach(() => {
 });
 
 async function loadFixtures() {
-  const runsResp = await mockGet<ListResponse<TrainingRun>>("/api/v1/mlops/runs");
-  const sweepsResp = await mockGet<ListResponse<MLOpsSweep>>("/api/v1/mlops/sweeps");
-  const runs = runsResp.items;
-  const sweeps = sweepsResp.items;
+  const runsResp = await mockGet<ListResponse<Run>>("/api/v1/runs", { limit: 100 });
+  const sweepsResp = await mockGet<ListResponse<CanonicalSweep>>("/api/v1/sweeps");
 
-  const seriesByRun: Record<string, TrainingMetricSeries["series"]> = {};
-  for (const r of runs.slice(0, 3)) {
-    const s = await mockGet<TrainingMetricSeries>(`/api/v1/mlops/runs/${r.id}/metrics`);
-    seriesByRun[r.id] = s.series;
+  const runs: TrainingRun[] = [];
+  for (const r of runsResp.items) {
+    const reportsResp = await mockGet<{ items: Report[] }>(`/api/v1/runs/${r.id}/reports`).catch(
+      () => ({ items: [] as Report[] }),
+    );
+    runs.push(canonicalRunToTrainingRun(r, reportsResp.items));
   }
-  const sweepDetail = await mockGet<SweepDetail>(`/api/v1/mlops/sweeps/${sweeps[0].id}`);
+  const sweeps: MLOpsSweep[] = sweepsResp.items.map((s) => canonicalSweepToMLOpsSweep(s));
+
+  const seriesByRun: Record<string, Record<string, TrainingMetricPoint[]>> = {};
+  for (const r of runs.slice(0, 3)) {
+    const keyResp = await mockGet<{ keys: MetricKeyStat[] }>(`/api/v1/runs/${r.id}/metric-keys`);
+    const keys = canonicalRunMetricKeys(r, keyResp.keys);
+    const s = await mockGet<SeriesResponse>(`/api/v1/runs/${r.id}/metrics`, {
+      keys: keys.join(","),
+    });
+    seriesByRun[r.id] = canonicalSeriesToTrainingSeries(s);
+  }
+  const rawSweepDetail = await mockGet<CanonicalSweepDetail>(`/api/v1/sweeps/${sweeps[0].id}`);
+  const sweepDetail: SweepDetail = canonicalSweepDetailToSweepDetail(rawSweepDetail);
   return { runs, sweeps, seriesByRun, sweepDetail };
 }
 
@@ -178,7 +200,9 @@ describe("ClassicMlTab", () => {
     );
 
     const grid = screen.getByRole("grid");
-    expect(grid.textContent).toContain("412");
+    const firstCell = String(classicRun.classic_eval?.confusion_matrix?.matrix?.[0]?.[0] ?? "");
+    expect(firstCell).not.toBe("");
+    expect(grid.textContent).toContain(firstCell);
 
     fireEvent.click(screen.getByRole("button", { name: "Row %" }));
     expect(grid.textContent).toContain("%");

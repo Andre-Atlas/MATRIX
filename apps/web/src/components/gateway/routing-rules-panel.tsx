@@ -67,7 +67,7 @@ export function RoutingRulesPanel({ rules }: RoutingRulesPanelProps) {
                   className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider ${
                     rule.is_active
                       ? "bg-emerald-950/60 text-emerald-300 border border-emerald-800/60"
-                      : "bg-zinc-800 text-zinc-500"
+                      : "bg-zinc-800 text-zinc-400"
                   }`}
                 >
                   {rule.is_active ? "Ativo" : "Inativo"}
@@ -85,7 +85,12 @@ export function RoutingRulesPanel({ rules }: RoutingRulesPanelProps) {
                 Fluxo de Execução & Fallback Sequencial:
               </div>
 
-              <div className="flex flex-col md:flex-row md:items-center gap-2 overflow-x-auto pb-1">
+              <div
+                tabIndex={0}
+                role="region"
+                aria-label={`Fallback pipeline for ${rule.name}`}
+                className="flex flex-col md:flex-row md:items-center gap-2 overflow-x-auto pb-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
+              >
                 {/* Primary Provider Box */}
                 <div className="flex-1 min-w-[200px] rounded-lg border-2 border-emerald-700/60 bg-emerald-950/20 p-3">
                   <div className="flex items-center justify-between text-[11px] font-semibold text-emerald-300">
@@ -110,7 +115,7 @@ export function RoutingRulesPanel({ rules }: RoutingRulesPanelProps) {
                 {rule.fallback_chain.map((fallback, idx) => (
                   <div key={`${fallback.provider}-${fallback.model}-${idx}`} className="flex flex-col md:flex-row md:items-center gap-2 flex-1 min-w-[200px]">
                     {/* Arrow */}
-                    <div className="flex items-center justify-center text-zinc-500 shrink-0 self-center">
+                    <div className="flex items-center justify-center text-zinc-400 shrink-0 self-center">
                       <div className="hidden md:flex items-center text-zinc-600 gap-1">
                         <span className="text-[10px] uppercase font-mono text-amber-500/80">on fail</span>
                         <svg className="h-4 w-4 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">

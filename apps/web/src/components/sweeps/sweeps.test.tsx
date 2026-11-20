@@ -172,13 +172,15 @@ describe("SweepsListClient", () => {
 });
 
 describe("SweepDetailClient", () => {
-  it("renders best run highlight, pruned badge, and importance bar chart", () => {
+  it("renders best run highlight, pruned badge, visualizations, and importance bar chart", () => {
     render(<SweepDetailClient sweepId="swp-tpe-01" initialDetail={SAMPLE_DETAIL} />);
 
     expect(screen.getAllByText(/run-best-01/i).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/Pruned/i).length).toBeGreaterThan(0);
     expect(screen.getByText(/68\.0%/)).toBeTruthy();
     expect(screen.getByText(/32\.0%/)).toBeTruthy();
+    expect(screen.getByRole("img", { name: /Parallel coordinates/i })).toBeTruthy();
+    expect(screen.getByRole("img", { name: /Metric progression and pruning curve/i })).toBeTruthy();
   });
 
   it("renders accessible fallback notice when importance is null", () => {

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getAliasStyle, getModelStageStyle, PRIMARY_BTN_CLASS } from "@/lib/mlops-tokens";
 import { explain, proxy } from "@/lib/proxy-client";
 import type { ModelStage, ModelVersion, RegisteredModelDetail } from "@/lib/types";
@@ -37,14 +37,26 @@ export function PromoteModal({
   const [aliasInput, setAliasInput] = useState<string>("champion");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
 
   useEffect(() => {
+    if (open) {
+      previousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    }
     if (!open) return;
     setActiveMode(initialMode);
     setTargetStage(version.stage);
     setComment("");
     setAliasInput(initialMode === "alias" ? "champion" : "challenger");
     setError(null);
+    const id = requestAnimationFrame(() => dialogRef.current?.focus());
+    return () => {
+      cancelAnimationFrame(id);
+      previousFocusRef.current?.focus();
+    };
   }, [open, initialMode, version]);
 
   useEffect(() => {
@@ -52,12 +64,12 @@ export function PromoteModal({
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
-        onClose();
+        onCloseRef.current();
       }
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [open, onClose]);
+  }, [open]);
 
   if (!open) return null;
 
@@ -122,10 +134,12 @@ export function PromoteModal({
       }}
     >
       <div
+        ref={dialogRef}
+        tabIndex={-1}
         role="dialog"
         aria-modal="true"
         aria-labelledby="promote-modal-title"
-        className="w-full max-w-lg rounded-lg border border-zinc-800 bg-zinc-950 p-5 shadow-2xl"
+        className="w-full max-w-lg rounded-lg border border-zinc-800 bg-zinc-950 p-5 shadow-2xl focus:outline-none"
       >
         <div className="flex items-start justify-between gap-3">
           <div>

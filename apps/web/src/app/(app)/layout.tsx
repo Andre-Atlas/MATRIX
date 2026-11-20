@@ -51,7 +51,7 @@ export default async function AppLayout({ children }: { children: React.ReactNod
         </div>
         <ProjectSwitcher memberships={me.memberships} activeId={membership?.project.id ?? null} />
         {membership && (
-          <nav aria-label="Primary" className="flex flex-col gap-0.5">
+          <nav aria-label="Primary" className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto pr-0.5">
             {NAV.map((n) => (
               <NavLink key={n.href} href={n.href}>
                 {n.label}

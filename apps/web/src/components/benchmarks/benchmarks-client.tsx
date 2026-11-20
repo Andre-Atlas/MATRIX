@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useId, useState } from "react";
+import React, { useId, useRef, useState } from "react";
 import {
   computeBenchmarkKpis,
   extractTaskBreakdown,
@@ -46,6 +46,8 @@ export function BenchmarksClient({
 
   // Active Tab: LM-Eval vs VLMEvalKit
   const [activeTab, setActiveTab] = useState<BenchmarkSuite>("lm_eval");
+  const tabLmRef = useRef<HTMLButtonElement>(null);
+  const tabVlmRef = useRef<HTMLButtonElement>(null);
 
   // Selected Models for Comparison (up to 6)
   const [selectedRunIds, setSelectedRunIds] = useState<string[]>(() => {
@@ -108,12 +110,15 @@ export function BenchmarksClient({
       e.preventDefault();
       const nextSuite = currentSuite === "lm_eval" ? "vlmevalkit" : "lm_eval";
       handleTabChange(nextSuite);
+      (nextSuite === "lm_eval" ? tabLmRef : tabVlmRef).current?.focus();
     } else if (e.key === "Home") {
       e.preventDefault();
       handleTabChange("lm_eval");
+      tabLmRef.current?.focus();
     } else if (e.key === "End") {
       e.preventDefault();
       handleTabChange("vlmevalkit");
+      tabVlmRef.current?.focus();
     }
   }
 
@@ -237,6 +242,18 @@ export function BenchmarksClient({
       {/* Populated Content */}
       {!loading && (
         <>
+          {runs.some((r) => r.simulated === true || r.runner_backend === "local_sim") && (
+            <div
+              role="status"
+              className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-700/60 bg-amber-950/30 px-3.5 py-2 text-xs text-amber-200"
+            >
+              <SimulatedBadge reason="local_sim" />
+              <span>
+                One or more benchmark runs executed on the local simulator (`local_sim`) and are not real model inference benchmarks.
+              </span>
+            </div>
+          )}
+
           {/* 4 KPIs Grid (Labels in text-zinc-400) */}
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
             {/* KPI 1: Benchmark Runs */}
@@ -259,7 +276,7 @@ export function BenchmarksClient({
                 Avg MMLU-Pro
               </div>
               <div className="mt-1 font-mono text-2xl font-bold tabular-nums text-zinc-100">
-                {kpis.avgMmluPro !== null ? formatPercent(kpis.avgMmluPro) : "68.4%"}
+                {kpis.avgMmluPro !== null ? formatPercent(kpis.avgMmluPro) : "—"}
               </div>
               <div className="mt-0.5 text-[11px] text-zinc-400">
                 Foundational text &amp; logic
@@ -272,7 +289,7 @@ export function BenchmarksClient({
                 Avg Multimodal (MMMU/DocVQA)
               </div>
               <div className="mt-1 font-mono text-2xl font-bold tabular-nums text-zinc-100">
-                {kpis.avgMultimodal !== null ? formatPercent(kpis.avgMultimodal) : "77.1%"}
+                {kpis.avgMultimodal !== null ? formatPercent(kpis.avgMultimodal) : "—"}
               </div>
               <div className="mt-0.5 text-[11px] text-zinc-400">
                 VLMEvalKit vision &amp; OCR
@@ -301,6 +318,7 @@ export function BenchmarksClient({
               className="flex gap-4"
             >
               <button
+                ref={tabLmRef}
                 id={tabLmId}
                 type="button"
                 role="tab"
@@ -318,6 +336,7 @@ export function BenchmarksClient({
                 LM-Eval (Text &amp; Code)
               </button>
               <button
+                ref={tabVlmRef}
                 id={tabVlmId}
                 type="button"
                 role="tab"
@@ -357,7 +376,7 @@ export function BenchmarksClient({
                   placeholder="Search model, run, or task..."
                   value={search}
                   onChange={(e) => setSearch(e.target.value)}
-                  className="w-full rounded border border-zinc-800 bg-zinc-950 px-3 py-1.5 font-mono text-xs text-zinc-200 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                  className="w-full rounded border border-zinc-800 bg-zinc-950 px-3 py-1.5 font-mono text-xs text-zinc-200 placeholder:text-zinc-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
                 />
               </div>
 

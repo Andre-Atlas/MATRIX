@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Background,
   Controls,
@@ -73,11 +73,20 @@ const NODE_TYPES = {
 export interface LineageDagTabProps {
   lineage: LineageGraph;
   loading?: boolean;
+  hideTruncatedBanner?: boolean;
 }
 
-export function LineageDagTab({ lineage, loading = false }: LineageDagTabProps) {
+export function LineageDagTab({
+  lineage,
+  loading = false,
+  hideTruncatedBanner = false,
+}: LineageDagTabProps) {
   const [viewMode, setViewMode] = useState<"graph" | "tree">("graph");
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+
+  useEffect(() => {
+    setSelectedNodeId(null);
+  }, [lineage]);
 
   const positionedNodes = useMemo(
     () => layoutLineageNodes(lineage.nodes ?? [], lineage.edges ?? []),
@@ -117,6 +126,7 @@ export function LineageDagTab({ lineage, loading = false }: LineageDagTabProps) 
         source: e.source,
         target: e.target,
         label: e.relation,
+        ariaLabel: `${e.relation}: edge from ${e.source} to ${e.target}`,
         animated: hasSelection && inPath,
         markerEnd: {
           type: MarkerType.ArrowClosed,
@@ -179,7 +189,7 @@ export function LineageDagTab({ lineage, loading = false }: LineageDagTabProps) 
 
   return (
     <div className="space-y-3">
-      {lineage.truncated && (
+      {lineage.truncated && !hideTruncatedBanner && (
         <div
           role="alert"
           className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-600/80 bg-amber-950/50 px-3.5 py-2.5 text-xs text-amber-200"

@@ -131,8 +131,10 @@ export function ModelsRegistryClient({
   const [verModelCard, setVerModelCard] = useState("");
   const [verSubmitting, setVerSubmitting] = useState(false);
   const [verError, setVerError] = useState<string | null>(null);
+  const detailReqIdRef = useRef(0);
 
   const loadModelDetail = useCallback(async (modelId: string) => {
+    const reqId = ++detailReqIdRef.current;
     setDetailLoading(true);
     try {
       const [nextDetail, historyResp] = await Promise.all([
@@ -162,13 +164,14 @@ export function ModelsRegistryClient({
           .catch(() => ({ model_id: modelId, nodes: [], edges: [] }));
       }
 
+      if (detailReqIdRef.current !== reqId) return;
       setDetail(nextDetail);
       setHistory(historyResp?.items ?? []);
       setLineage(nextLineage);
     } catch (err) {
-      setError(explain(err));
+      if (detailReqIdRef.current === reqId) setError(explain(err));
     } finally {
-      setDetailLoading(false);
+      if (detailReqIdRef.current === reqId) setDetailLoading(false);
     }
   }, []);
 
@@ -626,7 +629,7 @@ export function ModelsRegistryClient({
                           e.stopPropagation();
                           handleSelectModel(m.id);
                         }}
-                        className="text-left focus:outline-none"
+                        className="text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 rounded"
                       >
                         <div className="font-mono text-xs font-semibold text-zinc-100">
                           {m.name}

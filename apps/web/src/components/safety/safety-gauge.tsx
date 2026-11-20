@@ -45,12 +45,16 @@ export function SafetyGauge({
             <svg
               className="h-36 w-36 -rotate-90 transform"
               viewBox="0 0 160 160"
-              role="meter"
-              aria-label="Global Safety Score"
-              aria-valuenow={isNotEvaluated ? undefined : numericScore}
-              aria-valuetext={isNotEvaluated ? "Not evaluated" : `${numericScore}%`}
-              aria-valuemin={0}
-              aria-valuemax={100}
+              role={isNotEvaluated ? "img" : "meter"}
+              aria-label={isNotEvaluated ? "Global Safety Score: Not evaluated" : "Global Safety Score"}
+              {...(!isNotEvaluated
+                ? {
+                    "aria-valuenow": numericScore,
+                    "aria-valuetext": `${numericScore}%`,
+                    "aria-valuemin": 0,
+                    "aria-valuemax": 100,
+                  }
+                : {})}
             >
               {/* Background circle track */}
               <circle
@@ -193,7 +197,7 @@ export function SafetyGauge({
             <div className="mt-1 h-1.5 w-full min-w-[160px] overflow-hidden rounded-full bg-zinc-800">
               <div
                 className="h-full bg-emerald-500 transition-all duration-500"
-                style={{ width: `${summary.compliance_rate}%` }}
+                style={{ width: `${summary.compliance_rate ?? 0}%` }}
               />
             </div>
           </div>

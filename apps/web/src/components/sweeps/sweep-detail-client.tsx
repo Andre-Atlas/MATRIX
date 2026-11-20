@@ -60,6 +60,144 @@ export function SweepDetailClient({
     [runs],
   );
 
+  const metricKey = sweep?.config?.metric?.key ?? "metric";
+  const metricGoal = sweep?.config?.metric?.goal === "maximize" ? "maximize" : "minimize";
+
+  const parallelPlotData = useMemo(() => {
+    const dimKeys = [...paramKeys, metricKey];
+    if (dimKeys.length === 0 || runs.length === 0) return null;
+    const width = 520;
+    const height = 210;
+    const padX = 36;
+    const topY = 24;
+    const bottomY = 172;
+    const spanY = bottomY - topY;
+
+    const axesMeta = dimKeys.map((k, idx) => {
+      const isMetric = k === metricKey;
+      const spec = sweep?.config?.parameters?.[k];
+      const x =
+        dimKeys.length === 1
+          ? width / 2
+          : padX + (idx / (dimKeys.length - 1)) * (width - padX * 2);
+
+      const rawVals = runs.map((r) =>
+        isMetric ? r.best_value ?? r.last_value : r.params?.[k],
+      );
+
+      if (spec?.type === "choice" || rawVals.some((v) => typeof v === "string" || typeof v === "boolean")) {
+        const categories =
+          spec?.type === "choice" && spec.values.length > 0
+            ? spec.values.map((v) => String(v))
+            : [...new Set(rawVals.filter((v) => v !== null && v !== undefined).map((v) => String(v)))];
+        return { key: k, x, categories, isLog: false, min: 0, max: Math.max(0, categories.length - 1), topLabel: categories[categories.length - 1] ?? "", bottomLabel: categories[0] ?? "" };
+      }
+
+      const nums = rawVals.map((v) => Number(v)).filter((n) => Number.isFinite(n));
+      const min = nums.length > 0 ? Math.min(...nums) : 0;
+      const max = nums.length > 0 ? Math.max(...nums) : 1;
+      const isLog = Boolean(spec && "log" in spec && spec.log && min > 0 && max > 0);
+      const fmt = (n: number) =>
+        isLog || (Math.abs(n) > 0 && Math.abs(n) < 0.01)
+          ? n.toExponential(1)
+          : Number.isInteger(n)
+            ? String(n)
+            : n.toFixed(3);
+      return { key: k, x, categories: null as string[] | null, isLog, min, max, topLabel: fmt(max), bottomLabel: fmt(min) };
+    });
+
+    const lines = runs
+      .map((r) => {
+        const pts: string[] = [];
+        for (const ax of axesMeta) {
+          const raw = ax.key === metricKey ? r.best_value ?? r.last_value : r.params?.[ax.key];
+          if (raw === null || raw === undefined) continue;
+          let norm = 0.5;
+          if (ax.categories) {
+            const idx = ax.categories.indexOf(String(raw));
+            if (idx < 0) continue;
+            norm = ax.categories.length <= 1 ? 0.5 : idx / (ax.categories.length - 1);
+          } else {
+            const num = Number(raw);
+            if (!Number.isFinite(num)) continue;
+            if (ax.max === ax.min) {
+              norm = 0.5;
+            } else if (ax.isLog && num > 0) {
+              const lMin = Math.log10(ax.min);
+              const lMax = Math.log10(ax.max);
+              norm = lMax === lMin ? 0.5 : (Math.log10(num) - lMin) / (lMax - lMin);
+            } else {
+              norm = (num - ax.min) / (ax.max - ax.min);
+            }
+          }
+          const clamped = Math.max(0, Math.min(1, norm));
+          const y = bottomY - clamped * spanY;
+          pts.push(`${ax.x.toFixed(1)},${y.toFixed(1)}`);
+        }
+        return {
+          runId: r.run_id,
+          isBest: sweep?.best_run_id === r.run_id,
+          pruned: Boolean(r.pruned),
+          points: pts.join(" "),
+          count: pts.length,
+        };
+      })
+      .filter((l) => l.count >= 2);
+
+    return { width, height, topY, bottomY, axesMeta, lines };
+  }, [paramKeys, metricKey, runs, sweep]);
+
+  const metricCurveData = useMemo(() => {
+    const scoredRuns = runs
+      .map((r, idx) => ({
+        idx: idx + 1,
+        runId: r.run_id,
+        val: r.best_value ?? r.last_value,
+        pruned: Boolean(r.pruned),
+        isBest: sweep?.best_run_id === r.run_id,
+      }))
+      .filter((d): d is { idx: number; runId: string; val: number; pruned: boolean; isBest: boolean } =>
+        typeof d.val === "number" && Number.isFinite(d.val),
+      );
+    if (scoredRuns.length === 0) return null;
+
+    const width = 520;
+    const height = 210;
+    const leftX = 44;
+    const rightX = 502;
+    const topY = 20;
+    const bottomY = 172;
+    const minVal = Math.min(...scoredRuns.map((d) => d.val));
+    const maxVal = Math.max(...scoredRuns.map((d) => d.val));
+    const range = maxVal - minVal || 1;
+
+    let runningBest = scoredRuns[0].val;
+    const coords = scoredRuns.map((d, i) => {
+      runningBest = metricGoal === "maximize" ? Math.max(runningBest, d.val) : Math.min(runningBest, d.val);
+      const x =
+        scoredRuns.length === 1
+          ? (leftX + rightX) / 2
+          : leftX + (i / (scoredRuns.length - 1)) * (rightX - leftX);
+      const y = bottomY - ((d.val - minVal) / range) * (bottomY - topY);
+      const bestY = bottomY - ((runningBest - minVal) / range) * (bottomY - topY);
+      return { ...d, x, y, bestY };
+    });
+
+    return {
+      width,
+      height,
+      leftX,
+      rightX,
+      topY,
+      bottomY,
+      minVal,
+      maxVal,
+      coords,
+      metricPoly: coords.map((c) => `${c.x.toFixed(1)},${c.y.toFixed(1)}`).join(" "),
+      envelopePoly: coords.map((c) => `${c.x.toFixed(1)},${c.bestY.toFixed(1)}`).join(" "),
+    };
+  }, [runs, sweep?.best_run_id, metricGoal]);
+
   const sortedRuns = useMemo(() => {
     const filtered = hidePruned ? runs.filter((r) => !r.pruned) : runs;
     return [...filtered].sort((a, b) => {
@@ -363,6 +501,217 @@ export function SweepDetailClient({
           </div>
         )}
       </section>
+
+      {/* Parallel Coordinates & Per-Run Metric / Pruning Curve */}
+      {runs.length > 0 && (
+        <section
+          aria-label="Sweep trial visualizations"
+          className="grid grid-cols-1 gap-4 lg:grid-cols-2"
+        >
+          {/* Parallel Coordinates */}
+          <div className="rounded-lg border border-zinc-800 bg-zinc-900/60 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800 pb-2.5">
+              <div>
+                <h2 className="text-sm font-semibold text-zinc-100">
+                  Parallel Coordinates
+                </h2>
+                <p className="text-xs text-zinc-400">
+                  Hyperparameter paths vs {metricKey} across {runs.length} trials
+                </p>
+              </div>
+              <div className="flex items-center gap-3 text-[11px] text-zinc-300">
+                <span className="inline-flex items-center gap-1">
+                  <span aria-hidden="true" className="h-2 w-2 rounded-full bg-emerald-400" />
+                  Best
+                </span>
+                <span className="inline-flex items-center gap-1">
+                  <span aria-hidden="true" className="h-2 w-2 rounded-full bg-amber-400" />
+                  Pruned
+                </span>
+              </div>
+            </div>
+            {parallelPlotData && parallelPlotData.lines.length > 0 ? (
+              <svg
+                role="img"
+                aria-label={`Parallel coordinates across ${parallelPlotData.axesMeta.length} dimensions for ${runs.length} trials`}
+                viewBox={`0 0 ${parallelPlotData.width} ${parallelPlotData.height}`}
+                className="mt-3 h-52 w-full"
+              >
+                {parallelPlotData.axesMeta.map((ax) => (
+                  <g key={ax.key}>
+                    <line
+                      x1={ax.x}
+                      y1={parallelPlotData.topY}
+                      x2={ax.x}
+                      y2={parallelPlotData.bottomY}
+                      stroke="#3f3f46"
+                      strokeWidth="1.5"
+                    />
+                    <text
+                      x={ax.x}
+                      y={14}
+                      textAnchor="middle"
+                      fill="#e4e4e7"
+                      fontSize="10"
+                      fontFamily="ui-monospace, monospace"
+                    >
+                      {ax.key}
+                    </text>
+                    <text
+                      x={ax.x}
+                      y={parallelPlotData.topY + 10}
+                      textAnchor="middle"
+                      fill="#a1a1aa"
+                      fontSize="9"
+                      fontFamily="ui-monospace, monospace"
+                    >
+                      {ax.topLabel}
+                    </text>
+                    <text
+                      x={ax.x}
+                      y={parallelPlotData.bottomY + 12}
+                      textAnchor="middle"
+                      fill="#a1a1aa"
+                      fontSize="9"
+                      fontFamily="ui-monospace, monospace"
+                    >
+                      {ax.bottomLabel}
+                    </text>
+                  </g>
+                ))}
+                {parallelPlotData.lines.map((line) => (
+                  <polyline
+                    key={line.runId}
+                    fill="none"
+                    points={line.points}
+                    stroke={line.isBest ? "#34d399" : line.pruned ? "#fbbf24" : "#38bdf8"}
+                    strokeWidth={line.isBest ? 2.5 : 1.5}
+                    strokeOpacity={line.isBest ? 1 : line.pruned ? 0.7 : 0.75}
+                    strokeDasharray={line.pruned ? "4 3" : undefined}
+                  />
+                ))}
+              </svg>
+            ) : (
+              <p className="mt-4 text-xs text-zinc-400">
+                Waiting for completed trial metrics to plot parallel coordinates.
+              </p>
+            )}
+          </div>
+
+          {/* Per-Run Metric & Pruning Curve */}
+          <div className="rounded-lg border border-zinc-800 bg-zinc-900/60 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800 pb-2.5">
+              <div>
+                <h2 className="text-sm font-semibold text-zinc-100">
+                  Metric &amp; Pruning Curve
+                </h2>
+                <p className="text-xs text-zinc-400">
+                  {metricKey} progression per trial ({metricGoal}) with best envelope and pruned markers
+                </p>
+              </div>
+              <div className="flex items-center gap-3 text-[11px] text-zinc-300">
+                <span className="inline-flex items-center gap-1">
+                  <span aria-hidden="true" className="h-2 w-2 rounded-full bg-sky-400" />
+                  Trial
+                </span>
+                <span className="inline-flex items-center gap-1">
+                  <span aria-hidden="true" className="h-2 w-2 rounded-full bg-amber-400" />
+                  Pruned
+                </span>
+              </div>
+            </div>
+            {metricCurveData ? (
+              <svg
+                role="img"
+                aria-label={`Metric progression and pruning curve for ${metricCurveData.coords.length} trials`}
+                viewBox={`0 0 ${metricCurveData.width} ${metricCurveData.height}`}
+                className="mt-3 h-52 w-full"
+              >
+                <line
+                  x1={metricCurveData.leftX}
+                  y1={metricCurveData.topY}
+                  x2={metricCurveData.leftX}
+                  y2={metricCurveData.bottomY}
+                  stroke="#3f3f46"
+                  strokeWidth="1"
+                />
+                <line
+                  x1={metricCurveData.leftX}
+                  y1={metricCurveData.bottomY}
+                  x2={metricCurveData.rightX}
+                  y2={metricCurveData.bottomY}
+                  stroke="#3f3f46"
+                  strokeWidth="1"
+                />
+                <text
+                  x={metricCurveData.leftX - 6}
+                  y={metricCurveData.topY + 4}
+                  textAnchor="end"
+                  fill="#a1a1aa"
+                  fontSize="9"
+                  fontFamily="ui-monospace, monospace"
+                >
+                  {metricCurveData.maxVal.toFixed(3)}
+                </text>
+                <text
+                  x={metricCurveData.leftX - 6}
+                  y={metricCurveData.bottomY}
+                  textAnchor="end"
+                  fill="#a1a1aa"
+                  fontSize="9"
+                  fontFamily="ui-monospace, monospace"
+                >
+                  {metricCurveData.minVal.toFixed(3)}
+                </text>
+                {metricCurveData.coords.length > 1 && (
+                  <>
+                    <polyline
+                      fill="none"
+                      stroke="#38bdf8"
+                      strokeWidth="1.5"
+                      strokeOpacity="0.8"
+                      points={metricCurveData.metricPoly}
+                    />
+                    <polyline
+                      fill="none"
+                      stroke="#34d399"
+                      strokeWidth="1.5"
+                      strokeDasharray="4 3"
+                      points={metricCurveData.envelopePoly}
+                    />
+                  </>
+                )}
+                {metricCurveData.coords.map((pt) => (
+                  <g key={pt.runId}>
+                    <circle
+                      cx={pt.x}
+                      cy={pt.y}
+                      r={pt.isBest ? 5 : 4}
+                      fill={pt.pruned ? "#fbbf24" : pt.isBest ? "#34d399" : "#38bdf8"}
+                      stroke="#09090b"
+                      strokeWidth="1.5"
+                    />
+                    <text
+                      x={pt.x}
+                      y={metricCurveData.bottomY + 14}
+                      textAnchor="middle"
+                      fill="#a1a1aa"
+                      fontSize="9"
+                      fontFamily="ui-monospace, monospace"
+                    >
+                      #{pt.idx}{pt.pruned ? "*" : ""}
+                    </text>
+                  </g>
+                ))}
+              </svg>
+            ) : (
+              <p className="mt-4 text-xs text-zinc-400">
+                Waiting for objective metric points across sweep runs.
+              </p>
+            )}
+          </div>
+        </section>
+      )}
 
       {/* Trials / Runs Table */}
       <section

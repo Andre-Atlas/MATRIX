@@ -51,7 +51,7 @@ export function layoutLineageNodes(
     byCol.set(col, arr);
   }
 
-  const COL_GAP = 270;
+  const COL_GAP = 360;
   const ROW_GAP = 120;
   const PADDING_X = 24;
   const PADDING_Y = 24;

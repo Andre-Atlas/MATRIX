@@ -144,7 +144,7 @@ export function summarizeScan(
   categories: SafetyCategory[],
 ): SafetyScanReport {
   const scanId = scan.id ?? (scan as any).scan_id;
-  const scanFindings = findings.filter((f) => f.scan_id === scanId || !f.scan_id);
+  const scanFindings = findings.filter((f) => f.scan_id === scanId);
 
   let critical = 0;
   let high = 0;
@@ -160,6 +160,13 @@ export function summarizeScan(
     }
   }
 
+  const isNotEvaluated =
+    scan.status === "not_evaluated" ||
+    scan.risk_level === "not_evaluated" ||
+    (scan.safety_score === null && (scan as any).global_score == null);
+
+  const testedSet = new Set(scan.categories_tested ?? []);
+
   const categoryScores: SafetyCategoryScore[] = categories.map((cat) => {
     const catCode = (cat.code ?? cat.id) as SafetyCategoryCode;
     const catFindings = scanFindings.filter(
@@ -169,6 +176,23 @@ export function summarizeScan(
         f.category_id === catCode ||
         f.category_code === cat.id,
     );
+    const explicitlyUntested =
+      testedSet.size > 0 && !testedSet.has(catCode) && !testedSet.has(cat.id) && catFindings.length === 0;
+    if (isNotEvaluated || explicitlyUntested) {
+      return {
+        category_id: cat.id,
+        category_code: catCode,
+        name: cat.name,
+        probes_tested: 0,
+        probes_passed: 0,
+        probes_failed: 0,
+        pass_rate: null,
+        status: "not_evaluated",
+        findings_count: 0,
+        critical_findings: 0,
+      };
+    }
+
     const catProbesTested = catFindings.length > 0 ? catFindings.length : cat.probes_count || 1;
     const failedFindings = catFindings.filter((f) => f.status === "failed");
     const passedCount =
@@ -192,11 +216,6 @@ export function summarizeScan(
       critical_findings: catCritical,
     };
   });
-
-  const isNotEvaluated =
-    scan.status === "not_evaluated" ||
-    scan.risk_level === "not_evaluated" ||
-    (scan.safety_score === null && (scan as any).global_score == null);
 
   const probesPassed = scan.probes_passed ?? (scan as any).passed_count ?? 0;
   const probesFailed = scan.probes_failed ?? (scan as any).failed_count ?? 0;
@@ -447,6 +466,12 @@ export function formatComplianceStatus(status: ComplianceStatus) {
         label: "Vulnerable",
         badge: "bg-red-950/60 text-red-300 border-red-800/60",
         dot: "bg-red-400",
+      };
+    case "not_evaluated":
+      return {
+        label: "Not evaluated",
+        badge: "bg-zinc-900 text-zinc-200 border-zinc-600",
+        dot: "bg-zinc-400",
       };
     default:
       return {

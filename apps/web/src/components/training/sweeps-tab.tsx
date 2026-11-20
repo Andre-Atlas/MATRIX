@@ -167,7 +167,7 @@ export function SweepsTab({
       <div className="rounded-md border border-dashed border-zinc-800 px-6 py-12 text-center">
         <p className="font-medium text-zinc-200">No hyperparameter sweeps found</p>
         <p className="mt-1 text-xs text-zinc-400">
-          Create a sweep via the Python SDK (<code className="font-mono text-zinc-300">matrix_sdk.mlops.create_sweep</code>) to visualize parallel coordinates and parameter importance.
+          Create a sweep via the Python SDK (<code className="font-mono text-zinc-300">matrix_sdk.sweep</code>) to visualize parallel coordinates and parameter importance.
         </p>
       </div>
     );

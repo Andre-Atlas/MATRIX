@@ -16,14 +16,14 @@ afterEach(() => {
 describe("SimulatedBadge & NotEvaluatedBadge (WCAG 2.2 AA)", () => {
   it("renders SimulatedBadge with non-color-only icon and text", () => {
     render(<SimulatedBadge />);
-    const badge = screen.getByRole("status");
+    const badge = screen.getByLabelText(/Simulated/i);
     expect(badge.textContent).toContain("Simulated");
     expect(badge.getAttribute("aria-label")).toMatch(/Simulated/i);
   });
 
   it("renders NotEvaluatedBadge with accessible text", () => {
     render(<NotEvaluatedBadge />);
-    const badge = screen.getByRole("status");
+    const badge = screen.getByLabelText("Not evaluated");
     expect(badge.textContent).toContain("Not evaluated");
   });
 });
@@ -39,18 +39,24 @@ describe("Safety not_evaluated handling", () => {
         message="No target outputs supplied for red-team evaluation."
         summary={{
           total_probes: 0,
-          probes_passed: 0,
-          probes_failed: 0,
-          critical_findings: 0,
-          high_findings: 0,
-          medium_findings: 0,
-          low_findings: 0,
+          passed: 0,
+          failed: 0,
+          compliance_rate: null,
+          score: null,
+          risk_level: "not_evaluated",
+          critical_count: 0,
+          high_count: 0,
+          medium_count: 0,
+          low_count: 0,
+          not_evaluated: true,
+          simulated: true,
+          message: "No target outputs supplied for red-team evaluation.",
         }}
       />,
     );
 
-    const meter = screen.getByRole("meter");
-    expect(meter.getAttribute("aria-valuetext")).toBe("Not evaluated");
+    const meter = screen.getByRole("img", { name: /Not evaluated/i });
+    expect(meter).toBeTruthy();
     expect(screen.getAllByText("Not evaluated").length).toBeGreaterThan(0);
     expect(screen.queryByText("100")).toBeNull();
     expect(screen.queryByText("100%")).toBeNull();
@@ -71,7 +77,6 @@ describe("Safety not_evaluated handling", () => {
       risk_level: "not_evaluated",
       findings_count: 0,
       simulated: false,
-      not_evaluated: true,
       message: "Target model endpoint was not evaluated.",
       created_at: "2026-11-12T10:00:00Z",
     };
@@ -79,7 +84,10 @@ describe("Safety not_evaluated handling", () => {
     const report = summarizeScan(scan, [], MOCK_SAFETY_CATEGORIES);
     expect(report.scan.safety_score).toBeNull();
     expect(report.scan.risk_level).toBe("not_evaluated");
-    expect(report.category_breakdown[0].compliance_rate).toBeNull();
+    expect(report.summary.compliance_rate).toBeNull();
+    expect(report.summary.not_evaluated).toBe(true);
+    expect(report.category_scores[0].pass_rate).toBeNull();
+    expect(report.category_scores[0].status).toBe("not_evaluated");
   });
 });
 

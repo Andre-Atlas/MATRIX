@@ -39,6 +39,7 @@ export default async function LineagePage({
 
   return (
     <LineageExplorerClient
+      key={`${node}:${direction}:${depth}`}
       initialNode={node}
       initialDirection={direction}
       initialDepth={depth}

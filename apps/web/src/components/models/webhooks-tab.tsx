@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useCan } from "@/components/auth/role-context";
 import { EmptyState } from "@/components/ui";
 import { formatTimestamp } from "@/lib/format";
@@ -40,9 +40,12 @@ export function WebhooksTab({ modelId }: WebhooksTabProps) {
   const [selectedWebhookId, setSelectedWebhookId] = useState<string | null>(null);
   const [deliveries, setDeliveries] = useState<WebhookDelivery[]>([]);
   const [loadingDeliveries, setLoadingDeliveries] = useState(false);
+  const webhooksReqRef = useRef(0);
+  const deliveriesReqRef = useRef(0);
 
   const loadWebhooks = useCallback(async () => {
     if (!isAdmin) return;
+    const reqId = ++webhooksReqRef.current;
     setLoading(true);
     setError(null);
     try {
@@ -50,11 +53,12 @@ export function WebhooksTab({ modelId }: WebhooksTabProps) {
         "GET",
         `models/${encodeURIComponent(modelId)}/webhooks`,
       );
+      if (webhooksReqRef.current !== reqId) return;
       setWebhooks(Array.isArray(resp?.items) ? resp.items : []);
     } catch (err) {
-      setError(explain(err));
+      if (webhooksReqRef.current === reqId) setError(explain(err));
     } finally {
-      setLoading(false);
+      if (webhooksReqRef.current === reqId) setLoading(false);
     }
   }, [modelId, isAdmin]);
 
@@ -66,6 +70,7 @@ export function WebhooksTab({ modelId }: WebhooksTabProps) {
   }, [loadWebhooks]);
 
   const loadDeliveries = async (webhookId: string) => {
+    const reqId = ++deliveriesReqRef.current;
     setSelectedWebhookId(webhookId);
     setLoadingDeliveries(true);
     setError(null);
@@ -74,11 +79,12 @@ export function WebhooksTab({ modelId }: WebhooksTabProps) {
         "GET",
         `models/${encodeURIComponent(modelId)}/webhooks/${encodeURIComponent(webhookId)}/deliveries`,
       );
+      if (deliveriesReqRef.current !== reqId) return;
       setDeliveries(Array.isArray(resp?.items) ? resp.items : []);
     } catch (err) {
-      setError(explain(err));
+      if (deliveriesReqRef.current === reqId) setError(explain(err));
     } finally {
-      setLoadingDeliveries(false);
+      if (deliveriesReqRef.current === reqId) setLoadingDeliveries(false);
     }
   };
 

@@ -248,7 +248,7 @@ export function LineageExplorerClient({
           </p>
         </EmptyState>
       ) : (
-        <LineageDagTab lineage={filteredGraph} loading={false} />
+        <LineageDagTab lineage={filteredGraph} loading={false} hideTruncatedBanner />
       )}
     </div>
   );

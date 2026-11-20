@@ -95,7 +95,7 @@ export function ProviderCircuitBoard({ providers }: ProviderCircuitBoardProps) {
                       )}
                     </div>
                     {p.endpoint && (
-                      <p className="mt-0.5 truncate text-[11px] font-mono text-zinc-500" title={p.endpoint}>
+                      <p className="mt-0.5 truncate text-[11px] font-mono text-zinc-400" title={p.endpoint}>
                         {p.endpoint}
                       </p>
                     )}
@@ -193,7 +193,12 @@ export function ProviderCircuitBoard({ providers }: ProviderCircuitBoardProps) {
                     {health.label}
                   </span>
                 </div>
-                <div className="flex flex-wrap gap-1 max-h-16 overflow-y-auto">
+                <div
+                  tabIndex={0}
+                  role="region"
+                  aria-label={`Modelos registrados para ${p.name}`}
+                  className="flex flex-wrap gap-1 max-h-16 overflow-y-auto focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-emerald-400"
+                >
                   {models.map((m) => (
                     <span
                       key={m}

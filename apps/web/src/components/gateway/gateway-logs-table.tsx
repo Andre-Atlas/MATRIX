@@ -74,10 +74,11 @@ export function GatewayLogsTable({ logs }: GatewayLogsTableProps) {
           <div className="relative min-w-[220px] flex-1 sm:flex-initial">
             <input
               type="text"
+              aria-label="Filter request logs"
               placeholder="Buscar por modelo, ID ou rota..."
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              className="w-full rounded-lg border border-zinc-800 bg-zinc-950/80 px-3 py-1.5 text-xs text-zinc-200 placeholder-zinc-500 focus:border-zinc-700 focus:outline-none focus:ring-1 focus:ring-zinc-700"
+              className="w-full rounded-lg border border-zinc-800 bg-zinc-950/80 px-3 py-1.5 text-xs text-zinc-200 placeholder:text-zinc-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
             />
           </div>
 
@@ -87,6 +88,7 @@ export function GatewayLogsTable({ logs }: GatewayLogsTableProps) {
               <button
                 key={st}
                 type="button"
+                aria-pressed={statusFilter === st}
                 onClick={() => setStatusFilter(st)}
                 className={`rounded px-2.5 py-1 text-xs font-medium transition-colors ${
                   statusFilter === st
@@ -104,7 +106,7 @@ export function GatewayLogsTable({ logs }: GatewayLogsTableProps) {
             value={providerFilter}
             onChange={(e) => setProviderFilter(e.target.value)}
             aria-label="Filtrar por Provedor"
-            className="rounded-lg border border-zinc-800 bg-zinc-950/80 px-2.5 py-1.5 text-xs text-zinc-300 focus:border-zinc-700 focus:outline-none"
+            className="rounded-lg border border-zinc-800 bg-zinc-950/80 px-2.5 py-1.5 text-xs text-zinc-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
           >
             <option value="all">Todos os Provedores</option>
             {providers.map((p) => (
@@ -131,7 +133,12 @@ export function GatewayLogsTable({ logs }: GatewayLogsTableProps) {
       </div>
 
       {/* Table */}
-      <div className="mt-4 overflow-x-auto">
+      <div
+        tabIndex={0}
+        role="region"
+        aria-label="Gateway request logs table"
+        className="mt-4 overflow-x-auto focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-emerald-400"
+      >
         <table className="w-full border-collapse text-left text-xs">
           <thead>
             <tr className="border-b border-zinc-800/80 text-[11px] font-semibold uppercase tracking-wider text-zinc-400">
@@ -148,7 +155,7 @@ export function GatewayLogsTable({ logs }: GatewayLogsTableProps) {
           <tbody className="divide-y divide-zinc-800/60 font-mono">
             {filteredLogs.length === 0 ? (
               <tr>
-                <td colSpan={8} className="py-8 text-center text-sm text-zinc-500 font-sans">
+                <td colSpan={8} className="py-8 text-center text-sm text-zinc-400 font-sans">
                   Nenhuma requisição corresponde aos filtros aplicados.
                 </td>
               </tr>
@@ -208,10 +215,19 @@ export function GatewayLogsTable({ logs }: GatewayLogsTableProps) {
 
                     {/* Route & Request ID */}
                     <td className="py-2.5 px-3 align-middle">
-                      <div className="font-sans font-medium text-zinc-200 truncate max-w-[200px]" title={routeName}>
+                      <button
+                        type="button"
+                        aria-expanded={isExpanded}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setExpandedLogId(isExpanded ? null : log.id);
+                        }}
+                        className="rounded text-left font-sans font-medium text-zinc-200 hover:text-emerald-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 truncate max-w-[200px]"
+                        title={routeName}
+                      >
                         {routeName}
-                      </div>
-                      <div className="text-[10px] text-zinc-500 truncate" title={reqId}>
+                      </button>
+                      <div className="text-[10px] text-zinc-400 truncate" title={reqId}>
                         {reqId}
                       </div>
                     </td>
@@ -232,7 +248,7 @@ export function GatewayLogsTable({ logs }: GatewayLogsTableProps) {
                         )}
                       </div>
                       {isRerouted && (
-                        <div className="text-[10px] text-zinc-500 line-through truncate max-w-[170px]">
+                        <div className="text-[10px] text-zinc-400 line-through truncate max-w-[170px]">
                           {reqModel}
                         </div>
                       )}
@@ -255,7 +271,7 @@ export function GatewayLogsTable({ logs }: GatewayLogsTableProps) {
                       <div className="text-zinc-200 font-semibold">
                         {formatTokenCount(totalTokens)}
                       </div>
-                      <div className="text-[10px] text-zinc-500">
+                      <div className="text-[10px] text-zinc-400">
                         {promptTokens} in / {completionTokens} out
                       </div>
                     </td>
@@ -289,7 +305,7 @@ export function GatewayLogsTable({ logs }: GatewayLogsTableProps) {
                         </div>
                       )}
                       {log.cache_score !== undefined && log.cache_score !== null && (
-                        <div className="text-[10px] text-zinc-500">
+                        <div className="text-[10px] text-zinc-400">
                           sim: {(log.cache_score * 100).toFixed(1)}%
                         </div>
                       )}
@@ -319,7 +335,7 @@ export function GatewayLogsTable({ logs }: GatewayLogsTableProps) {
                   <button
                     type="button"
                     onClick={() => setExpandedLogId(null)}
-                    className="text-zinc-500 hover:text-zinc-300 text-xs"
+                    className="text-zinc-400 hover:text-zinc-300 text-xs"
                   >
                     Fechar &times;
                   </button>

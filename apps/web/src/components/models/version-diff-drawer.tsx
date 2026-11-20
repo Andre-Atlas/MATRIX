@@ -99,7 +99,12 @@ export function VersionDiffDrawer({
           </button>
         </div>
 
-        <div className="flex-1 space-y-5 overflow-y-auto p-5 text-xs">
+        <div
+          tabIndex={0}
+          role="region"
+          aria-label="Version comparison details"
+          className="flex-1 space-y-5 overflow-y-auto p-5 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
+        >
           {/* Stage & Aliases */}
           <section className="space-y-2">
             <h3 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">

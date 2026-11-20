@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { PRIMARY_BTN_CLASS } from "@/lib/mlops-tokens";
 import { proxy } from "@/lib/proxy-client";
 import type {
   CreateSafetyScanRequest,
@@ -35,6 +36,10 @@ export function NewScanModal({
   const [probeDepth, setProbeDepth] = useState<number>(4);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     if (categories.length > 0) {
@@ -45,16 +50,22 @@ export function NewScanModal({
     }
   }, [categories, isOpen]);
 
-  // Close on Escape key
   useEffect(() => {
+    if (!isOpen) return;
+    previousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const raf = requestAnimationFrame(() => dialogRef.current?.focus());
     function handleKeyDown(e: KeyboardEvent) {
-      if (e.key === "Escape" && isOpen && !isSubmitting) {
-        onClose();
+      if (e.key === "Escape" && !isSubmitting) {
+        onCloseRef.current();
       }
     }
     window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [isOpen, isSubmitting, onClose]);
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener("keydown", handleKeyDown);
+      previousFocusRef.current?.focus();
+    };
+  }, [isOpen, isSubmitting]);
 
   if (!isOpen) return null;
 
@@ -113,7 +124,11 @@ export function NewScanModal({
       aria-labelledby="modal-title"
       className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-black/70 p-4 backdrop-blur-sm"
     >
-      <div className="relative w-full max-w-2xl rounded-xl border border-zinc-800 bg-zinc-950 p-6 shadow-2xl">
+      <div
+        ref={dialogRef}
+        tabIndex={-1}
+        className="relative w-full max-w-2xl rounded-xl border border-zinc-800 bg-zinc-950 p-6 shadow-2xl focus:outline-none"
+      >
         {/* Header */}
         <div className="flex items-center justify-between border-b border-zinc-800/80 pb-4">
           <div>
@@ -128,14 +143,15 @@ export function NewScanModal({
             type="button"
             onClick={onClose}
             disabled={isSubmitting}
-            className="rounded p-1 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+            aria-label="Close modal"
+            className="inline-flex h-7 w-7 items-center justify-center rounded border border-zinc-800 bg-zinc-900 text-xs text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100"
           >
             ✕
           </button>
         </div>
 
         {error && (
-          <div className="mt-4 rounded-md border border-red-800/80 bg-red-950/40 p-3 text-xs text-red-300">
+          <div role="alert" className="mt-4 rounded-md border border-red-800/80 bg-red-950/40 p-3 text-xs text-red-300">
             {error}
           </div>
         )}
@@ -144,26 +160,28 @@ export function NewScanModal({
           {/* Audit Name & Target Model */}
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div>
-              <label className="block text-xs font-medium text-zinc-300">
+              <label htmlFor="safety-audit-name" className="block text-xs font-medium text-zinc-300">
                 Audit Name
               </label>
               <input
+                id="safety-audit-name"
                 type="text"
                 required
                 value={name}
                 onChange={(e) => setName(e.target.value)}
-                className="mt-1 w-full rounded border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-100 focus:border-emerald-500 focus:outline-none"
+                className="mt-1 w-full rounded border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
               />
             </div>
 
             <div>
-              <label className="block text-xs font-medium text-zinc-300">
+              <label htmlFor="safety-target-model" className="block text-xs font-medium text-zinc-300">
                 Target Model
               </label>
               <select
+                id="safety-target-model"
                 value={targetModel}
                 onChange={(e) => setTargetModel(e.target.value)}
-                className="mt-1 w-full rounded border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-100 focus:border-emerald-500 focus:outline-none"
+                className="mt-1 w-full rounded border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
               >
                 <option value="gpt-4o">gpt-4o</option>
                 <option value="gpt-4o-mini">gpt-4o-mini</option>
@@ -177,23 +195,24 @@ export function NewScanModal({
 
           {/* Target System Prompt */}
           <div>
-            <label className="block text-xs font-medium text-zinc-300">
+            <label htmlFor="safety-system-prompt" className="block text-xs font-medium text-zinc-300">
               Target System Prompt / Guardrail Rules
             </label>
             <textarea
+              id="safety-system-prompt"
               rows={2}
               value={targetSystemPrompt}
               onChange={(e) => setTargetSystemPrompt(e.target.value)}
               placeholder="Instructions provided to the LLM agent..."
-              className="mt-1 w-full rounded border border-zinc-700 bg-zinc-900 px-3 py-1.5 font-mono text-xs text-zinc-200 focus:border-emerald-500 focus:outline-none"
+              className="mt-1 w-full rounded border border-zinc-700 bg-zinc-900 px-3 py-1.5 font-mono text-xs text-zinc-200 placeholder:text-zinc-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
             />
           </div>
 
           {/* Probe Depth / Intensity */}
           <div>
-            <label className="block text-xs font-medium text-zinc-300">
+            <span className="block text-xs font-medium text-zinc-300">
               Audit Intensity / Probe Depth
-            </label>
+            </span>
             <div className="mt-1 grid grid-cols-3 gap-2">
               {[
                 { depth: 2, label: "Fast Triage", sub: "2 probes/cat" },
@@ -203,11 +222,12 @@ export function NewScanModal({
                 <button
                   key={lvl.depth}
                   type="button"
+                  aria-pressed={probeDepth === lvl.depth}
                   onClick={() => setProbeDepth(lvl.depth)}
                   className={`rounded border p-2 text-left transition-colors ${
                     probeDepth === lvl.depth
                       ? "border-emerald-500 bg-emerald-950/30 text-emerald-300"
-                      : "border-zinc-800 bg-zinc-900/60 text-zinc-400 hover:border-zinc-700"
+                      : "border-zinc-800 bg-zinc-900/60 text-zinc-300 hover:border-zinc-700"
                   }`}
                 >
                   <div className="text-xs font-semibold">{lvl.label}</div>
@@ -289,18 +309,15 @@ export function NewScanModal({
             <button
               type="submit"
               disabled={isSubmitting}
-              className="inline-flex items-center gap-1.5 rounded bg-emerald-600 px-4 py-1.5 text-xs font-semibold text-white shadow-sm hover:bg-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500 disabled:opacity-50"
+              className={`inline-flex items-center gap-1.5 rounded px-4 py-1.5 text-xs font-semibold disabled:opacity-50 ${PRIMARY_BTN_CLASS}`}
             >
               {isSubmitting ? (
                 <>
-                  <span className="h-3 w-3 animate-spin rounded-full border-2 border-white border-t-transparent" />
+                  <span className="h-3 w-3 animate-spin rounded-full border-2 border-emerald-200 border-t-transparent" />
                   Running defensive probes...
                 </>
               ) : (
-                <>
-                  <span>⚡</span>
-                  Disparar Scan de Segurança
-                </>
+                <>Trigger Safety Scan</>
               )}
             </button>
           </div>

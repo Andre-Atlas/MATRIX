@@ -152,9 +152,7 @@ export function SandboxesClient({
     const avgStepsStr =
       totalTranscriptsCount > 0
         ? (totalStepsCount / totalTranscriptsCount).toFixed(1)
-        : totalRuns > 0
-          ? "4.0"
-          : "—";
+        : "—";
 
     // Active containers
     const activeDocker = runningList.filter((r) => r.runner_backend === "docker").length;
@@ -237,6 +235,23 @@ export function SandboxesClient({
       )}
 
       {/* 4 KPIs Section */}
+      {runs.some(
+        (r) =>
+          r.simulated === true ||
+          r.runner_backend === "fake" ||
+          r.runner_backend === "local_sandbox",
+      ) && (
+        <div
+          role="status"
+          className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-700/60 bg-amber-950/30 px-3.5 py-2 text-xs text-amber-200"
+        >
+          <SimulatedBadge reason="fake / local_sandbox" />
+          <span>
+            One or more sandbox runs executed against the local/fake runner backend and display simulated transcripts.
+          </span>
+        </div>
+      )}
+
       <section
         aria-label="Agent Sandboxes Summary Metrics"
         className="grid grid-cols-2 gap-3 lg:grid-cols-4"
@@ -534,7 +549,9 @@ export function SandboxesClient({
                                 ? "Fake"
                                 : "Local"}
                         </span>
-                        {(r.simulated === true || r.runner_backend === "fake") && (
+                        {(r.simulated === true ||
+                          r.runner_backend === "fake" ||
+                          r.runner_backend === "local_sandbox") && (
                           <SimulatedBadge reason={r.runner_backend || "fake"} />
                         )}
                       </div>
