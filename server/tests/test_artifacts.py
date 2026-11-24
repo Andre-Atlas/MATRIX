@@ -427,18 +427,19 @@ def test_presigned_mismatch_removes_object(env):
     assert env.blobs(env.p1.id) == [] and env.leftovers(env.p1.id) == []
 
 
-def test_above_hash_limit_local_content_route_is_hashed(make_env, backend):
-    if backend["artifact_backend"] != "local":
-        pytest.skip("local content route only")
-    env = make_env(verify_hash_max_bytes=1000)
-    data = os.urandom(2000)
-    resp = env.client.post("/api/v1/artifacts/uploads", headers=env.h1,
-                           json={"filename": "x", "size": len(data), "sha256": sha(data)})
-    art, upload = resp.json()["artifact"], resp.json()["upload"]
-    assert _presigned_put(env, upload, os.urandom(2000)).status_code == 422  # hashed while streaming
-    assert _presigned_put(env, upload, data).status_code == 204
-    done = env.client.post(f"/api/v1/artifacts/{art['id']}/complete", headers=env.h1).json()
-    assert done["status"] == "ready" and done["verified"] is True
+def test_above_hash_limit_local_content_route_is_hashed(db_url, tmp_path):
+    env = _local_env(db_url, tmp_path, verify_hash_max_bytes=1000)
+    try:
+        data = os.urandom(2000)
+        resp = env.client.post("/api/v1/artifacts/uploads", headers=env.h1,
+                               json={"filename": "x", "size": len(data), "sha256": sha(data)})
+        art, upload = resp.json()["artifact"], resp.json()["upload"]
+        assert _presigned_put(env, upload, os.urandom(2000)).status_code == 422  # hashed while streaming
+        assert _presigned_put(env, upload, data).status_code == 204
+        done = env.client.post(f"/api/v1/artifacts/{art['id']}/complete", headers=env.h1).json()
+        assert done["status"] == "ready" and done["verified"] is True
+    finally:
+        env.close()
 
 
 class StagingStore(LocalArtifactStore):
@@ -832,28 +833,29 @@ def store_blobs(store, project_id):
     return [b.sha256 for b in store.iter_blobs() if b.project_id == project_id]
 
 
-def test_quota_rechecked_on_put_content_and_complete(make_env):
-    env = make_env(project_quota_bytes=1000, max_artifact_bytes=100_000)
-    if not isinstance(env.store, LocalArtifactStore):
-        pytest.skip("the content route exists only with the local backend")
-    data = os.urandom(800)
-    art = env.client.post("/api/v1/artifacts/uploads", headers=env.h1,
-                          json={"filename": "r", "size": len(data), "sha256": sha(data)}).json()["artifact"]
-    # The operator lowers the quota (or other reservations settled first): the received bytes no longer fit.
-    env.app.state.settings = env.settings.model_copy(update={"project_quota_bytes": 500})
-    put = env.client.put(f"/api/v1/artifacts/{art['id']}/content", content=data, headers=env.h1)
-    assert put.status_code == 413
-    assert env.blobs(env.p1.id) == []
-    assert env.client.get(f"/api/v1/artifacts/{art['id']}", headers=env.h1).status_code == 404
-    # complete re-checks too (blob written under the old quota, completed under the new one)
-    env.app.state.settings = env.settings
-    art = env.client.post("/api/v1/artifacts/uploads", headers=env.h1,
-                          json={"filename": "r", "size": len(data), "sha256": sha(data)}).json()["artifact"]
-    assert env.client.put(f"/api/v1/artifacts/{art['id']}/content", content=data, headers=env.h1).status_code == 204
-    env.app.state.settings = env.settings.model_copy(update={"project_quota_bytes": 500})
-    assert env.client.post(f"/api/v1/artifacts/{art['id']}/complete", headers=env.h1).status_code == 413
-    assert env.blobs(env.p1.id) == []
-    assert env.client.get(f"/api/v1/artifacts/{art['id']}", headers=env.h1).status_code == 404
+def test_quota_rechecked_on_put_content_and_complete(db_url, tmp_path):
+    env = _local_env(db_url, tmp_path, project_quota_bytes=1000, max_artifact_bytes=100_000)
+    try:
+        data = os.urandom(800)
+        art = env.client.post("/api/v1/artifacts/uploads", headers=env.h1,
+                              json={"filename": "r", "size": len(data), "sha256": sha(data)}).json()["artifact"]
+        # The operator lowers the quota (or other reservations settled first): the received bytes no longer fit.
+        env.app.state.settings = env.settings.model_copy(update={"project_quota_bytes": 500})
+        put = env.client.put(f"/api/v1/artifacts/{art['id']}/content", content=data, headers=env.h1)
+        assert put.status_code == 413
+        assert env.blobs(env.p1.id) == []
+        assert env.client.get(f"/api/v1/artifacts/{art['id']}", headers=env.h1).status_code == 404
+        # complete re-checks too (blob written under the old quota, completed under the new one)
+        env.app.state.settings = env.settings
+        art = env.client.post("/api/v1/artifacts/uploads", headers=env.h1,
+                              json={"filename": "r", "size": len(data), "sha256": sha(data)}).json()["artifact"]
+        assert env.client.put(f"/api/v1/artifacts/{art['id']}/content", content=data, headers=env.h1).status_code == 204
+        env.app.state.settings = env.settings.model_copy(update={"project_quota_bytes": 500})
+        assert env.client.post(f"/api/v1/artifacts/{art['id']}/complete", headers=env.h1).status_code == 413
+        assert env.blobs(env.p1.id) == []
+        assert env.client.get(f"/api/v1/artifacts/{art['id']}", headers=env.h1).status_code == 404
+    finally:
+        env.close()
 
 
 def _disk_bytes(env: Env) -> int:

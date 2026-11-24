@@ -199,80 +199,108 @@ def deliver_webhook_job(
     payload_data = job.payload or {}
     delivery_id = payload_data.get("delivery_id")
     if not delivery_id:
+        session.close()
         return
 
-    delivery = session.scalar(
-        select(WebhookDelivery).where(
+    row = session.execute(
+        select(
+            WebhookDelivery.id,
+            WebhookDelivery.webhook_id,
+            WebhookDelivery.project_id,
+            WebhookDelivery.event,
+            WebhookDelivery.payload,
+            WebhookDelivery.attempts,
+        ).where(
             WebhookDelivery.id == delivery_id,
             WebhookDelivery.project_id == job.project_id,
         )
-    )
-    if delivery is None:
-        return
-    webhook = session.scalar(
-        select(ModelWebhook).where(
-            ModelWebhook.id == delivery.webhook_id,
-            ModelWebhook.project_id == job.project_id,
-        )
-    )
-    if webhook is None or not webhook.active:
+    ).first()
+    if row is None:
+        session.close()
         return
 
+    deliv_id, webhook_id, project_id, event_type, payload_raw, delivery_attempts = row
+
+    wh_row = session.execute(
+        select(
+            ModelWebhook.url,
+            ModelWebhook.secret_encrypted,
+            ModelWebhook.active,
+        ).where(
+            ModelWebhook.id == webhook_id,
+            ModelWebhook.project_id == job.project_id,
+        )
+    ).first()
+
     factory = session_factory or sessionmaker(bind=session.get_bind(), expire_on_commit=False)
-    attempt_num = max(int(delivery.attempts or 0) + 1, int(job.attempts or 1))
-    is_last_attempt = int(job.attempts or 1) >= int(job.max_attempts or WEBHOOK_MAX_ATTEMPTS)
+    payload_json = dict(payload_raw or {})
+    attempts = int(delivery_attempts or 0)
+    job_attempts = int(job.attempts or 1)
+    max_attempts = int(job.max_attempts or WEBHOOK_MAX_ATTEMPTS)
+
+    # Release the worker transaction/connection before external HTTP I/O or side sessions.
+    session.close()
+
+    if wh_row is None:
+        return
+    url, secret_encrypted, wh_active = wh_row
+    if not wh_active:
+        return
+
+    attempt_num = max(attempts + 1, job_attempts)
+    is_last_attempt = job_attempts >= max_attempts
 
     try:
         key = resolve_secret_key(secret_key)
-        secret = decrypt_secret(webhook.secret_encrypted, key)
+        secret = decrypt_secret(secret_encrypted, key)
     except (SecretKeyMissingError, WebhookDeliveryError) as exc:
         _update_delivery_state(
             factory,
-            delivery.id,
+            deliv_id,
             status="failed",
             attempts=attempt_num,
             last_status_code=None,
             last_error=f"crypto:{type(exc).__name__}",
         )
-        log.error("webhook delivery %s failed: encryption key unavailable", delivery.id)
+        log.error("webhook delivery %s failed: encryption key unavailable", deliv_id)
         return
 
-    body_bytes = json.dumps(delivery.payload or {}, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    body_bytes = json.dumps(payload_json, separators=(",", ":"), sort_keys=True).encode("utf-8")
     timestamp = str(int(time.time()))
     signature = sign_payload(secret, timestamp, body_bytes)
     headers = {
         "Content-Type": "application/json",
         "X-Matrix-Signature": signature,
         "X-Matrix-Timestamp": timestamp,
-        "X-Matrix-Event": delivery.event,
-        "X-Matrix-Delivery": delivery.id,
+        "X-Matrix-Event": event_type,
+        "X-Matrix-Delivery": deliv_id,
     }
 
     client = egress_client(
-        project_id=delivery.project_id,
+        project_id=project_id,
         session_factory=factory,
         purpose="webhook",
         timeout=10.0,
     )
 
     try:
-        resp = client.post(webhook.url, content=body_bytes, headers=headers)
+        resp = client.post(url, content=body_bytes, headers=headers)
     except EgressError as exc:
         reason = f"egress:{exc.reason}"
         if exc.reason not in _RETRYABLE_EGRESS_REASONS:
             _update_delivery_state(
                 factory,
-                delivery.id,
+                deliv_id,
                 status="failed",
                 attempts=attempt_num,
                 last_status_code=None,
                 last_error=reason,
             )
-            log.warning("webhook delivery %s blocked by egress policy (%s)", delivery.id, exc.reason)
+            log.warning("webhook delivery %s blocked by egress policy (%s)", deliv_id, exc.reason)
             return
         _update_delivery_state(
             factory,
-            delivery.id,
+            deliv_id,
             status="failed" if is_last_attempt else "queued",
             attempts=attempt_num,
             last_status_code=None,
@@ -283,7 +311,7 @@ def deliver_webhook_job(
     if 200 <= resp.status_code < 300:
         _update_delivery_state(
             factory,
-            delivery.id,
+            deliv_id,
             status="delivered",
             attempts=attempt_num,
             last_status_code=resp.status_code,
@@ -296,7 +324,7 @@ def deliver_webhook_job(
     err_msg = f"http:{resp.status_code}"
     _update_delivery_state(
         factory,
-        delivery.id,
+        deliv_id,
         status="failed" if is_last_attempt else "queued",
         attempts=attempt_num,
         last_status_code=resp.status_code,

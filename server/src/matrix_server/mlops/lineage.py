@@ -569,7 +569,7 @@ def _enrich_nodes(
             sw = sweeps_by_id[nid]
             label = sw.name
             status = sw.status
-            meta = {"method": sw.method, "status": sw.status}
+            meta = {"method": (sw.config or {}).get("method"), "status": sw.status}
         elif ntype == "benchmark" and nid in benchmarks_by_id:
             br = benchmarks_by_id[nid]
             label = br.name

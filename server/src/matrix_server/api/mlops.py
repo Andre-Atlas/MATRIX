@@ -44,6 +44,7 @@ from matrix_server.storage.db import as_utc, get_db, utcnow
 from matrix_server.storage.jobs import enqueue
 from matrix_server.storage.models import (
     ArtifactLineage,
+    BenchmarkRun,
     Dataset,
     Experiment,
     ModelAlias,
@@ -1351,23 +1352,47 @@ def evaluate_model_version(
     if body.dataset_id is not None:
         _get_dataset_or_404(db, principal.project_id, body.dataset_id)
 
+    eval_name = (body.name or f"{model.name}-v{mv.version}-eval")[:200]
+    benchmark_run = BenchmarkRun(
+        project_id=principal.project_id,
+        name=eval_name,
+        suite="lm_eval",
+        tasks=["gsm8k"],
+        runner_backend="local_sim",
+        runner_config={"metrics": body.metrics} if body.metrics else {},
+        eval_mode="generate_until",
+        num_fewshot=0,
+        target_model=(f"{model.name}:v{mv.version}")[:200],
+        model_version_id=mv.id,
+        dataset_id=body.dataset_id,
+        status="queued",
+        simulated=True,
+        summary_metrics={},
+    )
+    db.add(benchmark_run)
+    db.flush()
+
     job = enqueue(
         db,
         principal.project_id,
         "mlops.evaluate",
         {
+            "benchmark_run_id": benchmark_run.id,
             "model_id": model.id,
             "model_name": model.name,
             "version": mv.version,
             "model_version_id": mv.id,
             "dataset_id": body.dataset_id,
-            "name": body.name or f"{model.name}-v{mv.version}-eval",
+            "name": eval_name,
             "metrics": body.metrics,
         },
     )
+    benchmark_run.job_id = job.id
+    db.flush()
     return {
         "status": "queued",
         "job_id": job.id,
+        "benchmark_run_id": benchmark_run.id,
         "model_id": model.id,
         "version": mv.version,
     }

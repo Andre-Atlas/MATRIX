@@ -15,7 +15,7 @@ from matrix_server.storage import jobs
 from matrix_server.storage.db import utcnow
 from matrix_server.storage.models import BenchmarkRun, Experiment, Job, SandboxRun
 from matrix_server.workers.context import JobLost
-from matrix_server.workers.runner import on_final_failure, register
+from matrix_server.workers.runner import NonRetryableJobError, on_final_failure, register
 
 log = logging.getLogger(__name__)
 
@@ -129,11 +129,34 @@ def purge_project_spans(session: Session, job: Job) -> None:
 @register("mlops.evaluate")
 def run_benchmark_worker_handler(session: Session, job: Job) -> None:
     benchmark_run_id = (job.payload or {}).get("benchmark_run_id")
-    if not benchmark_run_id:
-        log.warning("job %s: missing benchmark_run_id in payload", job.id)
-        return
+    if not isinstance(benchmark_run_id, str) or not benchmark_run_id.strip():
+        raise NonRetryableJobError("missing benchmark_run_id in job payload")
+
+    row = session.execute(
+        select(BenchmarkRun.status, BenchmarkRun.error).where(
+            BenchmarkRun.id == benchmark_run_id,
+            BenchmarkRun.project_id == job.project_id,
+        )
+    ).first()
+    session.rollback()
+    if row is None:
+        raise NonRetryableJobError(f"benchmark run {benchmark_run_id!r} not found")
+    pre_status, pre_error = row
+    if pre_status == "failed":
+        raise NonRetryableJobError(pre_error or f"benchmark run {benchmark_run_id} is already failed")
+
     factory = sessionmaker(bind=session.get_bind(), expire_on_commit=False)
     run_benchmark_job(factory, benchmark_run_id)
+
+    post = session.execute(
+        select(BenchmarkRun.status, BenchmarkRun.error).where(
+            BenchmarkRun.id == benchmark_run_id,
+            BenchmarkRun.project_id == job.project_id,
+        )
+    ).first()
+    session.rollback()
+    if post is not None and post[0] == "failed":
+        raise NonRetryableJobError(post[1] or f"benchmark run {benchmark_run_id} failed")
 
 
 @on_final_failure("benchmark.run")

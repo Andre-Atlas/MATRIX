@@ -153,6 +153,20 @@ def _project_routes(app):
     return found
 
 
+def _project_admin_routes(app):
+    """(method, path, spec) of every project-scoped route (including GET) requiring ADMIN+."""
+    found = []
+    for route in _routes(app):
+        specs = [
+            g for g in _guards(route.dependant)
+            if g != "platform" and g.project_from == "project" and g.min_role is not None and g.min_role >= auth.Role.ADMIN
+        ]
+        for method in sorted(route.methods):
+            for spec in specs:
+                found.append((method, route.path, spec))
+    return found
+
+
 def _fill(path, project_id):
     return re.sub(r"\{(\w+)(:\w+)?\}", lambda m: project_id if m.group(1) == "project_id" else "nope", path)
 
@@ -204,7 +218,18 @@ def test_every_route_is_authenticated_except_the_public_ones(tmp_path):
                 specs = [g for g in guards if g != "platform"]
                 assert specs and all(s.project_from == "none" or s.min_role > auth.Role.VIEWER or s.scope in ("write", "ingest") for s in specs), (method, route.path)
     assert unguarded == []
-    main_prefixes = ("benchmarks", "datasets", "gateway", "mlops", "safety", "sandboxes", "vectors")
+    main_prefixes = (
+        "benchmarks",
+        "datasets",
+        "gateway",
+        "lineage",
+        "mlops",
+        "models",
+        "safety",
+        "sandboxes",
+        "sweeps",
+        "vectors",
+    )
     assert {p for p in main_prefixes if any(r.path.startswith(f"/api/v1/{p}") for r in _routes(app))} == set(main_prefixes)
 
 
@@ -230,10 +255,15 @@ def test_member_cannot_reach_admin_routes(env):
     app, client = env
     pid, _ = _project(client)
     member = member_headers(_factory(app), pid, auth.Role.MEMBER)
-    for method, path, spec in _project_routes(app):
-        if spec.min_role >= auth.Role.ADMIN:
-            resp = client.request(method, _fill(path, pid), json={}, headers=member)
-            assert resp.status_code == 403, (method, path)
+    admin_routes = [(m, p) for m, p, _spec in _project_admin_routes(app)]
+    assert {
+        ("GET", "/api/v1/models/{model_id}/webhooks"),
+        ("GET", "/api/v1/mlops/models/{model_id}/webhooks"),
+    } <= set(admin_routes)
+    for method, path in admin_routes:
+        kwargs = {"json": {}} if method in MUTATING else {}
+        resp = client.request(method, _fill(path, pid), headers=member, **kwargs)
+        assert resp.status_code == 403, (method, path, resp.status_code, resp.text)
     for path in ("members", "keys", "audit-log"):
         assert client.get(f"/api/v1/projects/{pid}/{path}", headers=member).status_code == 403
 
@@ -252,11 +282,17 @@ def test_key_never_reaches_admin_routes(env):
     app, client = env
     pid, full_key = _project(client)
     headers = {"Authorization": f"Bearer {full_key}"}
-    admin_routes = [(m, p) for m, p, s in _project_routes(app) if s.min_role >= auth.Role.ADMIN]
-    assert {("POST", "/api/v1/rules"), ("POST", "/api/v1/projects/{project_id}/keys")} <= set(admin_routes)
+    admin_routes = [(m, p) for m, p, _s in _project_admin_routes(app)]
+    assert {
+        ("POST", "/api/v1/rules"),
+        ("POST", "/api/v1/projects/{project_id}/keys"),
+        ("GET", "/api/v1/models/{model_id}/webhooks"),
+        ("GET", "/api/v1/mlops/models/{model_id}/webhooks"),
+    } <= set(admin_routes)
     for method, path in admin_routes:
-        resp = client.request(method, _fill(path, pid), json={}, headers=headers)
-        assert resp.status_code == 403, (method, path)
+        kwargs = {"json": {}} if method in MUTATING else {}
+        resp = client.request(method, _fill(path, pid), headers=headers, **kwargs)
+        assert resp.status_code == 403, (method, path, resp.status_code, resp.text)
     for path in ("members", "keys", "audit-log"):
         assert client.get(f"/api/v1/projects/{pid}/{path}", headers=headers).status_code == 403
     # Session-only routes refuse keys too.

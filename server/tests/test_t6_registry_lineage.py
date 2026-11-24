@@ -27,11 +27,13 @@ from matrix_server import egress
 from matrix_server.app import create_app
 from matrix_server.config import Settings
 from matrix_server.mlops.registry_models import ModelWebhook
+from matrix_server.storage import jobs as job_store
 from matrix_server.storage.db import Base, make_engine
 from matrix_server.storage.models import (
     ArtifactLineage,
     AuditLog,
     BenchmarkRun,
+    BenchmarkTaskResult,
     Experiment,
     Job,
     ModelVersion,
@@ -831,3 +833,250 @@ def test_t6_migration_fragment_upgrade_and_downgrade(tmp_path):
         assert "ix_runs_project_dataset_version" not in runs_indexes2
     finally:
         eng.dispose()
+
+
+# ---------------------------------------------------------------------------
+# 8. Sweep lineage regression, evaluate->BenchmarkRun, worker failures & pool release
+# ---------------------------------------------------------------------------
+
+
+def test_lineage_traversal_with_sweep_node_and_model_version(env):
+    client: TestClient = env["client"]
+    member_a = env["member_a"]
+    viewer_a = env["viewer_a"]
+    admin_b = env["admin_b"]
+
+    sweep_resp = client.post(
+        "/api/v1/sweeps",
+        headers=member_a,
+        json={
+            "name": "lin-sweep",
+            "config": {
+                "method": "random",
+                "metric": {"key": "loss", "goal": "minimize"},
+                "parameters": {"lr": {"type": "float", "min": 1e-4, "max": 1e-2}},
+            },
+        },
+    )
+    assert sweep_resp.status_code == 201, sweep_resp.text
+    sweep_id = sweep_resp.json()["id"]
+
+    trial_resp = client.post(f"/api/v1/sweeps/{sweep_id}/next", headers=member_a, json={})
+    assert trial_resp.status_code == 200, trial_resp.text
+    trial_run_id = trial_resp.json()["run"]["id"]
+
+    mid = _create_model(client, member_a, "sweep-origin-model")["id"]
+    mv = _create_version(client, member_a, mid, run_id=trial_run_id)
+
+    # Query lineage seeded at the sweep node -> traverses run -> model_version without AttributeError
+    sw_lin = client.get(f"/api/v1/lineage?node=sweep:{sweep_id}&direction=both&depth=2", headers=viewer_a)
+    assert sw_lin.status_code == 200, sw_lin.text
+    sw_data = sw_lin.json()
+    sw_nodes = {n["id"]: n for n in sw_data["nodes"]}
+    assert f"sweep:{sweep_id}" in sw_nodes
+    assert f"run:{trial_run_id}" in sw_nodes
+    assert f"model_version:{mv['id']}" in sw_nodes
+    assert sw_nodes[f"sweep:{sweep_id}"]["meta"]["method"] == "random"
+    assert sw_nodes[f"sweep:{sweep_id}"]["meta"]["status"] == "running"
+    assert any(
+        e["source"] == f"run:{trial_run_id}"
+        and e["target"] == f"sweep:{sweep_id}"
+        and e["relation"] == "member_of"
+        for e in sw_data["edges"]
+    )
+
+    # Query lineage seeded at the model_version -> reaches sweep node via run
+    mv_lin = client.get(f"/api/v1/lineage?node=model_version:{mv['id']}&direction=both&depth=2", headers=viewer_a)
+    assert mv_lin.status_code == 200, mv_lin.text
+    mv_nodes = {n["id"]: n for n in mv_lin.json()["nodes"]}
+    assert f"sweep:{sweep_id}" in mv_nodes
+    assert mv_nodes[f"sweep:{sweep_id}"]["meta"]["method"] == "random"
+
+    model_lin = client.get(f"/api/v1/mlops/models/{mid}/lineage?direction=both&depth=2", headers=viewer_a)
+    assert model_lin.status_code == 200, model_lin.text
+    assert f"sweep:{sweep_id}" in {n["id"] for n in model_lin.json()["nodes"]}
+
+    # Cross-project isolation
+    assert client.get(f"/api/v1/lineage?node=sweep:{sweep_id}", headers=admin_b).status_code == 404
+
+
+def test_evaluate_model_version_creates_benchmark_run_and_executes_via_worker(env):
+    client: TestClient = env["client"]
+    member_a = env["member_a"]
+    viewer_a = env["viewer_a"]
+    factory = env["factory"]
+
+    ds = client.post("/api/v1/datasets", headers=member_a, json={"name": "eval-ds"}).json()
+    mid = _create_model(client, member_a, "eval-model")["id"]
+    mv = _create_version(client, member_a, mid)
+
+    resp = client.post(
+        f"/api/v1/mlops/models/{mid}/versions/1/evaluate",
+        headers=member_a,
+        json={"dataset_id": ds["id"], "name": "mv1-eval", "metrics": [{"name": "exact_match"}]},
+    )
+    assert resp.status_code == 202, resp.text
+    body = resp.json()
+    assert body["status"] == "queued"
+    assert body["job_id"]
+    bm_id = body["benchmark_run_id"]
+    assert bm_id
+
+    with factory() as db:
+        bm = db.get(BenchmarkRun, bm_id)
+        assert bm is not None
+        assert bm.status == "queued"
+        assert bm.runner_backend == "local_sim"
+        assert bm.simulated is True
+        assert bm.model_version_id == mv["id"]
+        assert bm.dataset_id == ds["id"]
+        assert bm.job_id == body["job_id"]
+        job = db.get(Job, body["job_id"])
+        assert job is not None and job.kind == "mlops.evaluate"
+        assert job.payload["benchmark_run_id"] == bm_id
+
+    worker_runner.load_handler_modules()
+    assert worker_runner.run_once(factory, "eval-worker") is True
+
+    with factory() as db:
+        job = db.get(Job, body["job_id"])
+        bm = db.get(BenchmarkRun, bm_id)
+        task_results = list(
+            db.scalars(select(BenchmarkTaskResult).where(BenchmarkTaskResult.benchmark_run_id == bm_id))
+        )
+        assert job is not None and job.status == "done"
+        assert bm is not None and bm.status == "completed"
+        assert bm.simulated is True
+        assert bm.summary_metrics.get("total_tasks", 0) >= 1
+        assert len(task_results) >= 1
+
+    lin = client.get(f"/api/v1/lineage?node=model_version:{mv['id']}&direction=down&depth=1", headers=viewer_a)
+    assert lin.status_code == 200
+    assert f"benchmark:{bm_id}" in {n["id"] for n in lin.json()["nodes"]}
+
+
+def test_worker_non_retryable_benchmark_failures(env):
+    factory = env["factory"]
+    pid_a = env["pid_a"]
+    worker_runner.load_handler_modules()
+
+    # 1. Missing benchmark_run_id in mlops.evaluate payload fails immediately without retry (never 'done')
+    with factory() as db, db.begin():
+        bad_job = job_store.enqueue(db, pid_a, "mlops.evaluate", {"model_id": "m1"}, max_attempts=3)
+        bad_job_id = bad_job.id
+
+    assert worker_runner.run_once(factory, "w-bad") is True
+    with factory() as db:
+        j = db.get(Job, bad_job_id)
+        assert j is not None
+        assert j.status == "failed"
+        assert j.attempts == 1
+        assert "NonRetryableJobError" in (j.error or "")
+        assert "benchmark_run_id" in (j.error or "")
+
+    # 2. EngineUnavailable (lm_eval stub) fails permanently on attempt 1 without wasting retries
+    with factory() as db, db.begin():
+        bm = BenchmarkRun(
+            project_id=pid_a,
+            name="stub-lm-eval",
+            suite="lm_eval",
+            tasks=["gsm8k"],
+            runner_backend="lm_eval",
+            target_model="demo",
+            status="queued",
+            simulated=False,
+            summary_metrics={},
+        )
+        db.add(bm)
+        db.flush()
+        stub_job = job_store.enqueue(db, pid_a, "benchmark.run", {"benchmark_run_id": bm.id}, max_attempts=3)
+        bm.job_id = stub_job.id
+        bm_id = bm.id
+        stub_job_id = stub_job.id
+
+    assert worker_runner.run_once(factory, "w-stub") is True
+    with factory() as db:
+        j = db.get(Job, stub_job_id)
+        bm_row = db.get(BenchmarkRun, bm_id)
+        assert j is not None and j.status == "failed" and j.attempts == 1
+        assert "EngineUnavailable" in (j.error or "")
+        assert bm_row is not None and bm_row.status == "failed"
+
+    # 3. Re-running a job for an already-failed BenchmarkRun must NOT flip Job.status to 'done'
+    with factory() as db, db.begin():
+        re_job = job_store.enqueue(db, pid_a, "benchmark.run", {"benchmark_run_id": bm_id}, max_attempts=3)
+        re_job_id = re_job.id
+
+    assert worker_runner.run_once(factory, "w-rerun") is True
+    with factory() as db:
+        rj = db.get(Job, re_job_id)
+        assert rj is not None and rj.status == "failed" and rj.attempts == 1
+
+
+def test_webhook_worker_releases_db_connection_before_http_post(env):
+    client: TestClient = env["client"]
+    admin_a = env["admin_a"]
+    member_a = env["member_a"]
+    factory = env["factory"]
+    engine = env["app"].state.db_engine
+
+    mid = _create_model(client, member_a, "pool-release-model")["id"]
+    _create_version(client, member_a, mid)
+    created = client.post(
+        f"/api/v1/models/{mid}/webhooks",
+        headers=admin_a,
+        json={"url": "http://hooks.example.com/pool-check", "events": ["stage.changed"]},
+    )
+    assert created.status_code == 201, created.text
+    wh_id = created.json()["id"]
+
+    assert (
+        client.post(
+            f"/api/v1/projects/{env['pid_a']}/egress-hosts",
+            headers=admin_a,
+            json={"host": "hooks.example.com"},
+        ).status_code
+        == 201
+    )
+
+    checkedout_during_http: list[int] = []
+
+    class _PoolInspectHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            _ = self.rfile.read(length)
+            checkedout_during_http.append(engine.pool.checkedout())
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            pass
+
+    worker_runner.load_handler_modules()
+    webhook_handlers.set_secret_key(SECRET_KEY)
+    srv, port, _th = _start_receiver(_PoolInspectHandler)
+    try:
+        egress.set_resolver_for_tests(lambda host, _port: [PUBLIC_IP])
+        egress.set_dialer_for_tests(lambda ip, _p: ("127.0.0.1", port))
+        assert (
+            client.post(
+                f"/api/v1/models/{mid}/versions/1/stage",
+                headers=admin_a,
+                json={"stage": "staging"},
+            ).status_code
+            == 200
+        )
+        assert worker_runner.run_once(factory, "pool-worker") is True
+    finally:
+        egress.set_resolver_for_tests(None)
+        egress.set_dialer_for_tests(None)
+        webhook_handlers.set_secret_key(None)
+        srv.shutdown()
+        srv.server_close()
+
+    assert checkedout_during_http == [0]
+    deliv = client.get(f"/api/v1/models/{mid}/webhooks/{wh_id}/deliveries", headers=admin_a).json()["items"][0]
+    assert deliv["status"] == "delivered"
+    with factory() as db:
+        job = db.scalars(select(Job).where(Job.kind == "webhooks.deliver").order_by(Job.created_at.desc())).first()
+        assert job is not None and job.status == "done"

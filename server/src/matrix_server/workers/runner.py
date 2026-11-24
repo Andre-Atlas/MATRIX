@@ -17,6 +17,20 @@ from matrix_server.workers.context import JobContext, JobLost, current_job
 
 log = logging.getLogger(__name__)
 
+_NON_RETRYABLE_ERROR_NAMES = frozenset({"EngineUnavailable", "EgressError", "NonRetryableJobError"})
+
+
+class NonRetryableJobError(RuntimeError):
+    """Permanent job error: fail immediately without scheduling retries."""
+
+    non_retryable = True
+
+
+def _is_non_retryable(exc: Exception) -> bool:
+    if bool(getattr(exc, "non_retryable", False)):
+        return True
+    return any(cls.__name__ in _NON_RETRYABLE_ERROR_NAMES for cls in type(exc).__mro__)
+
 Handler = Callable[[Session, Job], None]
 HANDLERS: dict[str, Handler] = {}
 
@@ -152,9 +166,12 @@ def run_once(session_factory: sessionmaker[Session], worker_id: str, lease_secon
                 if isinstance(exc, JobLost) or ctx.lost.is_set():
                     log.warning("job %s: lease lost, result discarded", job.id)
                     return True
+                non_retryable = _is_non_retryable(exc)
                 log.exception("job %s (%s) failed on attempt %d", job.id, job.kind, job.attempts)
                 detail = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
-                status = jobs.fail_status(session_factory, job.id, detail, retry=True, worker_id=worker_id)
+                status = jobs.fail_status(
+                    session_factory, job.id, detail, retry=not non_retryable, worker_id=worker_id
+                )
                 if status == "failed":
                     job.error = jobs._truncate(detail)
                     run_final_failure_hooks(session_factory, job)
