@@ -351,20 +351,17 @@ def identify_knowledge_gaps(
     2. Faithfulness/retrieval confidence score < faithfulness_threshold.
     """
     gap_ids: set[str] = set()
+    doc_embeddings = [d.embedding or deterministic_text_embedding(d.text) for d in documents]
 
     for q in queries:
         q_emb = q.embedding or deterministic_text_embedding(q.text)
         is_gap = False
 
         # Check retrieval semantic distance
-        if not documents:
+        if not doc_embeddings:
             is_gap = True
         else:
-            min_dist = float("inf")
-            for d in documents:
-                d_emb = d.embedding or deterministic_text_embedding(d.text)
-                dist = cosine_distance(q_emb, d_emb)
-                min_dist = min(min_dist, dist)
+            min_dist = min(cosine_distance(q_emb, d_emb) for d_emb in doc_embeddings)
             if min_dist > distance_threshold:
                 is_gap = True
 
@@ -390,22 +387,31 @@ def build_vector_projection(
     faithfulness_threshold: float = 0.60,
 ) -> tuple[list[VectorPoint], list[ClusterSummary]]:
     """Builds the complete 2D/3D projection with clustering, knowledge gaps, and metadata."""
+    q_embs = [q.embedding or deterministic_text_embedding(q.text) for q in queries]
+    d_embs = [d.embedding or deterministic_text_embedding(d.text) for d in documents]
+    q_items = [
+        q if q.embedding else q.model_copy(update={"embedding": emb})
+        for q, emb in zip(queries, q_embs, strict=True)
+    ]
+    d_items = [
+        d if d.embedding else d.model_copy(update={"embedding": emb})
+        for d, emb in zip(documents, d_embs, strict=True)
+    ]
+
     gap_ids = identify_knowledge_gaps(
-        queries=queries,
-        documents=documents,
+        queries=q_items,
+        documents=d_items,
         distance_threshold=distance_threshold,
         faithfulness_threshold=faithfulness_threshold,
     )
 
     all_items: list[tuple[str, str, Literal["query", "document", "gap"], list[float], float | None, str | None, str | None]] = []
 
-    for q in queries:
-        emb = q.embedding or deterministic_text_embedding(q.text)
+    for q, emb in zip(queries, q_embs, strict=True):
         kind: Literal["query", "document", "gap"] = "gap" if q.id in gap_ids else "query"
         all_items.append((q.id, q.text, kind, emb, q.score, q.trace_id, q.timestamp))
 
-    for d in documents:
-        emb = d.embedding or deterministic_text_embedding(d.text)
+    for d, emb in zip(documents, d_embs, strict=True):
         all_items.append((d.id, d.text, "document", emb, d.score, d.trace_id, d.timestamp))
 
     if not all_items:

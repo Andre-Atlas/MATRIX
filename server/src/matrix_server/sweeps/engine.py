@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import random
 import statistics
+from bisect import bisect_left
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -409,32 +411,86 @@ def _grid_values_compat(spec: Mapping[str, Any]) -> list[Any]:
     return grid_values_for_param(spec)
 
 
+def _grid_param_size(spec: Mapping[str, Any]) -> int:
+    ptype = spec["type"]
+    if ptype == "choice":
+        return len(spec["values"])
+    if ptype == "constant":
+        return 1
+    if ptype == "int":
+        return ((int(spec["max"]) - int(spec["min"])) // int(spec.get("step", 1))) + 1
+    if ptype == "float":
+        if spec.get("values"):
+            return len(spec["values"])
+        fmin, fmax = float(spec["min"]), float(spec["max"])
+        return 1 if math.isclose(fmin, fmax) else 5
+    raise ValueError(f"parameter type '{ptype}' is not allowed in grid search")
+
+
+def _grid_param_at(spec: Mapping[str, Any], pos: int) -> Any:
+    ptype = spec["type"]
+    if ptype == "choice":
+        return spec["values"][pos]
+    if ptype == "constant":
+        return spec["value"]
+    if ptype == "int":
+        return int(spec["min"]) + pos * int(spec.get("step", 1))
+    return _grid_values_compat(spec)[pos]
+
+
+def _feistel_permute(index: int, total: int, seed: int | str) -> int:
+    """O(1)-time, O(1)-memory deterministic bijection on [0, total) via cycle-walking Feistel."""
+    if total <= 1:
+        return 0
+    digest = hashlib.sha256(f"matrix-grid:{seed}:{total}".encode()).digest()
+    keys = (
+        int.from_bytes(digest[0:8], "big"),
+        int.from_bytes(digest[8:16], "big"),
+        int.from_bytes(digest[16:24], "big"),
+        int.from_bytes(digest[24:32], "big"),
+    )
+    half = max(3, ((total - 1).bit_length() + 1) // 2)
+    mask = (1 << half) - 1
+
+    def _round_mix(val: int, key: int) -> int:
+        x = (val + key + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+        x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+        x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
+        x ^= x >> 31
+        return x & mask
+
+    x = index
+    while True:
+        left = (x >> half) & mask
+        right = x & mask
+        for k in keys:
+            left, right = right, left ^ _round_mix(right, k)
+        x = (left << half) | right
+        if x < total:
+            return x
+
+
 def _suggest_grid(
     parameters: Mapping[str, Mapping[str, Any]],
     trial_index: int,
     seed: int | str | None,
 ) -> dict[str, Any]:
     keys = list(parameters.keys())
-    value_lists = [_grid_values_compat(parameters[k]) for k in keys]
-    sizes = [len(vs) for vs in value_lists]
+    specs = [parameters[k] for k in keys]
+    sizes = [_grid_param_size(s) for s in specs]
     total = 1
     for sz in sizes:
         total *= sz
-    if trial_index >= total:
+    if trial_index < 0 or trial_index >= total:
         raise SweepExhaustedError("grid search space exhausted")
 
-    if seed is not None:
-        order = list(range(total))
-        random.Random(f"matrix-grid:{seed}").shuffle(order)
-        flat_idx = order[trial_index]
-    else:
-        flat_idx = trial_index
+    flat_idx = _feistel_permute(trial_index, total, seed) if seed is not None else trial_index
 
     result: dict[str, Any] = {}
     rem = flat_idx
-    for k, vs, sz in zip(reversed(keys), reversed(value_lists), reversed(sizes), strict=True):
+    for k, spec, sz in zip(reversed(keys), reversed(specs), reversed(sizes), strict=True):
         rem, pos = divmod(rem, sz)
-        result[k] = vs[pos]
+        result[k] = _grid_param_at(spec, pos)
     return {k: result[k] for k in keys}
 
 
@@ -471,7 +527,7 @@ def _parzen_components(z_obs: Sequence[float], z_min: float, z_max: float) -> tu
     means: list[float] = []
     sigmas: list[float] = []
     for z in pts:
-        idx = aug.index(z)
+        idx = bisect_left(aug, z)
         left = z - aug[idx - 1] if idx > 0 else z - z_min
         right = aug[idx + 1] - z if idx + 1 < len(aug) else z_max - z
         bw = max(min_bw, min(max_bw, max(left, right)))
@@ -701,6 +757,47 @@ def _peer_value_at_step(peer: Any, target_step: int, *, require_reached: bool = 
     return None
 
 
+def pruning_target_step(
+    early_stop: Mapping[str, Any] | None,
+    step: int,
+    value: float,
+    *,
+    bracket: int = 0,
+) -> tuple[int | None, bool, PruneDecision | None]:
+    """Determine the active rung/target step for pruning, or return an immediate decision."""
+    if not early_stop:
+        return None, False, PruneDecision(False)
+
+    es_type = str(early_stop.get("type", "")).lower()
+    if es_type not in COMPAT_EARLY_STOP_TYPES:
+        return None, False, PruneDecision(False)
+
+    if not _is_number(value) or not math.isfinite(float(value)):
+        return None, False, PruneDecision(True, "non-finite metric value")
+
+    min_iter = int(early_stop["min_iter"])
+    max_iter = early_stop.get("max_iter")
+    eta = max(2, int(early_stop.get("eta", DEFAULT_ETA)))
+
+    if es_type == "median":
+        if step < min_iter:
+            return None, False, PruneDecision(False)
+        return step, False, None
+
+    # ASHA / Hyperband: bracket starts at r0 = min_iter * eta^bracket
+    r0 = min_iter * (eta ** max(0, bracket))
+    if step < r0:
+        return None, False, PruneDecision(False)
+    if max_iter is not None and step > int(max_iter):
+        return None, False, PruneDecision(False)
+
+    # Highest rung r = r0 * eta^k <= step (and <= max_iter if bounded)
+    rung = r0
+    while rung * eta <= step and (max_iter is None or rung * eta <= int(max_iter)):
+        rung *= eta
+    return rung, True, None
+
+
 def evaluate_pruning(
     early_stop: Mapping[str, Any] | None,
     metric_goal: str,
@@ -711,50 +808,36 @@ def evaluate_pruning(
     bracket: int = 0,
 ) -> PruneDecision:
     """Evaluate asynchronous ASHA/Hyperband (or legacy median) pruning at (step, value)."""
-    if not early_stop:
-        return PruneDecision(False)
+    target_step, require_reached, immediate = pruning_target_step(
+        early_stop, step, value, bracket=bracket
+    )
+    if immediate is not None:
+        return immediate
+    assert early_stop is not None and target_step is not None
 
-    es_type = str(early_stop.get("type", "")).lower()
-    if es_type not in COMPAT_EARLY_STOP_TYPES:
-        return PruneDecision(False)
-
-    if not _is_number(value) or not math.isfinite(float(value)):
-        return PruneDecision(True, "non-finite metric value")
     cur_val = float(value)
-
-    min_iter = int(early_stop["min_iter"])
-    max_iter = early_stop.get("max_iter")
+    es_type = str(early_stop.get("type", "")).lower()
     eta = max(2, int(early_stop.get("eta", DEFAULT_ETA)))
 
     if es_type == "median":
-        if step < min_iter:
-            return PruneDecision(False)
-        peer_vals = [v for p in peer_series if (v := _peer_value_at_step(p, step)) is not None]
+        peer_vals = [v for p in peer_series if (v := _peer_value_at_step(p, target_step)) is not None]
         if not peer_vals:
             return PruneDecision(False)
         med = statistics.median(peer_vals)
         if (metric_goal == "minimize" and cur_val > med) or (metric_goal == "maximize" and cur_val < med):
-            return PruneDecision(True, f"metric {cur_val:.6g} worse than peer median {med:.6g} at step {step}", step)
+            return PruneDecision(
+                True, f"metric {cur_val:.6g} worse than peer median {med:.6g} at step {step}", step
+            )
         return PruneDecision(False)
-
-    # ASHA / Hyperband: bracket starts at r0 = min_iter * eta^bracket
-    r0 = min_iter * (eta ** max(0, bracket))
-    if step < r0:
-        return PruneDecision(False)
-    if max_iter is not None and step > int(max_iter):
-        return PruneDecision(False)
-
-    # Highest rung r = r0 * eta^k <= step (and <= max_iter if bounded)
-    rung = r0
-    while rung * eta <= step and (max_iter is None or rung * eta <= int(max_iter)):
-        rung *= eta
 
     peer_vals = [
-        v for p in peer_series if (v := _peer_value_at_step(p, rung, require_reached=True)) is not None
+        v
+        for p in peer_series
+        if (v := _peer_value_at_step(p, target_step, require_reached=require_reached)) is not None
     ]
     all_vals = peer_vals + [cur_val]
     if len(all_vals) < eta:
-        return PruneDecision(False, None, rung)
+        return PruneDecision(False, None, target_step)
 
     keep_count = max(1, len(all_vals) // eta)
     all_vals.sort(reverse=(metric_goal == "maximize"))
@@ -763,16 +846,16 @@ def evaluate_pruning(
     if metric_goal == "minimize" and cur_val > cutoff:
         return PruneDecision(
             True,
-            f"{es_type} rung {rung}: {cur_val:.6g} outside top 1/{eta} (cutoff {cutoff:.6g})",
-            rung,
+            f"{es_type} rung {target_step}: {cur_val:.6g} outside top 1/{eta} (cutoff {cutoff:.6g})",
+            target_step,
         )
     if metric_goal == "maximize" and cur_val < cutoff:
         return PruneDecision(
             True,
-            f"{es_type} rung {rung}: {cur_val:.6g} outside top 1/{eta} (cutoff {cutoff:.6g})",
-            rung,
+            f"{es_type} rung {target_step}: {cur_val:.6g} outside top 1/{eta} (cutoff {cutoff:.6g})",
+            target_step,
         )
-    return PruneDecision(False, None, rung)
+    return PruneDecision(False, None, target_step)
 
 
 # --------------------------------------------------------------------------- RF importance

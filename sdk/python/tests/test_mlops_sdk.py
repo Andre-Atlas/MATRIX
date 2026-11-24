@@ -271,6 +271,10 @@ def test_matrix_trainer_callback_logs_and_propagates_early_stop() -> None:
         body = json.loads(request.content.decode()) if request.content else None
         if request.method == "POST" and request.url.path == "/api/v1/runs":
             return httpx.Response(201, json={"id": "run_cb", "name": "cb-run", "status": "running", "sweep_id": "sw_cb"})
+        if request.method == "GET" and request.url.path == "/api/v1/sweeps/sw_cb":
+            return httpx.Response(
+                200, json={"sweep": {"id": "sw_cb", "config": {"metric": {"key": "eval_loss", "goal": "minimize"}}}}
+            )
         if request.method == "POST" and request.url.path == "/api/v1/runs/run_cb/metrics":
             metric_batches.append(body)
             return httpx.Response(202, json={"accepted": len(body["points"]), "rejected": []})
@@ -284,7 +288,7 @@ def test_matrix_trainer_callback_logs_and_propagates_early_stop() -> None:
     with pytest.warns(DeprecationWarning, match="start_run"):
         run = client.mlops.start_run("cb-run", sweep_id="sw_cb", flush_interval=60.0)
     with run:
-        run._run._sweep_metric_key = "eval_loss"
+        assert run._run._sweep_metric_key == "eval_loss"
         cb = MatrixTrainerCallback(run)
         state = SimpleNamespace(global_step=10, epoch=1.0)
         control = SimpleNamespace(should_training_stop=False)

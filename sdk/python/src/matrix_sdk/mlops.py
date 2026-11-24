@@ -60,16 +60,41 @@ def _translate_search_space(search_space: dict[str, Any]) -> dict[str, Any]:
         if isinstance(spec, dict):
             entry = dict(spec)
             raw_type = entry.get("type") or entry.get("distribution")
-            if raw_type == "categorical" or "values" in entry:
-                params[key] = {"type": "choice", "values": list(entry.get("values") or entry.get("choices") or [])}
+            if raw_type in ("categorical", "choice") or (
+                raw_type is None and ("values" in entry or "choices" in entry)
+            ):
+                raw_vals = entry.get("values") if "values" in entry else entry.get("choices")
+                params[key] = {"type": "choice", "values": list(raw_vals or [])}
             elif raw_type in ("int_uniform", "q_uniform", "int"):
-                params[key] = {"type": "int", "min": entry["min"], "max": entry["max"]}
+                out: dict[str, Any] = {"type": "int", "min": entry["min"], "max": entry["max"]}
+                if "step" in entry:
+                    out["step"] = entry["step"]
+                if "log" in entry:
+                    out["log"] = bool(entry["log"])
+                params[key] = out
             elif raw_type in ("log_uniform", "log_uniform_values"):
-                params[key] = {"type": "log_uniform", "min": entry["min"], "max": entry["max"]}
-            elif raw_type in ("uniform", "choice", "constant"):
-                params[key] = entry
+                out = {"type": "float", "min": entry["min"], "max": entry["max"], "log": True}
+                if "q" in entry:
+                    out["q"] = entry["q"]
+                params[key] = out
+            elif raw_type in ("uniform", "float"):
+                out = {"type": "float", "min": entry["min"], "max": entry["max"]}
+                if "log" in entry:
+                    out["log"] = bool(entry["log"])
+                if "q" in entry:
+                    out["q"] = entry["q"]
+                if "values" in entry:
+                    out["values"] = list(entry["values"])
+                params[key] = out
+            elif raw_type == "constant":
+                params[key] = {"type": "constant", "value": entry["value"]} if "value" in entry else entry
             elif "min" in entry and "max" in entry:
-                params[key] = {"type": "uniform", "min": entry["min"], "max": entry["max"]}
+                out = {"type": "float", "min": entry["min"], "max": entry["max"]}
+                if "log" in entry:
+                    out["log"] = bool(entry["log"])
+                if "q" in entry:
+                    out["q"] = entry["q"]
+                params[key] = out
             else:
                 params[key] = entry
         elif isinstance(spec, (list, tuple)):

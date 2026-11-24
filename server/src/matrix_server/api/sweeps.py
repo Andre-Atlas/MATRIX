@@ -177,10 +177,16 @@ def report_run_metric(
     if not math.isfinite(body.value):
         raise HTTPException(status_code=422, detail="value must be finite")
 
+    is_pg = db.get_bind().dialect.name == "postgresql"
     sweep = _get_sweep_or_404(db, principal.project_id, sweep_id)
-    run = db.scalars(
-        select(Run).where(Run.id == run_id, Run.project_id == principal.project_id, Run.sweep_id == sweep.id)
-    ).first()
+    run_stmt = select(Run).where(
+        Run.id == run_id,
+        Run.project_id == principal.project_id,
+        Run.sweep_id == sweep.id,
+    )
+    if is_pg:
+        run_stmt = run_stmt.with_for_update()
+    run = db.scalars(run_stmt).first()
     if run is None:
         raise HTTPException(status_code=404, detail="run not found in sweep")
 
@@ -193,6 +199,7 @@ def report_run_metric(
         step=body.step,
         value=body.value,
         record_point=True,
+        run_locked=is_pg,
     )
     return {"action": res.action}
 
