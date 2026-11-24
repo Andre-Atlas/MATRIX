@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import case, delete, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session, sessionmaker
@@ -190,25 +190,17 @@ class GatewayRateLimiter:
 
         if self.session_factory is not None:
             with self.session_factory() as db:
-                row = db.scalar(
-                    select(GatewayRateWindow).where(
+                expr = GatewayRateWindow.token_count + delta
+                db.execute(
+                    update(GatewayRateWindow)
+                    .where(
                         GatewayRateWindow.project_id == project_id,
                         GatewayRateWindow.scope == scope,
                         GatewayRateWindow.window_start == window_start,
                     )
+                    .values(token_count=case((expr < 0, 0), else_=expr))
                 )
-                if row is not None:
-                    new_total = max(0, int(row.token_count) + delta)
-                    db.execute(
-                        update(GatewayRateWindow)
-                        .where(
-                            GatewayRateWindow.project_id == project_id,
-                            GatewayRateWindow.scope == scope,
-                            GatewayRateWindow.window_start == window_start,
-                        )
-                        .values(token_count=new_total)
-                    )
-                    db.commit()
+                db.commit()
             return
 
         key = (project_id, scope)
@@ -228,8 +220,8 @@ class GatewayRateLimiter:
         self.cleanup_expired_windows(current_window_start)
 
     def cleanup_expired_windows(self, current_window_start: int | None = None) -> int:
-        """Bounded cleanup of expired rate-limit window rows."""
-        if self.session_factory is None:
+        """Bounded single-statement batched cleanup of expired rate-limit window rows."""
+        if self.session_factory is None or self.cleanup_batch_size <= 0:
             return 0
         now_win = (
             current_window_start
@@ -237,30 +229,27 @@ class GatewayRateLimiter:
             else _current_window_start(self.window_seconds)
         )
         cutoff = now_win - self.window_retention_seconds
+        subq = (
+            select(
+                GatewayRateWindow.project_id,
+                GatewayRateWindow.scope,
+                GatewayRateWindow.window_start,
+            )
+            .where(GatewayRateWindow.window_start < cutoff)
+            .limit(self.cleanup_batch_size)
+        )
         with self.session_factory() as db:
-            stale_keys = db.execute(
-                select(
-                    GatewayRateWindow.project_id,
-                    GatewayRateWindow.scope,
-                    GatewayRateWindow.window_start,
+            res = db.execute(
+                delete(GatewayRateWindow).where(
+                    tuple_(
+                        GatewayRateWindow.project_id,
+                        GatewayRateWindow.scope,
+                        GatewayRateWindow.window_start,
+                    ).in_(subq)
                 )
-                .where(GatewayRateWindow.window_start < cutoff)
-                .limit(self.cleanup_batch_size)
-            ).all()
-            if not stale_keys:
-                return 0
-            deleted = 0
-            for proj_id, sc, ws in stale_keys:
-                res = db.execute(
-                    delete(GatewayRateWindow).where(
-                        GatewayRateWindow.project_id == proj_id,
-                        GatewayRateWindow.scope == sc,
-                        GatewayRateWindow.window_start == ws,
-                    )
-                )
-                deleted += res.rowcount or 0
+            )
             db.commit()
-            return deleted
+            return int(res.rowcount or 0)
 
     def check_rate_limit(
         self,

@@ -24,7 +24,9 @@ def get_gateway(request: Request) -> GatewayRouter:
         gw = get_default_gateway_router()
 
     session_factory = getattr(request.app.state, "session_factory", None)
-    if session_factory is not None and gw.session_factory is None:
+    if session_factory is not None and (
+        gw.session_factory is None or gw.rate_limiter.session_factory is None
+    ):
         gw.bind_session_factory(session_factory)
     return gw
 

@@ -19,7 +19,7 @@ import re
 import threading
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -27,11 +27,12 @@ from typing import Any, Literal
 
 import httpx
 from fastapi import HTTPException
-from sqlalchemy import delete, select
+from sqlalchemy import and_, case, delete, func, select
 from sqlalchemy.orm import Session, sessionmaker
+from starlette.concurrency import run_in_threadpool
 
 from matrix_server.gateway.cache import GatewayCache
-from matrix_server.gateway.circuit_breaker import CircuitBreaker
+from matrix_server.gateway.circuit_breaker import CircuitBreaker, CircuitState
 from matrix_server.gateway.models import GatewayRequest
 from matrix_server.gateway.rate_limiter import GatewayRateLimiter
 from matrix_server.pricing import compute_cost
@@ -127,6 +128,41 @@ class AllProvidersUnavailableError(GatewayError):
 class ProviderExecutionError(GatewayError):
     """Raised when a specific provider fails during request execution."""
 
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+    @property
+    def is_client_error(self) -> bool:
+        """True for client-induced HTTP 4xx errors (excluding 408/429 availability/rate signals)."""
+        return (
+            self.status_code is not None
+            and 400 <= self.status_code < 500
+            and self.status_code not in (408, 429)
+        )
+
+    @property
+    def trips_circuit_breaker(self) -> bool:
+        """Only 429, 408, 5xx, and transport/connection/timeout errors trip the circuit breaker."""
+        return not self.is_client_error
+
+
+def _parse_iso_utc(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value)
+    return as_utc(parsed) or datetime.min.replace(tzinfo=UTC)
+
+
+def _percentile_from_sorted(sorted_vals: list[float], q: float) -> float:
+    if not sorted_vals:
+        return 0.0
+    if len(sorted_vals) == 1:
+        return sorted_vals[0]
+    pos = (len(sorted_vals) - 1) * q
+    lo = int(pos)
+    hi = min(lo + 1, len(sorted_vals) - 1)
+    frac = pos - lo
+    return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
+
 
 class ProviderNotConfiguredError(GatewayError):
     """Raised when a provider's required operator API key environment variable is not set."""
@@ -195,6 +231,8 @@ class BaseProvider:
         *,
         total_requests: int | None = None,
         avg_latency_ms: float | None = None,
+        circuit_breaker: CircuitBreaker | None = None,
+        scoped: bool = False,
     ) -> dict[str, Any]:
         if self.name == "openai":
             models = ["gpt-4o", "gpt-4o-mini", "o3-mini"]
@@ -202,10 +240,21 @@ class BaseProvider:
             models = ["claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022"]
         else:
             models = ["mock-gpt-4o", "mock-fast"]
+
+        if circuit_breaker is not None:
+            cb_state = circuit_breaker.state
+            cb_failures = circuit_breaker.failure_count
+        elif scoped:
+            cb_state = CircuitState.CLOSED.value
+            cb_failures = 0
+        else:
+            cb_state = self.circuit_breaker.state
+            cb_failures = self.circuit_breaker.failure_count
+
         return {
             "name": self.name,
-            "circuit_breaker": self.circuit_breaker.state,
-            "failure_count": self.circuit_breaker.failure_count,
+            "circuit_breaker": cb_state,
+            "failure_count": cb_failures,
             "failure_threshold": self.failure_threshold,
             "avg_latency_ms": self.avg_latency_ms if avg_latency_ms is None else round(avg_latency_ms, 2),
             "total_requests": self._total_requests if total_requests is None else total_requests,
@@ -292,6 +341,7 @@ class OpenAIProvider(BaseProvider):
     timeout: float = 30.0
     is_simulated: bool = False
     allowed_params: frozenset[str] = OPENAI_ALLOWED_PARAMS
+    transport: httpx.AsyncBaseTransport | None = field(default=None, repr=False)
 
     def _resolve_api_key(self) -> str | None:
         return self.api_key or os.environ.get(self.api_key_env)
@@ -331,13 +381,24 @@ class OpenAIProvider(BaseProvider):
         }
         url = f"{self._resolve_base_url()}/chat/completions"
 
+        client_kwargs: dict[str, Any] = {"timeout": self.timeout}
+        if self.transport is not None:
+            client_kwargs["transport"] = self.transport
+
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with httpx.AsyncClient(**client_kwargs) as client:
                 resp = await client.post(url, json=payload, headers=headers)
                 resp.raise_for_status()
                 data = resp.json()
                 self._successful_requests += 1
                 return data
+        except httpx.HTTPStatusError as exc:
+            self._failed_requests += 1
+            status_code = exc.response.status_code if exc.response is not None else None
+            sanitized = sanitize_provider_error(exc, secret_values=[resolved_key])
+            raise ProviderExecutionError(
+                f"{self.name} error: {sanitized}", status_code=status_code
+            ) from exc
         except Exception as exc:
             self._failed_requests += 1
             sanitized = sanitize_provider_error(exc, secret_values=[resolved_key])
@@ -355,6 +416,7 @@ class AnthropicProvider(BaseProvider):
     timeout: float = 30.0
     is_simulated: bool = False
     allowed_params: frozenset[str] = ANTHROPIC_ALLOWED_PARAMS
+    transport: httpx.AsyncBaseTransport | None = field(default=None, repr=False)
 
     def _resolve_api_key(self) -> str | None:
         return self.api_key or os.environ.get(self.api_key_env)
@@ -379,20 +441,22 @@ class AnthropicProvider(BaseProvider):
         filtered_kwargs, _ = filter_provider_params(self.allowed_params, kwargs)
 
         # Translate OpenAI messages format to Anthropic messages API
-        system_content = ""
+        system_parts: list[str] = []
         anthropic_msgs: list[dict[str, str]] = []
         for m in messages:
-            role = m.get("role", "user")
-            content = m.get("content", "")
+            role = str(m.get("role", "user"))
+            content = str(m.get("content", ""))
             if role == "system":
-                system_content = content
+                if content:
+                    system_parts.append(content)
             else:
                 anthropic_msgs.append({"role": role, "content": content})
+        system_content = "\n\n".join(system_parts)
 
         if not anthropic_msgs:
             anthropic_msgs.append({"role": "user", "content": "Hello"})
 
-        anthropic_model = model if "claude" in model else "claude-3-5-sonnet-20241022"
+        anthropic_model = model if "claude" in model.lower() else "claude-3-5-sonnet-20241022"
         payload: dict[str, Any] = {
             "model": anthropic_model,
             "messages": anthropic_msgs,
@@ -404,7 +468,7 @@ class AnthropicProvider(BaseProvider):
         for k in ("top_p", "tools", "tool_choice"):
             if k in filtered_kwargs:
                 payload[k] = filtered_kwargs[k]
-        if "stop" in filtered_kwargs:
+        if filtered_kwargs.get("stop") is not None:
             stop_val = filtered_kwargs["stop"]
             payload["stop_sequences"] = [stop_val] if isinstance(stop_val, str) else list(stop_val)
 
@@ -415,8 +479,12 @@ class AnthropicProvider(BaseProvider):
         }
         url = f"{self._resolve_base_url()}/messages"
 
+        client_kwargs: dict[str, Any] = {"timeout": self.timeout}
+        if self.transport is not None:
+            client_kwargs["transport"] = self.transport
+
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with httpx.AsyncClient(**client_kwargs) as client:
                 resp = await client.post(url, json=payload, headers=headers)
                 resp.raise_for_status()
                 data = resp.json()
@@ -452,6 +520,13 @@ class AnthropicProvider(BaseProvider):
                         "total_tokens": input_tokens + output_tokens,
                     },
                 }
+        except httpx.HTTPStatusError as exc:
+            self._failed_requests += 1
+            status_code = exc.response.status_code if exc.response is not None else None
+            sanitized = sanitize_provider_error(exc, secret_values=[resolved_key])
+            raise ProviderExecutionError(
+                f"{self.name} error: {sanitized}", status_code=status_code
+            ) from exc
         except Exception as exc:
             self._failed_requests += 1
             sanitized = sanitize_provider_error(exc, secret_values=[resolved_key])
@@ -556,11 +631,16 @@ class GatewayRouter:
     retention_days: int = 30
     cleanup_interval_requests: int = 100
     cleanup_batch_size: int = 500
+    max_circuit_breakers: int = 1024
+    stats_percentile_sample_size: int = 5000
 
     _logs: deque[GatewayRequestLog] = field(default_factory=lambda: deque(maxlen=1000))
     _latencies: deque[float] = field(default_factory=lambda: deque(maxlen=1000))
     _write_counter: int = 0
     _cleanup_lock: threading.Lock = field(default_factory=threading.Lock)
+    _logs_lock: threading.Lock = field(default_factory=threading.Lock)
+    _cb_lock: threading.Lock = field(default_factory=threading.Lock)
+    _circuit_breakers: OrderedDict[tuple[str, str], CircuitBreaker] = field(default_factory=OrderedDict)
 
     def __post_init__(self) -> None:
         if not self.providers:
@@ -577,9 +657,38 @@ class GatewayRouter:
         self.session_factory = session_factory
         self.rate_limiter.session_factory = session_factory
 
+    def get_circuit_breaker(self, project_id: str, provider_name: str) -> CircuitBreaker:
+        """Returns the project-isolated circuit breaker for `(project_id, provider_name)` with LRU eviction."""
+        key = (project_id, provider_name)
+        with self._cb_lock:
+            cb = self._circuit_breakers.get(key)
+            if cb is not None:
+                self._circuit_breakers.move_to_end(key)
+                return cb
+            prov = self.providers.get(provider_name)
+            cb = CircuitBreaker(
+                name=f"{project_id}:{provider_name}",
+                failure_threshold=prov.failure_threshold if prov is not None else 3,
+                cooldown_seconds=prov.cooldown_seconds if prov is not None else 30.0,
+            )
+            self._circuit_breakers[key] = cb
+            cap = max(1, int(self.max_circuit_breakers))
+            while len(self._circuit_breakers) > cap:
+                self._circuit_breakers.popitem(last=False)
+            return cb
+
+    def _peek_circuit_breaker(self, project_id: str, provider_name: str) -> CircuitBreaker | None:
+        """Read-only lookup of a project's circuit breaker without mutating LRU order or inserting."""
+        with self._cb_lock:
+            return self._circuit_breakers.get((project_id, provider_name))
+
     def register_provider(self, provider: BaseProvider) -> None:
         """Registers or replaces a provider in the gateway."""
         self.providers[provider.name] = provider
+        with self._cb_lock:
+            stale_keys = [k for k in self._circuit_breakers if k[1] == provider.name]
+            for k in stale_keys:
+                self._circuit_breakers.pop(k, None)
         if provider.name not in self.routing_order and provider.name != "mock":
             self.routing_order.append(provider.name)
 
@@ -646,9 +755,10 @@ class GatewayRouter:
                 },
             )
 
-        # 1. Atomic Rate Limit Check & Reserve BEFORE calling provider
+        # 1. Atomic Rate Limit Check & Reserve BEFORE calling provider (off event loop)
         est_tokens = sum(len(str(m.get("content", "")).split()) * 2 for m in messages)
-        allowed, reason, window_start = self.rate_limiter.acquire(
+        allowed, reason, window_start = await run_in_threadpool(
+            self.rate_limiter.acquire,
             project_id,
             estimated_tokens=est_tokens,
         )
@@ -676,7 +786,8 @@ class GatewayRouter:
             cost = compute_cost(model, input_tokens=p_tokens, output_tokens=c_tokens)
 
             # Reconcile tokens to 0 for cache hit (counts against RPM, zero new tokens)
-            self.rate_limiter.reconcile_tokens(
+            await run_in_threadpool(
+                self.rate_limiter.reconcile_tokens,
                 project_id=project_id,
                 window_start=window_start,
                 estimated_tokens=est_tokens,
@@ -690,7 +801,8 @@ class GatewayRouter:
                 "cache": "HIT",
             }
 
-            self._record_log(
+            await run_in_threadpool(
+                self._record_log,
                 project_id=project_id,
                 route=route,
                 model=model,
@@ -716,10 +828,11 @@ class GatewayRouter:
             if prov is None:
                 continue
 
-            # Circuit breaker check
-            if not prov.circuit_breaker.can_execute():
+            # Project-isolated circuit breaker check
+            cb = self.get_circuit_breaker(project_id, provider_name)
+            if not cb.can_execute():
                 other_errors.append(
-                    f"{provider_name}: Circuit breaker is {prov.circuit_breaker.state} (blocked)"
+                    f"{provider_name}: Circuit breaker is {cb.state} (blocked)"
                 )
                 continue
 
@@ -738,7 +851,7 @@ class GatewayRouter:
                 total_latency_ms = (time.monotonic() - req_start) * 1000.0
 
                 prov.record_latency(call_latency_ms)
-                prov.circuit_breaker.record_success()
+                cb.record_success()
                 self._latencies.append(total_latency_ms)
 
                 usage = response.get("usage", {})
@@ -768,8 +881,9 @@ class GatewayRouter:
                     project_id=project_id,
                 )
 
-                # Reconcile actual tokens in shared rate-limit window
-                self.rate_limiter.reconcile_tokens(
+                # Reconcile actual tokens in shared rate-limit window (off event loop)
+                await run_in_threadpool(
+                    self.rate_limiter.reconcile_tokens,
                     project_id=project_id,
                     window_start=window_start,
                     estimated_tokens=est_tokens,
@@ -777,7 +891,8 @@ class GatewayRouter:
                 )
 
                 status: Literal["DIRECT", "FALLBACK"] = "DIRECT" if attempt == 0 else "FALLBACK"
-                self._record_log(
+                await run_in_threadpool(
+                    self._record_log,
                     project_id=project_id,
                     route=route,
                     model=model,
@@ -797,15 +912,23 @@ class GatewayRouter:
                 not_configured_errors.append(exc)
                 attempt += 1
                 continue
+            except ProviderExecutionError as exc:
+                if exc.trips_circuit_breaker:
+                    cb.record_failure()
+                sanitized = sanitize_provider_error(exc)
+                other_errors.append(f"{provider_name}: {sanitized}")
+                attempt += 1
+                continue
             except Exception as exc:  # noqa: BLE001 - resilience layer catches provider failure to trigger fallback
-                prov.circuit_breaker.record_failure()
+                cb.record_failure()
                 sanitized = sanitize_provider_error(exc)
                 other_errors.append(f"{provider_name}: {sanitized}")
                 attempt += 1
                 continue
 
         # All providers failed — release reserved estimated tokens (keep RPM count)
-        self.rate_limiter.reconcile_tokens(
+        await run_in_threadpool(
+            self.rate_limiter.reconcile_tokens,
             project_id=project_id,
             window_start=window_start,
             estimated_tokens=est_tokens,
@@ -816,7 +939,8 @@ class GatewayRouter:
         if not_configured_errors and not other_errors:
             missing_vars = [e.env_var for e in not_configured_errors]
             err_msg = "; ".join(str(e) for e in not_configured_errors)
-            self._record_log(
+            await run_in_threadpool(
+                self._record_log,
                 project_id=project_id,
                 route=route,
                 model=model,
@@ -844,7 +968,8 @@ class GatewayRouter:
 
         all_errs = [str(e) for e in not_configured_errors] + other_errors
         err_msg = "All LLM providers unavailable: " + "; ".join(all_errs)
-        self._record_log(
+        await run_in_threadpool(
+            self._record_log,
             project_id=project_id,
             route=route,
             model=model,
@@ -893,7 +1018,8 @@ class GatewayRouter:
             simulated=simulated,
             error_sanitized=error_sanitized,
         )
-        self._logs.append(log)
+        with self._logs_lock:
+            self._logs.append(log)
 
         if self.session_factory is not None:
             with self.session_factory() as db:
@@ -947,43 +1073,154 @@ class GatewayRouter:
     def get_stats(self, project_id: str | None = None) -> dict[str, Any]:
         """Returns aggregate gateway telemetry, strictly scoped to `project_id` when provided."""
         active_providers = len(self.providers)
-        healthy_providers = sum(
-            1 for p in self.providers.values() if p.circuit_breaker.state != "OPEN"
-        )
+        if project_id is not None:
+            healthy_providers = sum(
+                1
+                for p in self.providers.values()
+                if (cb := self._peek_circuit_breaker(project_id, p.name)) is None
+                or cb.state != CircuitState.OPEN.value
+            )
+        else:
+            healthy_providers = sum(
+                1 for p in self.providers.values() if p.circuit_breaker.state != CircuitState.OPEN.value
+            )
 
         if self.session_factory is not None:
-            with self.session_factory() as db:
-                stmt = select(GatewayRequest)
-                if project_id is not None:
-                    stmt = stmt.where(GatewayRequest.project_id == project_id)
-                rows = db.scalars(stmt).all()
+            now_dt = datetime.now(UTC)
+            cutoff_24h = now_dt - timedelta(hours=24)
+            filters = []
+            if project_id is not None:
+                filters.append(GatewayRequest.project_id == project_id)
+            if self.retention_days > 0:
+                filters.append(GatewayRequest.ts >= (now_dt - timedelta(days=self.retention_days)))
 
-            total_requests = len(rows)
-            cache_hits = sum(1 for r in rows if r.cache_hit)
-            tokens_saved = sum(r.input_tokens + r.output_tokens for r in rows if r.cache_hit)
-            cost_saved = round(sum(r.cost_usd for r in rows if r.cache_hit), 6)
-            total_cost = round(sum(r.cost_usd for r in rows if not r.cache_hit and r.status != "ERROR"), 6)
-            latencies = sorted(r.latency_ms for r in rows)
-            fallback_events = sum(1 for r in rows if r.status == "FALLBACK")
-            hit_rate = round(cache_hits / total_requests, 4) if total_requests > 0 else 0.0
+            with self.session_factory() as db:
+                dialect = db.bind.dialect.name if db.bind is not None else "sqlite"
+                agg_cols: list[Any] = [
+                    func.count(GatewayRequest.id),
+                    func.coalesce(
+                        func.sum(case((GatewayRequest.cache_hit.is_(True), 1), else_=0)),
+                        0,
+                    ),
+                    func.coalesce(
+                        func.sum(
+                            case(
+                                (
+                                    GatewayRequest.cache_hit.is_(True),
+                                    GatewayRequest.input_tokens + GatewayRequest.output_tokens,
+                                ),
+                                else_=0,
+                            )
+                        ),
+                        0,
+                    ),
+                    func.coalesce(
+                        func.sum(
+                            case(
+                                (GatewayRequest.cache_hit.is_(True), GatewayRequest.cost_usd),
+                                else_=0.0,
+                            )
+                        ),
+                        0.0,
+                    ),
+                    func.coalesce(
+                        func.sum(
+                            case(
+                                (
+                                    and_(
+                                        GatewayRequest.cache_hit.is_(False),
+                                        GatewayRequest.status != "ERROR",
+                                    ),
+                                    GatewayRequest.cost_usd,
+                                ),
+                                else_=0.0,
+                            )
+                        ),
+                        0.0,
+                    ),
+                    func.coalesce(func.avg(GatewayRequest.latency_ms), 0.0),
+                    func.coalesce(
+                        func.sum(
+                            case(
+                                (
+                                    and_(
+                                        GatewayRequest.status == "FALLBACK",
+                                        GatewayRequest.ts >= cutoff_24h,
+                                    ),
+                                    1,
+                                ),
+                                else_=0,
+                            )
+                        ),
+                        0,
+                    ),
+                ]
+                if dialect == "postgresql":
+                    agg_cols.extend(
+                        [
+                            func.coalesce(
+                                func.percentile_cont(0.50).within_group(GatewayRequest.latency_ms),
+                                0.0,
+                            ),
+                            func.coalesce(
+                                func.percentile_cont(0.99).within_group(GatewayRequest.latency_ms),
+                                0.0,
+                            ),
+                        ]
+                    )
+
+                agg_stmt = select(*agg_cols)
+                if filters:
+                    agg_stmt = agg_stmt.where(*filters)
+                agg_row = db.execute(agg_stmt).one()
+
+                total_requests = int(agg_row[0] or 0)
+                cache_hits = int(agg_row[1] or 0)
+                tokens_saved = int(agg_row[2] or 0)
+                cost_saved = round(float(agg_row[3] or 0.0), 6)
+                total_cost = round(float(agg_row[4] or 0.0), 6)
+                avg_latency = round(float(agg_row[5] or 0.0), 2)
+                fallback_events = int(agg_row[6] or 0)
+                hit_rate = round(cache_hits / total_requests, 4) if total_requests > 0 else 0.0
+
+                if dialect == "postgresql":
+                    p50_latency = round(float(agg_row[7] or 0.0), 2)
+                    p99_latency = round(float(agg_row[8] or 0.0), 2)
+                elif total_requests > 0:
+                    lat_stmt = select(GatewayRequest.latency_ms)
+                    if filters:
+                        lat_stmt = lat_stmt.where(*filters)
+                    lat_stmt = lat_stmt.order_by(GatewayRequest.ts.desc()).limit(
+                        max(1, int(self.stats_percentile_sample_size))
+                    )
+                    sample_latencies = sorted(float(v) for v in db.scalars(lat_stmt).all())
+                    p50_latency = round(_percentile_from_sorted(sample_latencies, 0.50), 2)
+                    p99_latency = round(_percentile_from_sorted(sample_latencies, 0.99), 2)
+                else:
+                    p50_latency = 0.0
+                    p99_latency = 0.0
         else:
-            logs = [log for log in self._logs if project_id is None or log.project_id == project_id]
+            now_dt = datetime.now(UTC)
+            cutoff_24h = now_dt - timedelta(hours=24)
+            with self._logs_lock:
+                logs = [log for log in self._logs if project_id is None or log.project_id == project_id]
             total_requests = len(logs)
             cache_hits = sum(1 for log in logs if log.status == "CACHE_HIT")
             tokens_saved = sum(log.total_tokens for log in logs if log.status == "CACHE_HIT")
             cost_saved = round(sum(log.cost_usd for log in logs if log.status == "CACHE_HIT"), 6)
-            total_cost = round(sum(log.cost_usd for log in logs if log.status not in ("CACHE_HIT", "ERROR")), 6)
+            total_cost = round(
+                sum(log.cost_usd for log in logs if log.status not in ("CACHE_HIT", "ERROR")), 6
+            )
             latencies = sorted(log.latency_ms for log in logs)
-            fallback_events = sum(1 for log in logs if log.status == "FALLBACK")
+            fallback_events = sum(
+                1
+                for log in logs
+                if log.status == "FALLBACK" and _parse_iso_utc(log.timestamp) >= cutoff_24h
+            )
             hit_rate = round(cache_hits / total_requests, 4) if total_requests > 0 else 0.0
-
-        avg_latency = round(sum(latencies) / len(latencies), 2) if latencies else 0.0
-        p50_latency = round(latencies[int(len(latencies) * 0.50)], 2) if latencies else 0.0
-        p99_latency = (
-            round(latencies[min(len(latencies) - 1, int(len(latencies) * 0.99))], 2)
-            if latencies
-            else 0.0
-        )
+            avg_latency = round(sum(latencies) / len(latencies), 2) if latencies else 0.0
+            p50_latency = round(_percentile_from_sorted(latencies, 0.50), 2) if latencies else 0.0
+            p99_latency = round(_percentile_from_sorted(latencies, 0.99), 2) if latencies else 0.0
 
         return {
             "total_requests": total_requests,
@@ -1006,28 +1243,47 @@ class GatewayRouter:
         if project_id is None:
             return [provider.to_dict() for provider in self.providers.values()]
 
-        # Compute per-project request counts and latencies so tenants never see each other's metrics
+        # Compute per-project request counts and latencies in SQL so tenants never see each other's metrics
         counts: dict[str, int] = {}
-        latency_sums: dict[str, float] = {}
+        avg_latencies: dict[str, float] = {}
         if self.session_factory is not None:
+            stmt = select(
+                GatewayRequest.provider,
+                func.count(GatewayRequest.id),
+                func.coalesce(func.avg(GatewayRequest.latency_ms), 0.0),
+            ).where(GatewayRequest.project_id == project_id)
+            if self.retention_days > 0:
+                cutoff = datetime.now(UTC) - timedelta(days=self.retention_days)
+                stmt = stmt.where(GatewayRequest.ts >= cutoff)
+            stmt = stmt.group_by(GatewayRequest.provider)
             with self.session_factory() as db:
-                rows = db.scalars(
-                    select(GatewayRequest).where(GatewayRequest.project_id == project_id)
-                ).all()
-            for r in rows:
-                counts[r.provider] = counts.get(r.provider, 0) + 1
-                latency_sums[r.provider] = latency_sums.get(r.provider, 0.0) + r.latency_ms
+                for prov_name, cnt, avg_lat in db.execute(stmt).all():
+                    counts[str(prov_name)] = int(cnt or 0)
+                    avg_latencies[str(prov_name)] = float(avg_lat or 0.0)
         else:
-            for log in self._logs:
+            latency_sums: dict[str, float] = {}
+            with self._logs_lock:
+                logs_snapshot = list(self._logs)
+            for log in logs_snapshot:
                 if log.project_id == project_id:
                     counts[log.provider] = counts.get(log.provider, 0) + 1
                     latency_sums[log.provider] = latency_sums.get(log.provider, 0.0) + log.latency_ms
+            for prov_name, cnt in counts.items():
+                avg_latencies[prov_name] = (latency_sums[prov_name] / cnt) if cnt > 0 else 0.0
 
         result: list[dict[str, Any]] = []
         for provider in self.providers.values():
             c = counts.get(provider.name, 0)
-            avg_lat = (latency_sums[provider.name] / c) if c > 0 else 0.0
-            result.append(provider.to_dict(total_requests=c, avg_latency_ms=avg_lat))
+            avg_lat = avg_latencies.get(provider.name, 0.0)
+            cb = self._peek_circuit_breaker(project_id, provider.name)
+            result.append(
+                provider.to_dict(
+                    total_requests=c,
+                    avg_latency_ms=avg_lat,
+                    circuit_breaker=cb,
+                    scoped=True,
+                )
+            )
         return result
 
     def get_rules(self, project_id: str | None = None) -> list[dict[str, Any]]:
@@ -1078,28 +1334,33 @@ class GatewayRouter:
 
     def get_logs(self, limit: int = 50, project_id: str | None = None) -> list[dict[str, Any]]:
         """Returns the most recent request audit logs (strictly filtered by project_id)."""
+        safe_limit = max(1, min(int(limit), 1000))
         if self.session_factory is not None:
             with self.session_factory() as db:
                 stmt = select(GatewayRequest)
                 if project_id is not None:
                     stmt = stmt.where(GatewayRequest.project_id == project_id)
-                stmt = stmt.order_by(GatewayRequest.ts.desc()).limit(limit)
+                stmt = stmt.order_by(GatewayRequest.ts.desc()).limit(safe_limit)
                 rows = db.scalars(stmt).all()
             return [_row_to_log_dict(r) for r in rows]
 
-        all_logs = list(self._logs)
+        with self._logs_lock:
+            all_logs = list(self._logs)
         if project_id is not None:
             all_logs = [log for log in all_logs if log.project_id == project_id]
         all_logs.reverse()
-        return [log.to_dict() for log in all_logs[:limit]]
+        return [log.to_dict() for log in all_logs[:safe_limit]]
 
     def reset(self) -> None:
         """Resets telemetry, cache, rate limits, and provider states (for testing)."""
         self.cache.clear()
         self.cache.reset_stats()
         self.rate_limiter.reset()
-        self._logs.clear()
+        with self._logs_lock:
+            self._logs.clear()
         self._latencies.clear()
+        with self._cb_lock:
+            self._circuit_breakers.clear()
         for p in self.providers.values():
             p.circuit_breaker.reset()
             p._latencies.clear()
