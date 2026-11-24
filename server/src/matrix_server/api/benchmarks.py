@@ -6,7 +6,7 @@ import json
 import math
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -14,10 +14,15 @@ from sqlalchemy.orm import Session
 from matrix_server.auth import Principal, Role, require
 from matrix_server.benchmarks.catalog import VALID_SUITES, list_catalog, validate_tasks
 from matrix_server.benchmarks.runner import (
+    BenchmarkCredentialError,
+    EngineUnavailable,
+    get_benchmark_engine,
     run_benchmark_job,
     sanitize_runner_config,
     validate_runner_config,
 )
+from matrix_server.egress import EgressError
+from matrix_server.sandboxes.runner import is_test_env
 from matrix_server.storage import jobs
 from matrix_server.storage.db import as_utc, get_db, utcnow
 from matrix_server.storage.models import (
@@ -158,6 +163,7 @@ def get_catalog(
 
 @router.post("/runs", status_code=status.HTTP_201_CREATED)
 def create_run(
+    request: Request,
     raw_body: Annotated[Any, Body()],
     db: DbSession,
     principal: MemberAuth,
@@ -241,15 +247,19 @@ def create_run(
         dataset_id=body.dataset_id,
         dataset_commit_id=body.dataset_commit_id,
         status="queued",
-        simulated=(body.runner_backend == "local_sim"),
+        simulated=get_benchmark_engine(body.runner_backend).simulated,
         summary_metrics={},
     )
     db.add(run)
     db.flush()
 
-    if is_sync:
+    if is_sync and is_test_env():
         db.commit()
-        run_benchmark_job(db, run.id)
+        try:
+            run_benchmark_job(request.app.state.session_factory, run.id)
+        except (EngineUnavailable, EgressError, BenchmarkCredentialError, RuntimeError, ValueError):
+            # run_benchmark_job already persisted failed status and sanitized error
+            pass
         db.expire_all()
         run = db.get(BenchmarkRun, run.id)  # type: ignore[assignment]
         task_results = db.scalars(

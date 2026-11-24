@@ -1,6 +1,7 @@
 """Inspect AI Sandboxes module."""
 
 from matrix_server.sandboxes.runner import (
+    VALID_SCORERS,
     DockerSandbox,
     FakeSandbox,
     SandboxEngine,
@@ -15,9 +16,11 @@ from matrix_server.sandboxes.runner import (
     is_test_env,
     run_sandbox_job,
     validate_sandbox_policy,
+    validate_scorer_config,
 )
 
 __all__ = [
+    "VALID_SCORERS",
     "DockerSandbox",
     "FakeSandbox",
     "SandboxEngine",
@@ -32,4 +35,5 @@ __all__ = [
     "is_test_env",
     "run_sandbox_job",
     "validate_sandbox_policy",
+    "validate_scorer_config",
 ]

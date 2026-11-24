@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import subprocess
 
@@ -18,12 +19,16 @@ from matrix_server.sandboxes.runner import (
     DockerSandbox,
     FakeSandbox,
     SandboxPolicyError,
+    SandboxTask,
     SandboxUnavailableError,
     build_docker_run_args,
+    evaluate_scorer,
     execute_step,
     is_docker_available,
+    run_sandbox_job,
     validate_sandbox_path,
 )
+from matrix_server.storage.models import SandboxRun
 
 
 def _require_docker() -> None:
@@ -610,8 +615,14 @@ def test_live_docker_containment_uid_ro_no_net_no_env_leak(tmp_path, monkeypatch
     assert code != 0
 
     # no network interfaces besides lo
-    code, out, _ = ds.execute_python("import os; print(','.join(sorted(os.listdir('/sys/class/net'))))")
-    assert code == 0 and out.strip() == "lo"
+    # Some kernels (LinuxKit/OrbStack) list inactive tunnel devices even with --network none: only
+    # an UP interface other than loopback would be a real network path.
+    code, out, _ = ds.execute_python(
+        "import os; d='/sys/class/net'; "
+        "print(','.join(sorted(n for n in os.listdir(d) if n != 'lo' "
+        "and os.path.isdir(os.path.join(d, n)) and open(os.path.join(d, n, 'operstate')).read().strip() not in ('down',))))"
+    )
+    assert code == 0 and out.strip() == ""
 
     # server env does not leak
     code, out, _ = ds.execute_bash("printenv MATRIX_SECRET_PROBE || true")
@@ -644,3 +655,161 @@ def test_live_docker_timeout_and_oom_leave_no_orphan_containers(tmp_path):
         check=False,
     )
     assert ps.stdout.strip() == ""
+
+
+# ---------------------------------------------------------------------------
+# 6. T12 Scorer Fail-Closed & ArtifactStore Verification Tests
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_scorer_rejected_at_creation_and_fails_closed(env, tmp_path, monkeypatch):
+    monkeypatch.setenv("MATRIX_ENV", "test")
+    client: TestClient = env["client"]
+
+    # 1. API rejects unknown scorer name with 422
+    resp = client.post(
+        "/api/v1/sandboxes/runs",
+        headers=env["member_a"],
+        json={
+            "name": "unknown-scorer-run",
+            "runner_backend": "fake",
+            "scorer_config": {"name": "unit_test_typo"},
+        },
+    )
+    assert resp.status_code == 422
+    assert "Unsupported scorer" in resp.text
+
+    # 2. Direct evaluate_scorer fails closed (status="failed", score=0.0)
+    sb = FakeSandbox(workdir=tmp_path / "sb_unknown")
+    status, score, details, _arts, err = evaluate_scorer(
+        sandbox=sb,
+        task=SandboxTask(task_key="t1"),
+        scorer_config={"name": "nonexistent_scorer"},
+        steps=[],
+    )
+    assert status == "failed"
+    assert score == 0.0
+    assert details["unknown_scorer"] == "nonexistent_scorer"
+    assert "Unsupported scorer" in (err or "")
+
+
+def test_llm_judge_requires_expected_output_and_fails_closed(env, monkeypatch):
+    monkeypatch.setenv("MATRIX_ENV", "test")
+    client: TestClient = env["client"]
+
+    # Without expected_output (even with spoofed score=1.0), llm_judge must fail closed
+    resp_missing = client.post(
+        "/api/v1/sandboxes/runs",
+        headers=env["member_a"],
+        json={
+            "name": "llm-judge-no-expected",
+            "runner_backend": "fake",
+            "solver_config": {"steps": [{"tool_name": "bash", "tool_args": {"cmd": "echo 42"}}]},
+            "scorer_config": {"name": "llm_judge", "rubric": "be accurate", "score": 1.0},
+            "sync_exec": True,
+        },
+    )
+    assert resp_missing.status_code == 201
+    data_missing = resp_missing.json()
+    assert data_missing["passed_tasks"] == 0
+    assert data_missing["pass_rate"] == 0.0
+    t_missing = client.get(
+        f"/api/v1/sandboxes/runs/{data_missing['id']}/transcripts/task_1",
+        headers=env["viewer_a"],
+    ).json()
+    assert t_missing["status"] == "failed"
+    assert t_missing["score"] == 0.0
+    assert "expected_output" in (t_missing["error"] or "")
+
+    # With matching expected_output, llm_judge evaluates against output
+    resp_ok = client.post(
+        "/api/v1/sandboxes/runs",
+        headers=env["member_a"],
+        json={
+            "name": "llm-judge-with-expected",
+            "runner_backend": "fake",
+            "solver_config": {"steps": [{"tool_name": "bash", "tool_args": {"cmd": "echo 42"}}]},
+            "scorer_config": {"name": "llm_judge", "expected_output": "[simulated:bash]"},
+            "sync_exec": True,
+        },
+    )
+    assert resp_ok.status_code == 201
+    assert resp_ok.json()["pass_rate"] == 1.0
+
+
+def test_artifact_store_failures_mark_unverified_and_fail_task(env, tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("MATRIX_ENV", "test")
+    client: TestClient = env["client"]
+    app = env["app"]
+
+    # 1. save_blob failure inside evaluate_scorer
+    sb = FakeSandbox(workdir=tmp_path / "sb_art_fail")
+    sb.write_file("out.txt", "hello")
+
+    def _broken_save(_rel: str, _data: bytes) -> str | None:
+        raise RuntimeError("S3 quota exceeded")
+
+    with caplog.at_level(logging.WARNING):
+        status, score, details, arts, err = evaluate_scorer(
+            sandbox=sb,
+            task=SandboxTask(task_key="t_art", expected_files=["out.txt"], artifacts=["out.txt"]),
+            scorer_config={"name": "file_exists", "files": ["out.txt"]},
+            steps=[],
+            save_blob=_broken_save,
+        )
+    assert status == "failed"
+    assert score == 0.0
+    assert details.get("artifact_verification_failed") is True
+    assert len(arts) == 1
+    assert arts[0]["verified"] is False
+    assert arts[0]["storage_uri"] is None
+    assert "S3 quota exceeded" in (arts[0].get("error") or "")
+    assert "S3 quota exceeded" in (err or "")
+    assert any(r.levelno >= logging.WARNING and "S3 quota exceeded" in r.message for r in caplog.records)
+
+    # 2. get_artifact_store() failure inside run_sandbox_job (no debug-only suppression)
+    caplog.clear()
+    create_res = client.post(
+        "/api/v1/sandboxes/runs",
+        headers=env["member_a"],
+        json={
+            "name": "broken-default-store-run",
+            "runner_backend": "fake",
+            "solver_config": {
+                "steps": [
+                    {"tool_name": "file_edit", "tool_args": {"path": "result.txt", "content": "done"}}
+                ]
+            },
+            "scorer_config": {"name": "file_exists", "files": ["result.txt"], "artifacts": ["result.txt"]},
+            "sync_exec": False,
+        },
+    )
+    assert create_res.status_code == 201
+    run_id = create_res.json()["id"]
+
+    import matrix_server.workers.artifact_handlers as artifact_handlers_mod
+
+    monkeypatch.setattr(
+        artifact_handlers_mod,
+        "get_artifact_store",
+        lambda: (_ for _ in ()).throw(RuntimeError("S3 endpoint unreachable")),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        run_sandbox_job(app.state.session_factory, run_id, artifact_store=None)
+
+    assert any(
+        r.levelno >= logging.ERROR and "S3 endpoint unreachable" in r.message
+        for r in caplog.records
+    )
+
+    detail = client.get(f"/api/v1/sandboxes/runs/{run_id}/transcripts/task_1", headers=env["viewer_a"]).json()
+    assert detail["status"] == "failed"
+    assert detail["score"] == 0.0
+    assert len(detail["verified_artifacts"]) == 1
+    assert detail["verified_artifacts"][0]["verified"] is False
+    assert detail["verified_artifacts"][0]["storage_uri"] is None
+    assert "S3 endpoint unreachable" in (detail["verified_artifacts"][0].get("error") or "")
+    with app.state.session_factory() as db:
+        db_run = db.get(SandboxRun, run_id)
+        assert db_run is not None and db_run.passed_tasks == 0 and db_run.pass_rate == 0.0

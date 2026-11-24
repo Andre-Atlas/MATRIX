@@ -26,6 +26,7 @@ from matrix_server.sandboxes.runner import (
     run_sandbox_job,
     validate_sandbox_path,
     validate_sandbox_policy,
+    validate_scorer_config,
 )
 from matrix_server.storage import jobs
 from matrix_server.storage.db import as_utc, get_db, utcnow
@@ -196,6 +197,7 @@ def create_sandbox_run(
     policy = dict(body.sandbox_policy or {})
     try:
         validate_sandbox_policy(policy)
+        validate_scorer_config(body.scorer_config)
     except SandboxPolicyError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

@@ -135,6 +135,16 @@ def test_t7_fragment_upgrade_wipes_api_key_and_downgrade(tmp_path):
             cols = {c["name"] for c in insp.get_columns(tbl)}
             assert "simulated" in cols, f"missing simulated column in {tbl}"
 
+        with engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "INSERT INTO sandbox_runs (id, project_id, name, runner_backend, solver_config, "
+                    "scorer_config, sandbox_policy, status, simulated, created_at) "
+                    "VALUES ('sr-unavail', 'p1', 's2', 'docker', '{}', '{}', '{}', 'sandbox_unavailable', :sim, :ts)"
+                ),
+                {"sim": False, "ts": now},
+            )
+
         with engine.connect() as conn:
             http_row = conn.execute(
                 sa.text("SELECT runner_config, simulated FROM benchmark_runs WHERE id = 'br-http'")
@@ -166,6 +176,12 @@ def test_t7_fragment_upgrade_wipes_api_key_and_downgrade(tmp_path):
 
         with engine.begin() as conn, Operations.context(MigrationContext.configure(conn)):
             fragment.downgrade()
+
+        with engine.connect() as conn:
+            unavail_status = conn.execute(
+                sa.text("SELECT status FROM sandbox_runs WHERE id = 'sr-unavail'")
+            ).scalar_one()
+            assert unavail_status == "failed"
 
         insp = sa.inspect(engine)
         for tbl in fragment.TABLES:

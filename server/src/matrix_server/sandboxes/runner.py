@@ -48,6 +48,7 @@ MAX_CPUS = 4.0
 
 NETWORK_UNSUPPORTED_MSG = "network access for sandboxes is not supported until an egress proxy exists"
 RESERVED_POLICY_KEYS = frozenset({"network_approved_by", "is_admin"})
+VALID_SCORERS = frozenset({"unit_test", "file_exists", "regex", "artifact_hash", "llm_judge"})
 _MEMORY_RE = re.compile(r"^[1-9][0-9]*[kmgKMG]$")
 _SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9_.-]+")
 _DAEMON_ERROR_MARKERS = (
@@ -205,6 +206,22 @@ def validate_sandbox_policy(
         "memory": memory,
         "cpus": float(cpus),
     }
+
+
+def validate_scorer_config(scorer_config: Any) -> str:
+    """Validate scorer_config against the known scorer allowlist (fail-closed)."""
+    if scorer_config is None:
+        return "unit_test"
+    if not isinstance(scorer_config, dict):
+        raise SandboxPolicyError("scorer_config must be a JSON object")
+    if "name" not in scorer_config:
+        return "unit_test"
+    scorer_name = scorer_config["name"]
+    if not isinstance(scorer_name, str) or scorer_name not in VALID_SCORERS:
+        raise SandboxPolicyError(
+            f"Unsupported scorer '{scorer_name}'. Must be one of: {sorted(VALID_SCORERS)}"
+        )
+    return scorer_name
 
 
 def build_docker_run_args(
@@ -845,26 +862,31 @@ def evaluate_scorer(
 
     elif scorer_name == "llm_judge":
         rubric = scorer_config.get("rubric", "")
-        expected = scorer_config.get("expected_output") or task.scorer_target
+        expected = scorer_config.get("expected_output")
+        if expected is None:
+            expected = task.scorer_target
         last_out = steps[-1].get("stdout", "") if steps else ""
-        if expected is not None:
+        if expected is None or not str(expected).strip():
+            passed = False
+            score = 0.0
+            error = "llm_judge requires expected_output (no real judge evaluation configured)"
+        else:
             passed = str(expected).strip() in last_out.strip()
             score = 1.0 if passed else 0.0
-        else:
-            score = float(scorer_config.get("score", 1.0))
-            passed = score >= 0.7
+            if not passed:
+                error = "LLM judge evaluation below passing threshold"
         status = "passed" if passed else "failed"
         scorer_details.update({"rubric": rubric, "score": score, "passed": passed})
-        if not passed:
-            error = "LLM judge evaluation below passing threshold"
 
     else:
-        status = "passed"
-        score = 1.0
-        scorer_details.update({"unknown_scorer": scorer_name})
+        status = "failed"
+        score = 0.0
+        error = f"Unsupported scorer: {scorer_name}"
+        scorer_details.update({"unknown_scorer": scorer_name, "error": error})
 
     # 2. Artifact verification with SHA-256 via ArtifactStore
     verified_artifacts: list[dict[str, Any]] = []
+    artifact_errors: list[str] = []
     artifacts_to_check = set(task.artifacts)
     if "artifacts" in scorer_config:
         artifacts_to_check.update(scorer_config["artifacts"])
@@ -886,7 +908,32 @@ def evaluate_scorer(
                 try:
                     storage_uri = save_blob(rel_path, data)
                 except Exception as store_err:  # noqa: BLE001
-                    log.debug("Artifact store write skipped/failed: %s", store_err)
+                    log.warning("Artifact store write failed for %s: %s", rel_path, store_err)
+                    err_msg = f"Artifact store write failed: {store_err}"
+                    artifact_errors.append(f"{rel_path}: {err_msg}")
+                    verified_artifacts.append({
+                        "path": rel_path,
+                        "sha256": file_sha,
+                        "size_bytes": size_bytes,
+                        "verified": False,
+                        "storage_uri": None,
+                        "error": err_msg,
+                    })
+                    continue
+
+                if not storage_uri:
+                    log.warning("Artifact store returned empty storage URI for %s", rel_path)
+                    err_msg = "Artifact store returned empty storage URI"
+                    artifact_errors.append(f"{rel_path}: {err_msg}")
+                    verified_artifacts.append({
+                        "path": rel_path,
+                        "sha256": file_sha,
+                        "size_bytes": size_bytes,
+                        "verified": False,
+                        "storage_uri": None,
+                        "error": err_msg,
+                    })
+                    continue
 
             verified_artifacts.append({
                 "path": rel_path,
@@ -897,6 +944,25 @@ def evaluate_scorer(
             })
         except Exception as exc:  # noqa: BLE001
             log.warning("Artifact verification failed for %s: %s", rel_path, exc)
+            err_msg = f"Artifact verification failed: {exc}"
+            artifact_errors.append(f"{rel_path}: {err_msg}")
+            verified_artifacts.append({
+                "path": rel_path,
+                "sha256": None,
+                "size_bytes": 0,
+                "verified": False,
+                "storage_uri": None,
+                "error": err_msg,
+            })
+
+    if artifact_errors:
+        scorer_details["artifact_verification_failed"] = True
+        scorer_details["artifact_errors"] = artifact_errors
+        if status == "passed":
+            status = "failed"
+            score = 0.0
+        combined_err = "; ".join(artifact_errors)
+        error = f"{error}; {combined_err}" if error else combined_err
 
     return status, score, scorer_details, verified_artifacts, error
 
@@ -905,10 +971,19 @@ def evaluate_scorer(
 
 
 def _blob_saver(
-    session_factory: sessionmaker[Session], store: ArtifactStore | None, project_id: str, sandbox_run_id: str
+    session_factory: sessionmaker[Session],
+    store: ArtifactStore | None,
+    project_id: str,
+    sandbox_run_id: str,
+    store_error: str | None = None,
 ) -> Callable[[str, bytes], str | None] | None:
     """Store a task's output file through the G0 artifact store (an `artifacts` row owned by the
     sandbox run: deduplicated, within the project quota, removed with the project)."""
+    if store_error is not None:
+        def fail_save(_rel_path: str, _data: bytes) -> str | None:
+            raise RuntimeError(store_error)
+
+        return fail_save
     if store is None:
         return None
     limits = Limits.from_settings(get_settings())
@@ -930,13 +1005,15 @@ def run_sandbox_job(
     artifact_store: ArtifactStore | None = None,
 ) -> None:
     """Execute a complete SandboxRun job against the database."""
+    artifact_store_error: str | None = None
     if artifact_store is None:
         try:
             from matrix_server.workers.artifact_handlers import get_artifact_store
 
             artifact_store = get_artifact_store()
         except Exception as exc:  # noqa: BLE001
-            log.debug("Could not build default artifact store: %s", exc)
+            log.error("Could not build default artifact store for sandbox run %s: %s", sandbox_run_id, exc)
+            artifact_store_error = f"Artifact store unavailable: {exc}"
 
     # 1. Load run and validate state
     with session_factory() as session, session.begin():
@@ -1095,7 +1172,13 @@ def run_sandbox_job(
                     task=task,
                     scorer_config=scorer_config,
                     steps=steps,
-                    save_blob=_blob_saver(session_factory, artifact_store, project_id, sandbox_run_id),
+                    save_blob=_blob_saver(
+                        session_factory,
+                        artifact_store,
+                        project_id,
+                        sandbox_run_id,
+                        store_error=artifact_store_error,
+                    ),
                     project_id=project_id,
                     task_timeout=task_timeout,
                 )

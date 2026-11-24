@@ -2,6 +2,8 @@
 
 from matrix_server.benchmarks.runner import (
     API_KEY_ENV_RE,
+    BENCHMARK_API_KEY_ENV_PREFIX,
+    BenchmarkCredentialError,
     BenchmarkEngine,
     EngineUnavailable,
     HttpBenchmarkEngine,
@@ -16,6 +18,8 @@ from matrix_server.benchmarks.runner import (
 
 __all__ = [
     "API_KEY_ENV_RE",
+    "BENCHMARK_API_KEY_ENV_PREFIX",
+    "BenchmarkCredentialError",
     "BenchmarkEngine",
     "EngineUnavailable",
     "HttpBenchmarkEngine",

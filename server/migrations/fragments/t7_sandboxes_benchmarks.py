@@ -113,6 +113,12 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     bind = op.get_bind()
+    bind.execute(
+        sa.text(
+            "UPDATE sandbox_runs SET status = 'failed' "
+            "WHERE status = 'sandbox_unavailable' OR length(status) > 16"
+        )
+    )
     if bind.dialect.name != "sqlite":
         op.alter_column(
             "sandbox_runs",

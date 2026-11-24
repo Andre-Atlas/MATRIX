@@ -6,29 +6,59 @@ import abc
 import hashlib
 import ipaddress
 import logging
+import math
 import os
 import re
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from urllib.parse import urlsplit
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from matrix_server import audit
 from matrix_server.benchmarks.catalog import TASK_CATALOG, BenchmarkTaskDef
 from matrix_server.egress import EgressError, EgressSettings, classify_ip, egress_client
+from matrix_server.egress.policy import best_effort_host, check_url
 from matrix_server.storage.db import utcnow
 from matrix_server.storage.models import ArtifactLineage, BenchmarkRun, BenchmarkTaskResult
 
 log = logging.getLogger(__name__)
 
 API_KEY_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+BENCHMARK_API_KEY_ENV_PREFIX = "MATRIX_BENCH_API_KEY_"
+MAX_HTTP_TIMEOUT_SECONDS = 300.0
+HTTP_BENCHMARK_MAX_WORKERS = 4
 _CONTROL_OR_WS_RE = re.compile(r"[\x00-\x20\x7f]")
 
 
 class EngineUnavailable(RuntimeError):
     """Raised when an optional real benchmark engine (`lm_eval`, `vlmeval`) is not installed."""
+
+    non_retryable: bool = True
+
+
+class BenchmarkCredentialError(RuntimeError):
+    """Raised when a configured benchmark credential env var is unusable (no env oracle)."""
+
+    non_retryable: bool = True
+
+
+def allowed_benchmark_env_vars() -> set[str]:
+    """Return explicit operator-allowlisted env var names from `MATRIX_BENCHMARK_ALLOWED_ENV_VARS`."""
+    raw = os.environ.get("MATRIX_BENCHMARK_ALLOWED_ENV_VARS", "")
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def is_allowed_api_key_env(name: str) -> bool:
+    """Allow only `MATRIX_BENCH_API_KEY_*` or explicitly allowlisted benchmark credential env vars."""
+    if not API_KEY_ENV_RE.match(name):
+        return False
+    if name.startswith(BENCHMARK_API_KEY_ENV_PREFIX):
+        return True
+    return name in allowed_benchmark_env_vars()
 
 
 # --- Config & Secret Validation ---------------------------------------------
@@ -92,11 +122,27 @@ def validate_runner_config(config: dict[str, Any] | None, *, backend: str) -> No
             )
 
     api_key_env = cfg.get("api_key_env")
-    if api_key_env is not None and (not isinstance(api_key_env, str) or not API_KEY_ENV_RE.match(api_key_env)):
-        raise ValueError(
-            "runner_config.api_key_env must be a valid environment variable name "
-            "(matching ^[A-Z][A-Z0-9_]{0,63}$)"
-        )
+    if api_key_env is not None:
+        if not isinstance(api_key_env, str) or not API_KEY_ENV_RE.match(api_key_env):
+            raise ValueError(
+                "runner_config.api_key_env must be a valid environment variable name "
+                "(matching ^[A-Z][A-Z0-9_]{0,63}$)"
+            )
+        if not is_allowed_api_key_env(api_key_env):
+            raise ValueError(
+                "runner_config.api_key_env must use the 'MATRIX_BENCH_API_KEY_' prefix "
+                "or be explicitly allowlisted by MATRIX_BENCHMARK_ALLOWED_ENV_VARS"
+            )
+
+    if "timeout_seconds" in cfg and cfg["timeout_seconds"] is not None:
+        timeout_val = cfg["timeout_seconds"]
+        if (
+            isinstance(timeout_val, bool)
+            or not isinstance(timeout_val, (int, float))
+            or not math.isfinite(float(timeout_val))
+            or float(timeout_val) <= 0
+        ):
+            raise ValueError("runner_config.timeout_seconds must be a positive finite number")
 
     if backend in ("http", "vllm"):
         endpoint_url = cfg.get("endpoint_url")
@@ -155,10 +201,13 @@ class LocalSimBenchmarkEngine(BenchmarkEngine):
 
 
 class HttpBenchmarkEngine(BenchmarkEngine):
-    """HTTP / vLLM OpenAI-compatible benchmark engine routed exclusively through `egress_client`."""
+    """HTTP / vLLM OpenAI-compatible benchmark engine routed exclusively through `egress_client`.
+
+    Marked `simulated = True` until a real dataset evaluation scorer replaces synthetic response-hash scoring.
+    """
 
     name = "http"
-    simulated = False
+    simulated = True
 
     def run(
         self,
@@ -273,6 +322,35 @@ def run_local_sim(
 # --- HTTP / vLLM Runner (via EgressClient) ----------------------------------
 
 
+def _precheck_egress(
+    *,
+    url: str,
+    project_id: str,
+    session_factory: Callable[[], Session],
+) -> None:
+    """Validate project egress allowlist and resolved IP before reading server credentials."""
+    settings = EgressSettings()
+    try:
+        with session_factory() as session:
+            check_url(
+                url,
+                project_id=project_id,
+                session=session,
+                purpose="benchmark.run",
+                settings=settings,
+            )
+    except EgressError as exc:
+        with session_factory() as session, session.begin():
+            audit.record(
+                session,
+                action="egress.request",
+                project_id=project_id,
+                target=exc.host or best_effort_host(url),
+                detail={"purpose": "benchmark.run", "reason": exc.reason},
+            )
+        raise
+
+
 def execute_http_runner_tasks(
     run: BenchmarkRun,
     task_defs: list[BenchmarkTaskDef],
@@ -284,28 +362,40 @@ def execute_http_runner_tasks(
     config = run.runner_config or {}
     validate_runner_config(config, backend=run.runner_backend)
     endpoint_url = str(config["endpoint_url"]).rstrip("/")
-    timeout_seconds = max(1.0, min(float(config.get("timeout_seconds", 30.0)), 3600.0))
+    raw_timeout = config.get("timeout_seconds")
+    timeout_seconds = max(
+        1.0,
+        min(
+            float(30.0 if raw_timeout is None else raw_timeout),
+            MAX_HTTP_TIMEOUT_SECONDS,
+        ),
+    )
+
+    if run.eval_mode == "loglikelihood":
+        endpoint = f"{endpoint_url}/completions"
+    else:
+        endpoint = f"{endpoint_url}/chat/completions"
+
+    # Validate egress policy BEFORE accessing any environment credentials (prevents env presence oracle).
+    _precheck_egress(url=endpoint, project_id=run.project_id, session_factory=session_factory)
 
     headers: dict[str, str] = {"Content-Type": "application/json"}
     api_key_env = config.get("api_key_env")
     if api_key_env:
         secret_val = os.environ.get(api_key_env)
         if not secret_val:
-            raise RuntimeError(f"Environment variable '{api_key_env}' is not set on the server")
+            raise BenchmarkCredentialError("Benchmark credential configuration error")
         headers["Authorization"] = f"Bearer {secret_val}"
 
-    client = egress_client(
-        project_id=run.project_id,
-        session_factory=session_factory,
-        purpose="benchmark.run",
-        timeout=timeout_seconds,
-    )
-
-    results: list[BenchmarkTaskResult] = []
-    for task in task_defs:
+    def _run_single_task(task: BenchmarkTaskDef) -> BenchmarkTaskResult:
+        client = egress_client(
+            project_id=run.project_id,
+            session_factory=session_factory,
+            purpose="benchmark.run",
+            timeout=timeout_seconds,
+        )
         t0 = time.perf_counter()
         if run.eval_mode == "loglikelihood":
-            endpoint = f"{endpoint_url}/completions"
             payload: dict[str, Any] = {
                 "model": run.target_model,
                 "prompt": f"Benchmark evaluation for {task.name}",
@@ -314,7 +404,6 @@ def execute_http_runner_tasks(
                 "echo": True,
             }
         elif run.eval_mode == "multimodal":
-            endpoint = f"{endpoint_url}/chat/completions"
             payload = {
                 "model": run.target_model,
                 "messages": [
@@ -328,7 +417,6 @@ def execute_http_runner_tasks(
                 "max_tokens": 128,
             }
         else:  # generate_until
-            endpoint = f"{endpoint_url}/chat/completions"
             payload = {
                 "model": run.target_model,
                 "messages": [
@@ -353,25 +441,36 @@ def execute_http_runner_tasks(
             if m != task.primary_metric:
                 metrics[m] = primary_score
 
-        results.append(
-            BenchmarkTaskResult(
-                project_id=run.project_id,
-                benchmark_run_id=run.id,
-                task_name=task.name,
-                modality=task.modality,
-                eval_mode=run.eval_mode,
-                num_fewshot=run.num_fewshot,
-                sample_count=min(task.sample_count, 50),
-                primary_metric=task.primary_metric,
-                primary_score=primary_score,
-                simulated=False,
-                metrics=metrics,
-                latency_ms_p50=round(elapsed_ms, 2),
-                latency_ms_p95=round(elapsed_ms * 1.25, 2),
-            )
+        return BenchmarkTaskResult(
+            project_id=run.project_id,
+            benchmark_run_id=run.id,
+            task_name=task.name,
+            modality=task.modality,
+            eval_mode=run.eval_mode,
+            num_fewshot=run.num_fewshot,
+            sample_count=min(task.sample_count, 50),
+            primary_metric=task.primary_metric,
+            primary_score=primary_score,
+            simulated=True,
+            metrics=metrics,
+            latency_ms_p50=round(elapsed_ms, 2),
+            latency_ms_p95=round(elapsed_ms * 1.25, 2),
         )
 
-    return results
+    if not task_defs:
+        return []
+    max_workers = min(HTTP_BENCHMARK_MAX_WORKERS, len(task_defs))
+    if max_workers == 1:
+        return [_run_single_task(task_defs[0])]
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_run_single_task, task) for task in task_defs]
+        try:
+            return [future.result() for future in futures]
+        except Exception:
+            for future in futures:
+                future.cancel()
+            raise
 
 
 # --- Lineage Recording ------------------------------------------------------
@@ -483,8 +582,14 @@ def run_benchmark_job(
 
             _record_benchmark_lineage(db, persisted_run)
     except Exception as exc:
-        if isinstance(exc, (EgressError, EngineUnavailable)):
-            log.warning("Benchmark run %s blocked/unavailable: %s", benchmark_run_id, exc)
+        if isinstance(exc, (EgressError, EngineUnavailable, BenchmarkCredentialError, ValueError)):
+            exc.non_retryable = True
+            log.warning(
+                "Benchmark run %s blocked/unavailable (%s): %s",
+                benchmark_run_id,
+                type(exc).__name__,
+                exc,
+            )
         else:
             log.exception("Benchmark run %s failed", benchmark_run_id)
         with factory() as db, db.begin():

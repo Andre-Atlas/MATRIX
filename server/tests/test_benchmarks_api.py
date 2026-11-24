@@ -17,7 +17,9 @@ import matrix_server.benchmarks.runner as bench_runner_mod
 from matrix_server import egress
 from matrix_server.app import create_app
 from matrix_server.benchmarks.runner import (
+    BenchmarkCredentialError,
     EngineUnavailable,
+    HttpBenchmarkEngine,
     get_benchmark_engine,
     run_benchmark_job,
     validate_runner_config,
@@ -350,7 +352,7 @@ def test_http_runner_via_egress_client_against_fake_openai_server(env, monkeypat
     project_a = env["project_a"]
 
     sentinel = "SENTINEL_SECRET_KEY_987654321"
-    monkeypatch.setenv("MATRIX_TEST_BENCH_KEY", sentinel)
+    monkeypatch.setenv("MATRIX_BENCH_API_KEY_TEST", sentinel)
 
     received_auth: list[str] = []
     received_paths: list[str] = []
@@ -401,7 +403,7 @@ def test_http_runner_via_egress_client_against_fake_openai_server(env, monkeypat
                     "runner_backend": "http",
                     "runner_config": {
                         "endpoint_url": "http://bench.example.test/v1",
-                        "api_key_env": "MATRIX_TEST_BENCH_KEY",
+                        "api_key_env": "MATRIX_BENCH_API_KEY_TEST",
                     },
                     "eval_mode": "generate_until",
                     "target_model": "fake-openai-model",
@@ -412,9 +414,9 @@ def test_http_runner_via_egress_client_against_fake_openai_server(env, monkeypat
         assert resp.status_code == 201, resp.text
         data = resp.json()
         assert data["status"] == "completed"
-        assert data["simulated"] is False
+        assert data["simulated"] is True
         assert len(data["task_results"]) == 1
-        assert data["task_results"][0]["simulated"] is False
+        assert data["task_results"][0]["simulated"] is True
         assert received_paths == ["/v1/chat/completions"]
         assert received_auth == [f"Bearer {sentinel}"]
 
@@ -428,7 +430,7 @@ def test_http_runner_via_egress_client_against_fake_openai_server(env, monkeypat
             db_run = db.get(BenchmarkRun, data["id"])
             assert db_run is not None
             assert sentinel not in json.dumps(db_run.runner_config)
-            assert db_run.simulated is False
+            assert db_run.simulated is True
 
             audits = db.scalars(
                 select(AuditLog).where(
@@ -595,3 +597,352 @@ def test_async_run_benchmark_job_execution(env):
     assert detail["simulated"] is True
     assert len(detail["task_results"]) == 2
     assert all(r["simulated"] is True for r in detail["task_results"])
+
+
+# --- 10. T12 Security & Resilience Hardening Tests --------------------------
+
+
+def test_api_key_env_restricted_to_prefix_and_allowlist(env, monkeypatch):
+    client: TestClient = env["client"]
+    member = env["member_token_a"]
+
+    monkeypatch.delenv("MATRIX_BENCHMARK_ALLOWED_ENV_VARS", raising=False)
+    for forbidden_env in (
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "MATRIX_SECRET_KEY",
+        "MATRIX_ADMIN_TOKEN",
+        "DATABASE_URL",
+        "MATRIX_TEST_BENCH_KEY",
+    ):
+        resp = client.post(
+            "/api/v1/benchmarks/runs",
+            headers=auth(member),
+            json={
+                "name": "exfil-attempt",
+                "suite": "lm_eval",
+                "tasks": ["mmlu_pro"],
+                "runner_backend": "http",
+                "runner_config": {
+                    "endpoint_url": "https://bench.example.com/v1",
+                    "api_key_env": forbidden_env,
+                },
+                "target_model": "gpt-4o",
+            },
+        )
+        assert resp.status_code == 422, f"Expected 422 for {forbidden_env}, got {resp.status_code}"
+
+    # Default prefix MATRIX_BENCH_API_KEY_* is allowed
+    ok_prefixed = client.post(
+        "/api/v1/benchmarks/runs",
+        headers=auth(member),
+        json={
+            "name": "prefixed-key-run",
+            "suite": "lm_eval",
+            "tasks": ["mmlu_pro"],
+            "runner_backend": "http",
+            "runner_config": {
+                "endpoint_url": "https://bench.example.com/v1",
+                "api_key_env": "MATRIX_BENCH_API_KEY_OPENAI",
+            },
+            "target_model": "gpt-4o",
+            "sync_exec": False,
+        },
+    )
+    assert ok_prefixed.status_code == 201
+
+    # Explicit operator allowlist expands allowed env vars without allowing arbitrary secrets
+    monkeypatch.setenv("MATRIX_BENCHMARK_ALLOWED_ENV_VARS", "CUSTOM_BENCH_KEY,SECOND_BENCH_KEY")
+    ok_listed = client.post(
+        "/api/v1/benchmarks/runs",
+        headers=auth(member),
+        json={
+            "name": "allowlisted-key-run",
+            "suite": "lm_eval",
+            "tasks": ["mmlu_pro"],
+            "runner_backend": "http",
+            "runner_config": {
+                "endpoint_url": "https://bench.example.com/v1",
+                "api_key_env": "CUSTOM_BENCH_KEY",
+            },
+            "target_model": "gpt-4o",
+            "sync_exec": False,
+        },
+    )
+    assert ok_listed.status_code == 201
+
+    still_blocked = client.post(
+        "/api/v1/benchmarks/runs",
+        headers=auth(member),
+        json={
+            "name": "still-blocked",
+            "suite": "lm_eval",
+            "tasks": ["mmlu_pro"],
+            "runner_backend": "http",
+            "runner_config": {
+                "endpoint_url": "https://bench.example.com/v1",
+                "api_key_env": "DATABASE_URL",
+            },
+            "target_model": "gpt-4o",
+        },
+    )
+    assert still_blocked.status_code == 422
+
+
+def test_egress_checked_before_env_lookup_and_no_credential_oracle(env, monkeypatch):
+    client: TestClient = env["client"]
+    member = env["member_token_a"]
+    viewer = env["viewer_token_a"]
+    app = env["app"]
+    project_a = env["project_a"]
+
+    monkeypatch.delenv("MATRIX_BENCH_API_KEY_MISSING", raising=False)
+
+    # 1. Unlisted host + missing env var: must fail on egress allowlist BEFORE reading os.environ
+    r1 = client.post(
+        "/api/v1/benchmarks/runs",
+        headers=auth(member),
+        json={
+            "name": "unlisted-before-env",
+            "suite": "lm_eval",
+            "tasks": ["gsm8k"],
+            "runner_backend": "http",
+            "runner_config": {
+                "endpoint_url": "http://unlisted-oracle.example.com/v1",
+                "api_key_env": "MATRIX_BENCH_API_KEY_MISSING",
+            },
+            "target_model": "gpt-4o",
+            "sync_exec": False,
+        },
+    )
+    assert r1.status_code == 201
+    run1_id = r1.json()["id"]
+    with pytest.raises(EgressError) as exc1:
+        run_benchmark_job(app.state.session_factory, run1_id)
+    assert exc1.value.reason == "host_not_allowed"
+    assert getattr(exc1.value, "non_retryable", False) is True
+
+    # 2. Allowed host + missing env var: must fail with generic error, never echoing env var name
+    with app.state.session_factory() as db, db.begin():
+        db.add(EgressHost(project_id=project_a, host="allowed-oracle.example.test"))
+    egress.set_resolver_for_tests(lambda host, p: ["93.184.216.34"] if host == "allowed-oracle.example.test" else [])
+    try:
+        r2 = client.post(
+            "/api/v1/benchmarks/runs",
+            headers=auth(member),
+            json={
+                "name": "missing-cred-generic",
+                "suite": "lm_eval",
+                "tasks": ["gsm8k"],
+                "runner_backend": "http",
+                "runner_config": {
+                    "endpoint_url": "http://allowed-oracle.example.test/v1",
+                    "api_key_env": "MATRIX_BENCH_API_KEY_MISSING",
+                },
+                "target_model": "gpt-4o",
+                "sync_exec": False,
+            },
+        )
+        assert r2.status_code == 201
+        run2_id = r2.json()["id"]
+        with pytest.raises(BenchmarkCredentialError) as exc2:
+            run_benchmark_job(app.state.session_factory, run2_id)
+        assert getattr(exc2.value, "non_retryable", False) is True
+
+        detail2 = client.get(f"/api/v1/benchmarks/runs/{run2_id}", headers=auth(viewer)).json()
+        assert detail2["status"] == "failed"
+        assert detail2["error"] == "Benchmark credential configuration error"
+        assert "MATRIX_BENCH_API_KEY_MISSING" not in (detail2["error"] or "")
+    finally:
+        egress.set_resolver_for_tests(None)
+
+
+def test_sync_exec_ignored_outside_test_env(env, monkeypatch):
+    monkeypatch.setenv("MATRIX_ENV", "production")
+    client: TestClient = env["client"]
+    member = env["member_token_a"]
+
+    for qs in ("", "?sync_exec=true"):
+        resp = client.post(
+            f"/api/v1/benchmarks/runs{qs}",
+            headers=auth(member),
+            json={
+                "name": "prod-sync-ignored",
+                "suite": "lm_eval",
+                "tasks": ["gsm8k"],
+                "runner_backend": "local_sim",
+                "target_model": "llama-3",
+                "sync_exec": True,
+            },
+        )
+        assert resp.status_code == 201
+        data = resp.json()
+        assert data["status"] == "queued"
+        assert data["job_id"] is not None
+
+
+def test_sync_exec_engine_unavailable_and_egress_error_do_not_500(env):
+    client: TestClient = env["client"]
+    member = env["member_token_a"]
+    app = env["app"]
+
+    # 1. lm_eval EngineUnavailable -> 201 with persisted failed run (no 500)
+    resp_eng = client.post(
+        "/api/v1/benchmarks/runs",
+        headers=auth(member),
+        json={
+            "name": "sync-lm-eval-unavailable",
+            "suite": "lm_eval",
+            "tasks": ["gsm8k"],
+            "runner_backend": "lm_eval",
+            "target_model": "llama-3",
+            "sync_exec": True,
+        },
+    )
+    assert resp_eng.status_code == 201, resp_eng.text
+    eng_data = resp_eng.json()
+    assert eng_data["status"] == "failed"
+    assert "install the real engine" in (eng_data["error"] or "")
+
+    # 2. Async run_benchmark_job sets non_retryable=True on EngineUnavailable
+    resp_async = client.post(
+        "/api/v1/benchmarks/runs",
+        headers=auth(member),
+        json={
+            "name": "async-vlmeval-unavailable",
+            "suite": "vlmevalkit",
+            "tasks": ["docvqa"],
+            "runner_backend": "vlmeval",
+            "target_model": "qwen-vl",
+            "sync_exec": False,
+        },
+    )
+    assert resp_async.status_code == 201
+    with pytest.raises(EngineUnavailable) as exc_info:
+        run_benchmark_job(app.state.session_factory, resp_async.json()["id"])
+    assert getattr(exc_info.value, "non_retryable", False) is True
+
+    # 3. EgressError during sync_exec -> 201 with persisted failed run (no 500)
+    resp_egress = client.post(
+        "/api/v1/benchmarks/runs",
+        headers=auth(member),
+        json={
+            "name": "sync-egress-blocked",
+            "suite": "lm_eval",
+            "tasks": ["gsm8k"],
+            "runner_backend": "http",
+            "runner_config": {"endpoint_url": "http://blocked.example.com/v1"},
+            "target_model": "gpt-4o",
+            "sync_exec": True,
+        },
+    )
+    assert resp_egress.status_code == 201, resp_egress.text
+    egress_data = resp_egress.json()
+    assert egress_data["status"] == "failed"
+    assert "allowlist" in (egress_data["error"] or "")
+
+
+def test_http_runner_timeout_bounded_concurrent_and_simulated_true(env, monkeypatch):
+    client: TestClient = env["client"]
+    member = env["member_token_a"]
+    app = env["app"]
+    project_a = env["project_a"]
+
+    assert HttpBenchmarkEngine.simulated is True
+
+    # Invalid timeout_seconds rejected at API with 422
+    for bad_timeout in ("abc", True, -5, 0):
+        r_bad = client.post(
+            "/api/v1/benchmarks/runs",
+            headers=auth(member),
+            json={
+                "name": "bad-timeout",
+                "suite": "lm_eval",
+                "tasks": ["gsm8k"],
+                "runner_backend": "http",
+                "runner_config": {"endpoint_url": "https://bench.example.com/v1", "timeout_seconds": bad_timeout},
+                "target_model": "gpt-4o",
+            },
+        )
+        assert r_bad.status_code == 422
+
+    observed_timeouts: list[float] = []
+    real_egress_client = bench_runner_mod.egress_client
+
+    def _spy_egress_client(*args, **kwargs):
+        observed_timeouts.append(float(kwargs["timeout"]))
+        return real_egress_client(*args, **kwargs)
+
+    monkeypatch.setattr(bench_runner_mod, "egress_client", _spy_egress_client)
+
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+    barrier = threading.Barrier(4)
+
+    class ConcurrentFakeHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            nonlocal active, max_active
+            length = int(self.headers.get("Content-Length", "0"))
+            _ = self.rfile.read(length)
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                barrier.wait(timeout=3.0)
+            finally:
+                with lock:
+                    active -= 1
+            body = json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), ConcurrentFakeHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    with app.state.session_factory() as db, db.begin():
+        db.add(EgressHost(project_id=project_a, host="concurrent.example.test"))
+
+    egress.set_resolver_for_tests(lambda host, p: ["93.184.216.34"] if host == "concurrent.example.test" else [])
+    egress.set_dialer_for_tests(lambda ip, p: ("127.0.0.1", port) if ip == "93.184.216.34" else (ip, p))
+
+    try:
+        resp = client.post(
+            "/api/v1/benchmarks/runs",
+            headers=auth(member),
+            json={
+                "name": "concurrent-http-bench",
+                "suite": "lm_eval",
+                "tasks": ["mmlu_pro", "gpqa_diamond", "ifeval", "gsm8k"],
+                "runner_backend": "http",
+                "runner_config": {
+                    "endpoint_url": "http://concurrent.example.test/v1",
+                    "timeout_seconds": 3600,
+                },
+                "target_model": "fake-openai-model",
+                "sync_exec": True,
+            },
+        )
+        assert resp.status_code == 201, resp.text
+        data = resp.json()
+        assert data["status"] == "completed"
+        assert data["simulated"] is True
+        assert [r["task_name"] for r in data["task_results"]] == sorted(
+            ["mmlu_pro", "gpqa_diamond", "ifeval", "gsm8k"]
+        )
+        assert all(r["simulated"] is True for r in data["task_results"])
+        assert max_active == 4
+        assert observed_timeouts and all(t == 300.0 for t in observed_timeouts)
+    finally:
+        egress.set_resolver_for_tests(None)
+        egress.set_dialer_for_tests(None)
+        server.shutdown()
+        server.server_close()
