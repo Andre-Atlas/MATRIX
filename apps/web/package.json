@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:e2e": "playwright test --trace off"
   },
   "dependencies": {
     "@xyflow/react": "12.3.5",

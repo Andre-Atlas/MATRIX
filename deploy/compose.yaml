@@ -41,8 +41,20 @@ services:
       timeout: 3s
       retries: 20
 
-  # No S3/MinIO service: no S3-compatible image has been validated. Artifacts go to the local volume
-  # (MATRIX_ARTIFACT_BACKEND=local). MATRIX_S3_* exist in the server but are NOT validated here.
+  # Production artifacts use the local volume (MATRIX_ARTIFACT_BACKEND=local).
+  # An optional S3-compatible service (rustfs) is available ONLY under the dev profile (`--profile dev`).
+  rustfs:
+    profiles: ["dev"]
+    image: rustfs/rustfs:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    environment:
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:?set RUSTFS_ACCESS_KEY in deploy/.env}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:?set RUSTFS_SECRET_KEY in deploy/.env}
+    volumes:
+      - rustfs-data:/data
 
   api:
     build: ../server
@@ -64,6 +76,12 @@ services:
       MATRIX_MAX_ACTIVE_RUNS_PER_PROJECT: ${MATRIX_MAX_ACTIVE_RUNS_PER_PROJECT:-1000}
       MATRIX_ARTIFACT_BACKEND: ${MATRIX_ARTIFACT_BACKEND:-local}
       MATRIX_ARTIFACT_LOCAL_DIR: /app/artifacts
+      MATRIX_SECRET_KEY: ${MATRIX_SECRET_KEY:-}
+      MATRIX_SANDBOX_IMAGES: ${MATRIX_SANDBOX_IMAGES:-python:3.12-slim}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
     volumes:
       - artifacts-data:/app/artifacts
     ports:
@@ -93,8 +111,6 @@ services:
       MATRIX_JUDGE_MODEL: ${MATRIX_JUDGE_MODEL:-}
       MATRIX_EMBEDDING_MODEL: ${MATRIX_EMBEDDING_MODEL:-}
       MATRIX_OPENAI_BASE_URL: ${MATRIX_OPENAI_BASE_URL:-}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     depends_on:
       api:
         condition: service_healthy  # migrations run in the api container first
@@ -118,3 +134,4 @@ volumes:
   artifacts-data:
   clickhouse-data:
   postgres-data:
+  rustfs-data:

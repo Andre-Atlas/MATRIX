@@ -144,8 +144,19 @@ export function BenchmarksClient({
     setLoading(true);
     setError(null);
     try {
-      const data = await proxy<{ items: BenchmarkRun[] }>("GET", "benchmarks/runs");
-      setRuns(data?.items || []);
+      const data = await proxy<{ runs?: BenchmarkRun[]; items?: BenchmarkRun[] }>(
+        "GET",
+        "benchmarks/runs",
+      );
+      const nextRuns = data?.runs ?? data?.items ?? [];
+      setRuns(nextRuns);
+      setSelectedRunIds((prev) => {
+        const validIds = new Set(nextRuns.map((r) => r.id));
+        const retained = prev.filter((id) => validIds.has(id));
+        if (retained.length > 0) return retained;
+        const matching = nextRuns.filter((r) => r.suite === activeTab).slice(0, 6);
+        return (matching.length > 0 ? matching : nextRuns.slice(0, 2)).map((r) => r.id);
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load benchmark runs.");
     } finally {

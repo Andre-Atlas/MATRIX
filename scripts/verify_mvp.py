@@ -14,7 +14,10 @@ Variáveis opcionais: MATRIX_DATABASE_URL, MATRIX_CLICKHOUSE_URL, MATRIX_CLICKHO
 from __future__ import annotations
 
 import os
+import secrets
+import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -27,11 +30,14 @@ from typing import Any
 import httpx
 
 ROOT = Path(__file__).resolve().parent.parent
-PORT = 8765
-BASE = f"http://127.0.0.1:{PORT}"
-ADMIN_TOKEN = "verify-admin-token"
 RUN = time.strftime("%Y%m%d-%H%M%S")
 POLL = 60.0  # seconds
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
 
 
 class Check:
@@ -55,9 +61,10 @@ def poll(fn: Callable[[], Any], timeout: float = POLL, every: float = 0.5) -> An
 
 
 def start(cmd: list[str], env: dict[str, str], log: Path) -> subprocess.Popen:
-    return subprocess.Popen(
-        cmd, cwd=ROOT, env=env, stdout=log.open("wb"), stderr=subprocess.STDOUT, start_new_session=True
-    )
+    with log.open("wb") as log_file:
+        return subprocess.Popen(
+            cmd, cwd=ROOT, env=env, stdout=log_file, stderr=subprocess.STDOUT, start_new_session=True
+        )
 
 
 def stop(proc: subprocess.Popen | None) -> None:
@@ -65,16 +72,35 @@ def stop(proc: subprocess.Popen | None) -> None:
         return
     try:
         os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
         proc.wait(timeout=10)
-    except (subprocess.TimeoutExpired, ProcessLookupError):
+    except subprocess.TimeoutExpired:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
+            return
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
             pass
+
+
+def _dump_logs(tmp: Path) -> None:
+    for name in ("api.log", "worker.log"):
+        path = tmp / name
+        if path.exists():
+            tail = path.read_text(encoding="utf-8", errors="replace")[-2000:]
+            print(f"\n--- {name} tail ({path}) ---\n{tail}", file=sys.stderr)
 
 
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="matrix-verify-"))
+    port = _free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    admin_token = secrets.token_urlsafe(24)
+    secret_key = secrets.token_urlsafe(32)
     env = {
         **os.environ,
         "MATRIX_SPAN_STORE": "clickhouse",
@@ -83,12 +109,15 @@ def main() -> int:
         "MATRIX_DATABASE_URL": os.environ.get(
             "MATRIX_DATABASE_URL", "postgresql+psycopg://matrix:matrix@localhost:5432/matrix"
         ),
-        "MATRIX_ADMIN_TOKEN": ADMIN_TOKEN,
+        "MATRIX_ADMIN_TOKEN": admin_token,
         "MATRIX_JUDGE_PROVIDER": "fake",
+        "MATRIX_ARTIFACT_LOCAL_DIR": str(tmp / "artifacts"),
+        "MATRIX_SECRET_KEY": secret_key,
         "MATRIX_HOST": "127.0.0.1",
-        "MATRIX_PORT": str(PORT),
+        "MATRIX_PORT": str(port),
     }
     procs: list[subprocess.Popen] = []
+    clients: list[httpx.Client] = []
     results: list[tuple[str, bool, list[str]]] = []
     try:
         print(f"Logs do servidor em {tmp}")
@@ -99,28 +128,35 @@ def main() -> int:
             if procs[0].poll() is not None:
                 raise RuntimeError(f"matrix-api saiu cedo; veja {tmp / 'api.log'}")
             try:
-                return httpx.get(f"{BASE}/health", timeout=2).status_code == 200
+                return httpx.get(f"{base_url}/health", timeout=2, trust_env=False).status_code == 200
             except httpx.HTTPError:
                 return False
 
         if not poll(api_up, timeout=120):
             raise RuntimeError(f"matrix-api não respondeu; veja {tmp / 'api.log'}")
 
-        admin = httpx.Client(base_url=BASE, headers={"Authorization": f"Bearer {ADMIN_TOKEN}"}, timeout=30)
-        email, password = f"verify-{RUN}@example.com", f"verify-pw-{RUN}-xyz"
+        admin = httpx.Client(
+            base_url=base_url, headers={"Authorization": f"Bearer {admin_token}"}, timeout=30, trust_env=False
+        )
+        clients.append(admin)
+        email, password = f"verify-{RUN}-{secrets.token_hex(4)}@example.com", secrets.token_urlsafe(24)
         admin.post("/api/v1/admin/users", json={"email": email, "name": "Verify Owner", "password": password}).raise_for_status()
         created = admin.post("/api/v1/admin/projects", json={"name": f"rag-demo-{RUN}", "owner_email": email})
         created.raise_for_status()
         api_key = created.json()["api_key"]
         project_id = created.json()["project"]["id"]
-        login = httpx.post(f"{BASE}/api/v1/auth/login", json={"email": email, "password": password}, timeout=30)
+        login = httpx.post(
+            f"{base_url}/api/v1/auth/login", json={"email": email, "password": password}, timeout=30, trust_env=False
+        )
         login.raise_for_status()
         owner = httpx.Client(
-            base_url=BASE,
+            base_url=base_url,
             headers={"Authorization": f"Bearer {login.json()['token']}", "X-Matrix-Project": project_id},
             timeout=30,
+            trust_env=False,
         )
-        http = httpx.Client(base_url=BASE, headers={"Authorization": f"Bearer {api_key}"}, timeout=30)
+        http = httpx.Client(base_url=base_url, headers={"Authorization": f"Bearer {api_key}"}, timeout=30, trust_env=False)
+        clients.extend([owner, http])
 
         def call(method: str, path: str, *, as_owner: bool = False, **kw: Any) -> Any:
             r = (owner if as_owner else http).request(method, path, **kw)
@@ -141,9 +177,15 @@ def main() -> int:
              json={"name": "faithfulness", "metric": "faithfulness", "sampling_rate": 1.0})
         print("Regras e avaliação online criadas (sessão do owner); rodando o demo...")
 
+        demo_env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in ("MATRIX_ADMIN_TOKEN", "MATRIX_SECRET_KEY")
+        }
+        demo_env.update({"MATRIX_API_KEY": api_key, "MATRIX_ENDPOINT": base_url})
         demo = subprocess.run(
             ["uv", "run", "--project", "sdk/python", "python", "examples/rag_demo.py"],
-            cwd=ROOT, env={**env, "MATRIX_API_KEY": api_key, "MATRIX_ENDPOINT": BASE},
+            check=False, cwd=ROOT, env=demo_env,
             capture_output=True, text=True, timeout=300,
         )
         print(demo.stdout.strip())
@@ -296,6 +338,111 @@ def main() -> int:
         def c6(c: Check) -> None:
             c.expect(True, "rode `make test` (server, sdk e web) para a suíte completa; `make demo` repete esta verificação")
 
+        def c7(c: Check) -> None:
+            import hashlib
+
+            run = call(
+                "POST",
+                "/api/v1/runs",
+                json={"name": f"reconcile-run-{RUN}", "params": {"lr": 1e-4, "epochs": 2}, "tags": ["reconcile"]},
+            )
+            call(
+                "POST",
+                f"/api/v1/runs/{run['id']}/metrics",
+                json={"points": [{"key": "loss", "step": 1, "value": 0.42}, {"key": "loss", "step": 2, "value": 0.21}]},
+            )
+            fin = call("PATCH", f"/api/v1/runs/{run['id']}", json={"status": "finished"})
+            c.expect(fin["status"] == "finished", "run canônica concluída")
+
+            sweep = call(
+                "POST",
+                "/api/v1/sweeps",
+                json={
+                    "name": f"reconcile-sweep-{RUN}",
+                    "config": {
+                        "method": "random",
+                        "metric": {"key": "val_loss", "goal": "minimize"},
+                        "parameters": {"lr": {"type": "float", "min": 1e-5, "max": 1e-2, "log": True}},
+                        "max_runs": 4,
+                    },
+                },
+            )
+            trial_runs: list[str] = []
+            for idx, val in enumerate((0.35, 0.18), start=1):
+                nxt = call("POST", f"/api/v1/sweeps/{sweep['id']}/next", json={"agent_id": "verify-mvp"})
+                tr_id = nxt["run"]["id"]
+                trial_runs.append(tr_id)
+                call("POST", f"/api/v1/sweeps/{sweep['id']}/runs/{tr_id}/report", json={"step": idx, "value": val})
+                call("PATCH", f"/api/v1/runs/{tr_id}", json={"status": "finished"})
+            sw_detail = call("GET", f"/api/v1/sweeps/{sweep['id']}")
+            c.expect(
+                len(sw_detail["runs"]) == 2 and sw_detail["sweep"]["best_run_id"] == trial_runs[1],
+                "sweep com 2 trials e melhor run selecionado",
+            )
+
+            blob = b"reconcile-demo-weights-v1"
+            sha = hashlib.sha256(blob).hexdigest()
+            art = call(
+                "POST",
+                "/api/v1/artifacts",
+                content=blob,
+                headers={
+                    "x-filename": "demo-weights.bin",
+                    "content-type": "application/octet-stream",
+                    "x-sha256": sha,
+                    "x-owner-kind": "run",
+                    "x-owner-id": run["id"],
+                },
+            )
+            model = call("POST", "/api/v1/mlops/models", json={"name": f"reconcile-model-{RUN}", "model_type": "lora"})
+            mv = call(
+                "POST",
+                f"/api/v1/mlops/models/{model['id']}/versions",
+                json={"artifact_id": art["id"], "run_id": run["id"], "metrics_snapshot": {"val_loss": 0.18}},
+            )
+            files = call("GET", f"/api/v1/models/{model['id']}/versions/1/files")
+            c.expect(
+                len(files["files"]) == 1 and files["files"][0]["artifact_id"] == art["id"],
+                "BlobArtifact G0 vinculado à versão do modelo",
+            )
+            promo = call(
+                "POST",
+                f"/api/v1/models/{model['id']}/versions/1/stage",
+                as_owner=True,
+                json={"stage": "production", "comment": "demo promotion"},
+            )
+            alias = call(
+                "PUT",
+                f"/api/v1/models/{model['id']}/aliases/champion",
+                as_owner=True,
+                json={"version": 1},
+            )
+            hist = call("GET", f"/api/v1/models/{model['id']}/history")
+            c.expect(
+                promo["stage"] == "production"
+                and alias["alias"] == "champion"
+                and any(h["to_stage"] == "production" for h in hist["items"]),
+                "promoção para production + alias champion registrados",
+            )
+
+            lin = call("GET", f"/api/v1/lineage?node=model_version:{mv['id']}&direction=up&depth=2")
+            lin_types = {n["node_type"] for n in lin["nodes"]}
+            c.expect({"run", "artifact", "model_version"} <= lin_types, f"lineage completo ({sorted(lin_types)})")
+
+            bench = call(
+                "POST",
+                "/api/v1/benchmarks/runs",
+                json={
+                    "name": f"reconcile-bench-{RUN}",
+                    "suite": "lm_eval",
+                    "tasks": ["gsm8k"],
+                    "runner_backend": "local_sim",
+                    "target_model": model["name"],
+                    "sync_exec": True,
+                },
+            )
+            c.expect(bench.get("simulated") is True, "benchmark local_sim marcado explicitamente como simulated=true")
+
         criteria = [
             ("1. Traces com spans, custo e árvore de agente", c1),
             ("2. Span vira item de dataset", c2),
@@ -303,6 +450,7 @@ def main() -> int:
             ("4. Regras -> fila -> correção -> DPO + dataset", c4),
             ("5. Avaliação online + alerta", c5),
             ("6. make test", c6),
+            ("7. Reconciliação: run -> sweep -> registry -> promoção + lineage + simulado", c7),
         ]
         for title, fn in criteria:
             check = Check()
@@ -314,16 +462,26 @@ def main() -> int:
             results.append((title, check.ok, check.notes))
     except Exception as exc:  # noqa: BLE001
         print(f"ERRO de infraestrutura: {type(exc).__name__}: {exc}", file=sys.stderr)
+        _dump_logs(tmp)
         return 2
     finally:
+        for cli in clients:
+            try:
+                cli.close()
+            except Exception as exc:  # noqa: BLE001
+                print(f"warn: client close failed: {exc}", file=sys.stderr)
         for p in procs:
             stop(p)
+        if results and all(ok for _, ok, _ in results):
+            shutil.rmtree(tmp, ignore_errors=True)
     print()
     for title, ok, notes in results:
         print(f"{'PASS' if ok else 'FAIL'}  {title}")
         for n in notes:
             print(f"        {n}")
     all_ok = bool(results) and all(ok for _, ok, _ in results)
+    if not all_ok:
+        _dump_logs(tmp)
     print("\nMVP:", "TODOS OS CRITÉRIOS PASSARAM" if all_ok else "HÁ CRITÉRIOS FALHANDO")
     return 0 if all_ok else 1
 

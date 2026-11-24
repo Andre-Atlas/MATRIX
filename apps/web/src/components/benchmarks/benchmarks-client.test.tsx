@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 import React from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import * as proxyClient from "@/lib/proxy-client";
 import { MOCK_BENCHMARK_CATALOG, MOCK_BENCHMARK_RUNS } from "@/lib/sota-mocks";
 import { BenchmarksClient } from "./benchmarks-client";
 
@@ -222,5 +223,30 @@ describe("BenchmarksClient", () => {
     expect(alert).toBeTruthy();
     expect(within(alert).getByText(/Database timeout occurred/)).toBeTruthy();
     expect(within(alert).getByRole("button", { name: "Retry" })).toBeTruthy();
+  });
+
+  it("unwraps canonical { runs: [...] } payload on Retry", async () => {
+    const proxySpy = vi
+      .spyOn(proxyClient, "proxy")
+      .mockResolvedValueOnce({ runs: [MOCK_BENCHMARK_RUNS[0]] });
+
+    try {
+      render(
+        <BenchmarksClient
+          initialRuns={[]}
+          initialCatalog={MOCK_BENCHMARK_CATALOG}
+          initialError="Temporary error"
+        />,
+      );
+
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+      await waitFor(() => {
+        expect(proxySpy).toHaveBeenCalledWith("GET", "benchmarks/runs");
+        expect(screen.getAllByText(MOCK_BENCHMARK_RUNS[0].name).length).toBeGreaterThan(0);
+      });
+    } finally {
+      proxySpy.mockRestore();
+    }
   });
 });

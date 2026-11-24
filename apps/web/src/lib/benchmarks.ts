@@ -76,6 +76,43 @@ export function formatPercent(value: number | null | undefined, decimals = 1): s
   return `${pct.toFixed(decimals)}%`;
 }
 
+const SUMMARY_META_KEYS = new Set([
+  "mean_primary_score",
+  "total_tasks",
+  "total_samples",
+  "avg_score",
+]);
+
+/**
+ * Extracts per-task numeric scores from `summary_metrics`.
+ * Canonical backend runs store them under `summary_metrics.tasks` while legacy/mock
+ * payloads store flat top-level task keys alongside metadata keys like `avg_score`.
+ */
+export function extractSummaryTaskScores(
+  summaryMetrics: Record<string, unknown> | null | undefined,
+): Record<string, number> {
+  if (!summaryMetrics || typeof summaryMetrics !== "object") {
+    return {};
+  }
+  const nested = summaryMetrics.tasks;
+  if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+    const out: Record<string, number> = {};
+    for (const [k, v] of Object.entries(nested as Record<string, unknown>)) {
+      if (typeof v === "number" && Number.isFinite(v)) {
+        out[k] = v;
+      }
+    }
+    return out;
+  }
+  const out: Record<string, number> = {};
+  for (const [k, v] of Object.entries(summaryMetrics)) {
+    if (!SUMMARY_META_KEYS.has(k) && typeof v === "number" && Number.isFinite(v)) {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
 export function computeBenchmarkKpis(runs: BenchmarkRun[]): BenchmarkKpis {
   const totalRuns = runs.length;
   const runningRuns = runs.filter((r) => r.status === "running").length;
@@ -110,15 +147,15 @@ export function computeBenchmarkKpis(runs: BenchmarkRun[]): BenchmarkKpis {
           }
         }
       } else if (r.summary_metrics) {
-        const m = r.summary_metrics as Record<string, unknown>;
-        if (typeof m.mmlu_pro === "number") {
-          mmluScores.push(m.mmlu_pro);
+        const taskScores = extractSummaryTaskScores(
+          r.summary_metrics as Record<string, unknown>,
+        );
+        if (typeof taskScores.mmlu_pro === "number") {
+          mmluScores.push(taskScores.mmlu_pro);
         }
         if (r.suite === "vlmevalkit") {
-          for (const [k, v] of Object.entries(m)) {
-            if (typeof v === "number" && k !== "avg_score") {
-              multimodalScores.push(v);
-            }
+          for (const v of Object.values(taskScores)) {
+            multimodalScores.push(v);
           }
         }
       }
@@ -198,9 +235,15 @@ export function getTaskResultFromRun(
     );
     if (found) return found;
   }
-  // Check summary metrics
-  const sm = run.summary_metrics as Record<string, unknown> | undefined;
-  if (sm && typeof sm[taskName] === "number") {
+  // Check summary metrics (canonical nested `summary_metrics.tasks` or flat legacy keys)
+  const taskScores = extractSummaryTaskScores(
+    run.summary_metrics as Record<string, unknown> | undefined,
+  );
+  const matchedKey = Object.keys(taskScores).find(
+    (k) => k.toLowerCase() === taskName.toLowerCase(),
+  );
+  if (matchedKey !== undefined) {
+    const score = taskScores[matchedKey];
     return {
       id: `synth-${run.id}-${taskName}`,
       project_id: run.project_id,
@@ -211,8 +254,8 @@ export function getTaskResultFromRun(
       num_fewshot: run.num_fewshot,
       sample_count: 100,
       primary_metric: "score",
-      primary_score: sm[taskName] as number,
-      metrics: { score: sm[taskName] as number },
+      primary_score: score,
+      metrics: { score },
       latency_ms_p50: 160,
       latency_ms_p95: 320,
       created_at: run.created_at,
