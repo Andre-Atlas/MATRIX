@@ -1,3 +1,4 @@
+import { unstable_rethrow } from "next/navigation";
 import { apiGet } from "@/lib/api";
 import {
   canonicalRunMetricKeys,
@@ -43,6 +44,7 @@ export default async function TrainingPage({ searchParams }: TrainingPageProps) 
     const rawSweeps = Array.isArray(sweepsResp?.items) ? sweepsResp.items : [];
     sweeps = rawSweeps.map((s) => canonicalSweepToMLOpsSweep(s));
   } catch (err) {
+    unstable_rethrow(err);
     initialError = err instanceof Error ? err.message : "Failed to load training runs and sweeps.";
   }
 
@@ -56,7 +58,9 @@ export default async function TrainingPage({ searchParams }: TrainingPageProps) 
       ),
     );
     reportResults.forEach((res, idx) => {
-      if (res.status === "fulfilled" && Array.isArray(res.value?.items)) {
+      if (res.status === "rejected") {
+        unstable_rethrow(res.reason);
+      } else if (Array.isArray(res.value?.items)) {
         reportsByRun[reportSlice[idx].id] = res.value.items;
       }
     });
@@ -87,7 +91,10 @@ export default async function TrainingPage({ searchParams }: TrainingPageProps) 
           `/api/v1/runs/${encodeURIComponent(run.id)}/metric-keys`,
         )
           .then((r) => r.keys)
-          .catch(() => undefined);
+          .catch((err) => {
+            unstable_rethrow(err);
+            return undefined;
+          });
         const keys = canonicalRunMetricKeys(run, keyStats);
         const seriesResp = await apiGet<SeriesResponse>(
           `/api/v1/runs/${encodeURIComponent(run.id)}/metrics`,
@@ -97,7 +104,9 @@ export default async function TrainingPage({ searchParams }: TrainingPageProps) 
       }),
     );
     for (const res of seriesResults) {
-      if (res.status === "fulfilled") {
+      if (res.status === "rejected") {
+        unstable_rethrow(res.reason);
+      } else {
         initialSeriesByRun[res.value.runId] = res.value.series;
       }
     }
@@ -110,7 +119,8 @@ export default async function TrainingPage({ searchParams }: TrainingPageProps) 
         `/api/v1/sweeps/${encodeURIComponent(sweeps[0].id)}`,
       );
       initialSweepDetail = canonicalSweepDetailToSweepDetail(rawDetail);
-    } catch {
+    } catch (err) {
+      unstable_rethrow(err);
       initialSweepDetail = null;
     }
   }

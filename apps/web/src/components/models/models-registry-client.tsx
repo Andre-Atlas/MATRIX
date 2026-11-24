@@ -9,7 +9,7 @@ import {
   getTaskTypeStyle,
   PRIMARY_BTN_CLASS,
 } from "@/lib/mlops-tokens";
-import { explain, proxy } from "@/lib/proxy-client";
+import { ProxyError, explain, proxy } from "@/lib/proxy-client";
 import type {
   ArtifactRecord,
   LineageGraph,
@@ -32,6 +32,7 @@ export interface ModelsRegistryClientProps {
   initialModels: RegisteredModel[];
   initialDetail: RegisteredModelDetail | null;
   initialLineage: LineageGraph | null;
+  initialLineageError?: string | null;
   initialHistory?: ModelStageHistoryItem[];
   initialArtifacts: ArtifactRecord[];
   initialSelectedId: string | null;
@@ -62,6 +63,7 @@ export function ModelsRegistryClient({
   initialModels,
   initialDetail,
   initialLineage,
+  initialLineageError = null,
   initialHistory = [],
   initialArtifacts,
   initialSelectedId,
@@ -74,6 +76,7 @@ export function ModelsRegistryClient({
   const [lineage, setLineage] = useState<LineageGraph>(
     initialLineage ?? { nodes: [], edges: [] },
   );
+  const [lineageError, setLineageError] = useState<string | null>(initialLineageError);
   const [history, setHistory] = useState<ModelStageHistoryItem[]>(initialHistory);
   const [artifacts, setArtifacts] = useState<ArtifactRecord[]>(initialArtifacts);
 
@@ -136,6 +139,7 @@ export function ModelsRegistryClient({
   const loadModelDetail = useCallback(async (modelId: string) => {
     const reqId = ++detailReqIdRef.current;
     setDetailLoading(true);
+    setLineageError(null);
     try {
       const [nextDetail, historyResp] = await Promise.all([
         proxy<RegisteredModelDetail>("GET", `mlops/models/${encodeURIComponent(modelId)}`),
@@ -147,27 +151,39 @@ export function ModelsRegistryClient({
 
       const latestVersion = nextDetail?.versions?.[0];
       let nextLineage: LineageGraph | null = null;
+      let nextLineageError: string | null = null;
       if (latestVersion?.id) {
-        nextLineage = await proxy<LineageGraph>(
-          "GET",
-          `lineage?node=${encodeURIComponent(`model_version:${latestVersion.id}`)}&direction=both&depth=3`,
-        )
-          .then((g) => adaptLineageGraph(g))
-          .catch(() => null);
+        try {
+          const rawLineage = await proxy<LineageGraph>(
+            "GET",
+            `lineage?node=${encodeURIComponent(`model_version:${latestVersion.id}`)}&direction=both&depth=3`,
+          );
+          nextLineage = adaptLineageGraph(rawLineage);
+        } catch (err) {
+          if (err instanceof ProxyError && err.status === 404) {
+            // Fall through to model-level lineage endpoint below
+          } else {
+            nextLineageError = explain(err);
+          }
+        }
       }
-      if (!nextLineage) {
-        nextLineage = await proxy<LineageGraph>(
-          "GET",
-          `mlops/models/${encodeURIComponent(modelId)}/lineage`,
-        )
-          .then((g) => adaptLineageGraph(g))
-          .catch(() => ({ model_id: modelId, nodes: [], edges: [] }));
+      if (!nextLineage && !nextLineageError) {
+        try {
+          const rawModelLineage = await proxy<LineageGraph>(
+            "GET",
+            `mlops/models/${encodeURIComponent(modelId)}/lineage`,
+          );
+          nextLineage = adaptLineageGraph(rawModelLineage);
+        } catch (err) {
+          nextLineageError = explain(err);
+        }
       }
 
       if (detailReqIdRef.current !== reqId) return;
       setDetail(nextDetail);
       setHistory(historyResp?.items ?? []);
-      setLineage(nextLineage);
+      setLineage(nextLineage ?? { nodes: [], edges: [] });
+      setLineageError(nextLineageError);
     } catch (err) {
       if (detailReqIdRef.current === reqId) setError(explain(err));
     } finally {
@@ -204,6 +220,7 @@ export function ModelsRegistryClient({
           setDetail(null);
           setHistory([]);
           setLineage({ nodes: [], edges: [] });
+          setLineageError(null);
         }
       } catch (err) {
         setError(explain(err));
@@ -794,6 +811,25 @@ export function ModelsRegistryClient({
                 })}
               </div>
 
+              {/* Lineage error notice when viewing non-lineage tabs */}
+              {lineageError && activeTab !== "lineage" && (
+                <div
+                  role="alert"
+                  className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-red-800/70 bg-red-950/50 px-4 py-2.5 text-xs text-red-200"
+                >
+                  <div>
+                    <span className="font-semibold text-red-100">Lineage error:</span> {lineageError}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void loadModelDetail(detail.id)}
+                    className="inline-flex h-7 items-center rounded border border-red-700/70 bg-red-900/40 px-2.5 text-xs font-medium text-red-100 hover:bg-red-900/60"
+                  >
+                    Retry
+                  </button>
+                </div>
+              )}
+
               {/* Tabpanels */}
               <div
                 id={`panel-${activeTab}`}
@@ -825,7 +861,12 @@ export function ModelsRegistryClient({
                   <WebhooksTab modelId={detail.id} />
                 )}
                 {activeTab === "lineage" && (
-                  <LineageDagTab lineage={lineage} loading={detailLoading} />
+                  <LineageDagTab
+                    lineage={lineage}
+                    loading={detailLoading}
+                    error={lineageError}
+                    onRetry={() => void loadModelDetail(detail.id)}
+                  />
                 )}
                 {activeTab === "card" && (
                   <ModelCardTab model={detail} artifacts={artifacts} lineage={lineage} />

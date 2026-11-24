@@ -21,6 +21,9 @@ vi.mock("@/components/auth/role-context", () => ({
   useCan: (minRole: string) => (minRole === "admin" ? mockIsAdmin : true),
 }));
 
+import { ProxyError } from "@/lib/proxy-client";
+import { LineageDagTab } from "./lineage-dag-tab";
+import { ModelsRegistryClient } from "./models-registry-client";
 import { StageHistoryTab } from "./stage-history-tab";
 import { WebhooksTab } from "./webhooks-tab";
 import { PromoteModal } from "./promote-modal";
@@ -203,5 +206,104 @@ describe("PromoteModal", () => {
       });
     });
     expect(onSuccess).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("ModelsRegistryClient & LineageDagTab error handling", () => {
+  it("LineageDagTab renders error alert instead of empty DAG when error is set", () => {
+    const onRetry = vi.fn();
+    render(
+      <LineageDagTab
+        lineage={{ nodes: [], edges: [] }}
+        error="Internal server error loading sweep lineage."
+        onRetry={onRetry}
+      />,
+    );
+
+    const alert = screen.getByRole("alert");
+    expect(alert.textContent).toContain("Internal server error loading sweep lineage.");
+    expect(screen.queryByText(/No lineage data recorded/i)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /Retry/i }));
+    expect(onRetry).toHaveBeenCalledTimes(1);
+  });
+
+  it("ModelsRegistryClient surfaces HTTP 500 lineage failure instead of swallowing it as an empty DAG", async () => {
+    proxyMock.mockImplementation((_method: string, path: string) => {
+      if (path === "mlops/models/model-lora-01") {
+        return Promise.resolve(SAMPLE_MODEL);
+      }
+      if (path === "models/model-lora-01/history") {
+        return Promise.resolve({ items: SAMPLE_HISTORY });
+      }
+      if (path.startsWith("lineage?")) {
+        return Promise.reject(
+          new ProxyError(500, "'Sweep' object has no attribute 'method'"),
+        );
+      }
+      return Promise.resolve({ nodes: [], edges: [] });
+    });
+
+    render(
+      <ModelsRegistryClient
+        initialModels={[SAMPLE_MODEL]}
+        initialDetail={SAMPLE_MODEL}
+        initialLineage={null}
+        initialHistory={SAMPLE_HISTORY}
+        initialArtifacts={[]}
+        initialSelectedId="model-lora-01"
+        initialTab="lineage"
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /support-copilot-lora/i }));
+
+    await waitFor(() => {
+      const alert = screen.getByRole("alert");
+      expect(alert.textContent).toContain("'Sweep' object has no attribute 'method'");
+    });
+    expect(screen.queryByText(/No lineage data recorded/i)).toBeNull();
+  });
+
+  it("ModelsRegistryClient surfaces network failure on model fallback lineage endpoint", async () => {
+    const noVersionsModel: RegisteredModelDetail = {
+      ...SAMPLE_MODEL,
+      id: "model-empty-ver",
+      name: "empty-version-model",
+      versions: [],
+    };
+    proxyMock.mockImplementation((_method: string, path: string) => {
+      if (path === "mlops/models/model-empty-ver") {
+        return Promise.resolve(noVersionsModel);
+      }
+      if (path === "models/model-empty-ver/history") {
+        return Promise.resolve({ items: [] });
+      }
+      if (path === "mlops/models/model-empty-ver/lineage") {
+        return Promise.reject(
+          new ProxyError(0, "Network error: the MATRIX web server did not answer."),
+        );
+      }
+      return Promise.resolve({ nodes: [], edges: [] });
+    });
+
+    render(
+      <ModelsRegistryClient
+        initialModels={[SAMPLE_MODEL, noVersionsModel]}
+        initialDetail={SAMPLE_MODEL}
+        initialLineage={null}
+        initialHistory={SAMPLE_HISTORY}
+        initialArtifacts={[]}
+        initialSelectedId="model-lora-01"
+        initialTab="lineage"
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /empty-version-model/i }));
+
+    await waitFor(() => {
+      const alert = screen.getByRole("alert");
+      expect(alert.textContent).toContain("Network error");
+    });
+    expect(screen.queryByText(/No lineage data recorded/i)).toBeNull();
   });
 });

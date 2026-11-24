@@ -1,3 +1,4 @@
+import { unstable_rethrow } from "next/navigation";
 import { apiGet } from "@/lib/api";
 import type { CanonicalSweep, ListResponse } from "@/lib/types";
 import { SweepsListClient } from "@/components/sweeps/sweeps-list-client";
@@ -12,6 +13,7 @@ export default async function SweepsPage() {
     const resp = await apiGet<ListResponse<CanonicalSweep>>("/api/v1/sweeps");
     initialSweeps = Array.isArray(resp?.items) ? resp.items : [];
   } catch (err) {
+    unstable_rethrow(err);
     initialError = err instanceof Error ? err.message : "Failed to load sweeps.";
   }
 

@@ -3,6 +3,7 @@ import React from "react";
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { NotEvaluatedBadge, SimulatedBadge } from "@/components/ui";
+import { SafetyDashboard } from "@/components/safety/safety-dashboard";
 import { SafetyGauge } from "@/components/safety/safety-gauge";
 import { GatewayLogsTable } from "@/components/gateway/gateway-logs-table";
 import { summarizeScan } from "@/lib/safety";
@@ -88,6 +89,38 @@ describe("Safety not_evaluated handling", () => {
     expect(report.summary.not_evaluated).toBe(true);
     expect(report.category_scores[0].pass_rate).toBeNull();
     expect(report.category_scores[0].status).toBe("not_evaluated");
+  });
+
+  it("SafetyDashboard surfaces initialError alert and shows Not evaluated instead of Compliant when scan detail fails", () => {
+    render(
+      <SafetyDashboard
+        categories={MOCK_SAFETY_CATEGORIES}
+        scans={[
+          {
+            id: "scan-err-1",
+            name: "Audit Scan 1",
+            target_model: "gpt-4o",
+            status: "completed",
+            categories_tested: ["LLM01", "LLM02"],
+            total_probes: 10,
+            probes_passed: 9,
+            probes_failed: 1,
+            safety_score: 90,
+            risk_level: "low",
+            findings_count: 1,
+            created_at: "2026-11-24T00:00:00Z",
+          },
+        ]}
+        initialReport={null}
+        allFindings={[]}
+        initialError="Could not load safety scan details: API 500"
+      />,
+    );
+
+    const alert = screen.getByRole("alert");
+    expect(alert.textContent).toContain("Could not load safety scan details: API 500");
+    expect(screen.queryByText("Compliant")).toBeNull();
+    expect(screen.getAllByText("Not evaluated").length).toBeGreaterThan(0);
   });
 });
 

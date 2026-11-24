@@ -1,3 +1,4 @@
+import { unstable_rethrow } from "next/navigation";
 import { apiGet } from "@/lib/api";
 import { adaptLineageGraph } from "@/lib/mlops";
 import type { LineageGraph } from "@/lib/types";
@@ -33,6 +34,7 @@ export default async function LineagePage({
       });
       initialGraph = adaptLineageGraph(raw);
     } catch (err) {
+      unstable_rethrow(err);
       initialError = err instanceof Error ? err.message : "Failed to load lineage graph.";
     }
   }

@@ -73,12 +73,16 @@ const NODE_TYPES = {
 export interface LineageDagTabProps {
   lineage: LineageGraph;
   loading?: boolean;
+  error?: string | null;
+  onRetry?: () => void;
   hideTruncatedBanner?: boolean;
 }
 
 export function LineageDagTab({
   lineage,
   loading = false,
+  error = null,
+  onRetry,
   hideTruncatedBanner = false,
 }: LineageDagTabProps) {
   const [viewMode, setViewMode] = useState<"graph" | "tree">("graph");
@@ -171,6 +175,28 @@ export function LineageDagTab({
           <div className="mx-auto h-4 w-40 animate-pulse rounded bg-zinc-800 motion-reduce:animate-none" />
           <p className="text-xs text-zinc-400">Loading lineage DAG…</p>
         </div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div
+        role="alert"
+        className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-red-800/70 bg-red-950/50 px-4 py-3 text-xs text-red-200"
+      >
+        <div>
+          <span className="font-semibold text-red-100">Lineage error:</span> {error}
+        </div>
+        {onRetry && (
+          <button
+            type="button"
+            onClick={onRetry}
+            className="inline-flex h-7 items-center rounded border border-red-700/70 bg-red-900/40 px-2.5 text-xs font-medium text-red-100 hover:bg-red-900/60"
+          >
+            Retry
+          </button>
+        )}
       </div>
     );
   }

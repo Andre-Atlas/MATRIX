@@ -1,5 +1,6 @@
+import { unstable_rethrow } from "next/navigation";
 import { ModelsRegistryClient } from "@/components/models/models-registry-client";
-import { apiGet } from "@/lib/api";
+import { apiGet, isNotFound } from "@/lib/api";
 import { adaptLineageGraph } from "@/lib/mlops";
 import type {
   ArtifactRecord,
@@ -27,13 +28,17 @@ export default async function ModelsPage({
   try {
     const [modelsResp, artifactsResp] = await Promise.all([
       apiGet<{ items: RegisteredModel[] }>("/api/v1/mlops/models"),
-      apiGet<{ items: ArtifactRecord[] }>("/api/v1/artifacts").catch(() => ({
-        items: [] as ArtifactRecord[],
-      })),
+      apiGet<{ items: ArtifactRecord[] }>("/api/v1/artifacts").catch((err) => {
+        unstable_rethrow(err);
+        return {
+          items: [] as ArtifactRecord[],
+        };
+      }),
     ]);
     initialModels = modelsResp.items ?? [];
     initialArtifacts = artifactsResp.items ?? [];
   } catch (err) {
+    unstable_rethrow(err);
     initialError =
       err instanceof Error ? err.message : "Could not load registered models.";
   }
@@ -46,38 +51,57 @@ export default async function ModelsPage({
 
   let initialDetail: RegisteredModelDetail | null = null;
   let initialLineage: LineageGraph | null = null;
+  let initialLineageError: string | null = null;
   let initialHistory: ModelStageHistoryItem[] = [];
 
   if (initialSelectedId) {
     const [detailResult, historyResult] = await Promise.all([
       apiGet<RegisteredModelDetail>(
         `/api/v1/mlops/models/${encodeURIComponent(initialSelectedId)}`,
-      ).catch(() => null),
+      ).catch((err) => {
+        unstable_rethrow(err);
+        return null;
+      }),
       apiGet<{ items: ModelStageHistoryItem[] }>(
         `/api/v1/models/${encodeURIComponent(initialSelectedId)}/history`,
       )
         .then((r) => r.items ?? [])
-        .catch(() => [] as ModelStageHistoryItem[]),
+        .catch((err) => {
+          unstable_rethrow(err);
+          return [] as ModelStageHistoryItem[];
+        }),
     ]);
     initialDetail = detailResult;
     initialHistory = historyResult;
 
     const latestVersion = detailResult?.versions?.[0];
     if (latestVersion?.id) {
-      initialLineage = await apiGet<LineageGraph>("/api/v1/lineage", {
-        node: `model_version:${latestVersion.id}`,
-        direction: "both",
-        depth: 3,
-      })
-        .then((g) => adaptLineageGraph(g))
-        .catch(() => null);
+      try {
+        const rawLineage = await apiGet<LineageGraph>("/api/v1/lineage", {
+          node: `model_version:${latestVersion.id}`,
+          direction: "both",
+          depth: 3,
+        });
+        initialLineage = adaptLineageGraph(rawLineage);
+      } catch (err) {
+        unstable_rethrow(err);
+        if (!isNotFound(err)) {
+          initialLineageError =
+            err instanceof Error ? err.message : "Could not load model lineage.";
+        }
+      }
     }
-    if (!initialLineage) {
-      initialLineage = await apiGet<LineageGraph>(
-        `/api/v1/mlops/models/${encodeURIComponent(initialSelectedId)}/lineage`,
-      )
-        .then((g) => adaptLineageGraph(g))
-        .catch(() => null);
+    if (!initialLineage && !initialLineageError) {
+      try {
+        const rawModelLineage = await apiGet<LineageGraph>(
+          `/api/v1/mlops/models/${encodeURIComponent(initialSelectedId)}/lineage`,
+        );
+        initialLineage = adaptLineageGraph(rawModelLineage);
+      } catch (err) {
+        unstable_rethrow(err);
+        initialLineageError =
+          err instanceof Error ? err.message : "Could not load model lineage.";
+      }
     }
   }
 
@@ -87,6 +111,7 @@ export default async function ModelsPage({
       initialModels={initialModels}
       initialDetail={initialDetail}
       initialLineage={initialLineage}
+      initialLineageError={initialLineageError}
       initialHistory={initialHistory}
       initialArtifacts={initialArtifacts}
       initialSelectedId={initialSelectedId}

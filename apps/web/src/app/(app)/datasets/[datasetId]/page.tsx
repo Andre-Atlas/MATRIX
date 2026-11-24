@@ -1,4 +1,4 @@
-import { notFound } from "next/navigation";
+import { notFound, unstable_rethrow } from "next/navigation";
 import { apiGet, isNotFound } from "@/lib/api";
 import type { DatasetBranch, DatasetCommit, DatasetDetail } from "@/lib/types";
 import { DatasetStudioClient } from "@/components/datasets/dataset-studio-client";
@@ -11,6 +11,7 @@ export default async function DatasetPage({ params }: { params: Promise<{ datase
   try {
     detail = await apiGet<DatasetDetail>(`/api/v1/datasets/${encodeURIComponent(datasetId)}`);
   } catch (e) {
+    unstable_rethrow(e);
     if (isNotFound(e)) notFound();
     throw e;
   }
@@ -21,7 +22,8 @@ export default async function DatasetPage({ params }: { params: Promise<{ datase
       `/api/v1/datasets/${encodeURIComponent(datasetId)}/branches`
     );
     branches = brRes.items || [];
-  } catch {
+  } catch (e) {
+    unstable_rethrow(e);
     branches = [];
   }
 
@@ -31,7 +33,8 @@ export default async function DatasetPage({ params }: { params: Promise<{ datase
       `/api/v1/datasets/${encodeURIComponent(datasetId)}/commits`
     );
     commits = comRes.items || [];
-  } catch {
+  } catch (e) {
+    unstable_rethrow(e);
     commits = [];
   }
 

@@ -1,4 +1,4 @@
-import { notFound } from "next/navigation";
+import { notFound, unstable_rethrow } from "next/navigation";
 import { apiGet, isNotFound } from "@/lib/api";
 import type { CanonicalSweepDetail } from "@/lib/types";
 import { SweepDetailClient } from "@/components/sweeps/sweep-detail-client";
@@ -19,6 +19,7 @@ export default async function SweepDetailPage({
       `/api/v1/sweeps/${encodeURIComponent(sweepId)}`,
     );
   } catch (err) {
+    unstable_rethrow(err);
     if (isNotFound(err)) notFound();
     initialError = err instanceof Error ? err.message : "Failed to load sweep detail.";
   }

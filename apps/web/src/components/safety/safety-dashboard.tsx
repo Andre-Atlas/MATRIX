@@ -21,6 +21,7 @@ export interface SafetyDashboardProps {
   scans: SafetyScan[];
   initialReport: SafetyScanReport | null;
   allFindings: SafetyFinding[];
+  initialError?: string | null;
 }
 
 export function SafetyDashboard({
@@ -28,6 +29,7 @@ export function SafetyDashboard({
   scans: initialScans,
   initialReport,
   allFindings,
+  initialError = null,
 }: SafetyDashboardProps) {
   const [scans, setScans] = useState<SafetyScan[]>(() =>
     initialScans.map((s) => adaptSafetyScan(s)),
@@ -43,16 +45,64 @@ export function SafetyDashboard({
   const [findings, setFindings] = useState<SafetyFinding[]>(allFindings);
   const [selectedCategoryCode, setSelectedCategoryCode] = useState<string>("all");
   const [isModalOpen, setIsModalOpen] = useState(false);
-  const [fetchError, setFetchError] = useState<string | null>(null);
+  const [fetchError, setFetchError] = useState<string | null>(initialError);
+  const [loadingDetails, setLoadingDetails] = useState(false);
   const fetchedScanIdsRef = useRef<Set<string>>(
     new Set(
       initialReport?.scan?.id
         ? [initialReport.scan.id]
-        : [],
+        : initialError && (initialScans[0]?.id ?? (initialScans[0] as any)?.scan_id)
+          ? [String(initialScans[0]?.id ?? (initialScans[0] as any)?.scan_id)]
+          : [],
     ),
   );
 
   const handleCloseModal = useCallback(() => setIsModalOpen(false), []);
+
+  const loadScanDetails = useCallback(
+    async (scanId: string, isCancelled?: () => boolean) => {
+      if (!scanId) return;
+      setFetchError(null);
+      setLoadingDetails(true);
+      try {
+        const data = await proxy<any>(
+          "GET",
+          `safety/scans/${encodeURIComponent(scanId)}`,
+        );
+        if (isCancelled?.()) return;
+        fetchedScanIdsRef.current.add(scanId);
+        if (!data) return;
+        const rawFindings = Array.isArray(data.findings) ? data.findings : [];
+        if (rawFindings.length > 0) {
+          const adaptedFindings = adaptSafetyFindings(
+            rawFindings,
+            scanId,
+            categories,
+            data.created_at ?? data.scan?.created_at,
+          );
+          setFindings((prev) => {
+            const existingIds = new Set(prev.map((f) => f.id));
+            const merged = [...prev];
+            for (const f of adaptedFindings) {
+              if (!existingIds.has(f.id)) merged.push(f);
+            }
+            return merged;
+          });
+        }
+      } catch (err) {
+        if (!isCancelled?.()) {
+          setFetchError(
+            err instanceof Error ? err.message : "Failed to load scan details.",
+          );
+        }
+      } finally {
+        if (!isCancelled?.()) {
+          setLoadingDetails(false);
+        }
+      }
+    },
+    [categories],
+  );
 
   // Fetch findings for selectedScanId if not yet loaded
   useEffect(() => {
@@ -66,40 +116,12 @@ export function SafetyDashboard({
     }
 
     let cancelled = false;
-    setFetchError(null);
-    proxy<any>("GET", `safety/scans/${encodeURIComponent(selectedScanId)}`)
-      .then((data) => {
-        if (cancelled) return;
-        fetchedScanIdsRef.current.add(selectedScanId);
-        if (!data) return;
-        const rawFindings = Array.isArray(data.findings) ? data.findings : [];
-        if (rawFindings.length > 0) {
-          const adaptedFindings = adaptSafetyFindings(
-            rawFindings,
-            selectedScanId,
-            categories,
-            data.created_at ?? data.scan?.created_at,
-          );
-          setFindings((prev) => {
-            const existingIds = new Set(prev.map((f) => f.id));
-            const merged = [...prev];
-            for (const f of adaptedFindings) {
-              if (!existingIds.has(f.id)) merged.push(f);
-            }
-            return merged;
-          });
-        }
-      })
-      .catch((err) => {
-        if (!cancelled) {
-          setFetchError(err instanceof Error ? err.message : "Failed to load scan details.");
-        }
-      });
+    void loadScanDetails(selectedScanId, () => cancelled);
 
     return () => {
       cancelled = true;
     };
-  }, [selectedScanId, findings, categories]);
+  }, [selectedScanId, findings, loadScanDetails]);
 
   // Find currently active scan
   const activeScan = useMemo(() => {
@@ -114,6 +136,8 @@ export function SafetyDashboard({
 
   const handleScanCreated = (rawNewScan: SafetyScan) => {
     const newScan = adaptSafetyScan(rawNewScan);
+    fetchedScanIdsRef.current.add(newScan.id);
+    setFetchError(null);
     const rawFindings = Array.isArray((rawNewScan as any)?.findings)
       ? (rawNewScan as any).findings
       : [];
@@ -132,23 +156,33 @@ export function SafetyDashboard({
 
   if (!activeScan || !activeReport) {
     return (
-      <div className="space-y-4 rounded-lg border border-zinc-800 bg-zinc-900/50 p-8 text-center">
-        <p className="text-sm text-zinc-300">
-          No safety scans found yet for this project.
-        </p>
-        <button
-          type="button"
-          onClick={() => setIsModalOpen(true)}
-          className={`inline-flex items-center justify-center rounded px-4 py-1.5 text-xs font-semibold transition-colors ${PRIMARY_BTN_CLASS}`}
-        >
-          Trigger New Scan
-        </button>
-        <NewScanModal
-          isOpen={isModalOpen}
-          onClose={handleCloseModal}
-          categories={categories}
-          onScanCreated={handleScanCreated}
-        />
+      <div className="space-y-4">
+        {fetchError && (
+          <div
+            role="alert"
+            className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-red-800/80 bg-red-950/40 px-3.5 py-2.5 text-xs text-red-200"
+          >
+            <span>{fetchError}</span>
+          </div>
+        )}
+        <div className="space-y-4 rounded-lg border border-zinc-800 bg-zinc-900/50 p-8 text-center">
+          <p className="text-sm text-zinc-300">
+            No safety scans found yet for this project.
+          </p>
+          <button
+            type="button"
+            onClick={() => setIsModalOpen(true)}
+            className={`inline-flex items-center justify-center rounded px-4 py-1.5 text-xs font-semibold transition-colors ${PRIMARY_BTN_CLASS}`}
+          >
+            Trigger New Scan
+          </button>
+          <NewScanModal
+            isOpen={isModalOpen}
+            onClose={handleCloseModal}
+            categories={categories}
+            onScanCreated={handleScanCreated}
+          />
+        </div>
       </div>
     );
   }
@@ -158,9 +192,17 @@ export function SafetyDashboard({
       {fetchError && (
         <div
           role="alert"
-          className="rounded-md border border-red-800/80 bg-red-950/40 px-3.5 py-2.5 text-xs text-red-200"
+          className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-red-800/80 bg-red-950/40 px-3.5 py-2.5 text-xs text-red-200"
         >
-          {fetchError}
+          <span>{fetchError}</span>
+          <button
+            type="button"
+            disabled={loadingDetails}
+            onClick={() => void loadScanDetails(activeScan.id)}
+            className="inline-flex h-7 items-center rounded border border-red-700/70 bg-red-900/40 px-2.5 text-xs font-medium text-red-100 hover:bg-red-900/60 disabled:opacity-50"
+          >
+            {loadingDetails ? "Retrying…" : "Retry"}
+          </button>
         </div>
       )}
 
