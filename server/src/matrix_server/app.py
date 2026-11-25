@@ -29,7 +29,12 @@ from matrix_server.gateway.router import GatewayRouter
 from matrix_server.hooks import install_api_hooks
 from matrix_server.limits import BodyLimitMiddleware
 from matrix_server.runs.store import build_metric_store
-from matrix_server.storage.db import init_db, make_engine, make_session_factory
+from matrix_server.storage.db import (
+    CommitBeforeResponseMiddleware,
+    init_db,
+    make_engine,
+    make_session_factory,
+)
 from matrix_server.storage.spans import build_span_store
 
 
@@ -38,6 +43,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     app.state.settings = settings
     users.configure_hash_concurrency(settings.password_hash_concurrency)
+    app.add_middleware(CommitBeforeResponseMiddleware)
     app.add_middleware(
         BodyLimitMiddleware,
         max_body_bytes=settings.max_body_bytes,
