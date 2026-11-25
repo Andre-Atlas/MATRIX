@@ -60,6 +60,10 @@ class SpanStore(Protocol):
 
     def get_trace(self, project_id: str, trace_id: str) -> tuple[TraceSummary, list[Span]] | None: ...
 
+    def get_traces_batch(
+        self, project_id: str, trace_ids: Sequence[str]
+    ) -> dict[str, tuple[TraceSummary, list[Span]]]: ...
+
     def list_sessions(
         self, project_id: str, limit: int = 50, cursor: str | None = None
     ) -> tuple[list[SessionSummary], str | None]: ...
@@ -263,6 +267,21 @@ class MemorySpanStore:
             return None
         spans.sort(key=lambda s: (s.start_time, s.span_id))
         return summarize_trace(spans), spans
+
+    def get_traces_batch(
+        self, project_id: str, trace_ids: Sequence[str]
+    ) -> dict[str, tuple[TraceSummary, list[Span]]]:
+        unique_ids = list(dict.fromkeys(tid for tid in trace_ids if tid))
+        if not unique_ids:
+            return {}
+        with self._lock:
+            proj = self._data.get(project_id, {})
+            raw_by_trace = {tid: list(proj[tid].values()) for tid in unique_ids if proj.get(tid)}
+        out: dict[str, tuple[TraceSummary, list[Span]]] = {}
+        for tid, spans in raw_by_trace.items():
+            spans.sort(key=lambda s: (s.start_time, s.span_id))
+            out[tid] = (summarize_trace(spans), spans)
+        return out
 
     def _sessions(self, project_id: str) -> list[SessionSummary]:
         by_session: dict[str, list[TraceSummary]] = {}
@@ -765,6 +784,32 @@ SETTINGS index_granularity = 8192
         if not spans:
             return None
         return summarize_trace(spans), spans
+
+    def get_traces_batch(
+        self, project_id: str, trace_ids: Sequence[str]
+    ) -> dict[str, tuple[TraceSummary, list[Span]]]:
+        unique_ids = list(dict.fromkeys(tid for tid in trace_ids if tid))
+        if not unique_ids:
+            return {}
+        sql = f"""
+            SELECT {_SELECT_SPAN}
+            FROM (
+                SELECT *
+                FROM {self.table}
+                WHERE project_id = {{project_id:String}} AND trace_id IN {{trace_ids:Array(String)}}
+                ORDER BY version DESC
+                LIMIT 1 BY project_id, trace_id, span_id
+            )
+        """
+        by_trace: dict[str, list[Span]] = {}
+        for row in self._rows(sql, {"project_id": project_id, "trace_ids": unique_ids}):
+            span = _span_from_row(project_id, row)
+            by_trace.setdefault(span.trace_id, []).append(span)
+        out: dict[str, tuple[TraceSummary, list[Span]]] = {}
+        for tid, spans in by_trace.items():
+            spans.sort(key=lambda s: (s.start_time, s.span_id))
+            out[tid] = (summarize_trace(spans), spans)
+        return out
 
     def get_span(self, project_id: str, trace_id: str, span_id: str) -> Span | None:
         spans = self._spans(project_id, trace_id, span_id)

@@ -53,7 +53,7 @@ T2 (auth, migração de usuários), T3 (auth/rotas), T6 (webhooks → SSRF), T7 
 - **`main` continua andando** (é a linha de trabalho do usuário): `git fetch` antes de cada tarefa e antes do PR; se aparecer commit novo, ele é incorporado na T2 ou reportado.
 - **Tamanho:** o merge toca ~290 arquivos; por isso T2 vem antes e a suíte do branch precisa ficar verde a cada tarefa.
 
-## Status (2026-11-19)
+## Status (2026-11-25 — pronto para o Gate 2, branch `feat/reconciliacao-t5-t13`)
 
-- **Feitas:** T1, T2, T3, T4.
-- **Pendentes (passadas ao Antigravity):** T5, T6, T7, T8, T9, T10, T11, T12, T13. Especificações em `tasks/` e visão geral em `HANDOFF.md`.
+- **Feitas e verificadas:** T1–T13. T11 (CI/compose/e2e) commit `4280016`; T12 (auditoria final, 5 CRITICAL + 17 HIGH corrigidos) commits `8e9932f`…`f0cc161`; correção do E2E `e8e04bb`.
+- Relatório final: [report.md](report.md). Auditoria: [audit-final.md](audit-final.md).

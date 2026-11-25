@@ -38,16 +38,18 @@ export function FindingsTable({
           <div className="relative min-w-[200px] flex-1 sm:w-64 sm:flex-initial">
             <input
               type="text"
+              aria-label="Search findings"
               placeholder="Search probes, payloads, guardrails..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full rounded border border-zinc-700/80 bg-zinc-950 px-2.5 py-1 text-xs text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+              className="w-full rounded border border-zinc-700/80 bg-zinc-950 px-2.5 py-1 text-xs text-zinc-100 placeholder:text-zinc-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
             />
             {searchQuery && (
               <button
                 type="button"
+                aria-label="Clear search query"
                 onClick={() => setSearchQuery("")}
-                className="absolute right-2 top-1 text-xs text-zinc-400 hover:text-zinc-200"
+                className="absolute right-1 top-0.5 inline-flex h-6 w-6 items-center justify-center rounded text-xs text-zinc-400 hover:text-zinc-200"
               >
                 ×
               </button>
@@ -88,8 +90,9 @@ export function FindingsTable({
               <span>Category: <strong>{activeCategoryCode}</strong></span>
               <button
                 type="button"
+                aria-label="Clear category filter"
                 onClick={onClearCategoryFilter}
-                className="text-zinc-400 hover:text-zinc-100"
+                className="inline-flex h-6 w-6 items-center justify-center rounded text-zinc-400 hover:text-zinc-100"
                 title="Clear category filter"
               >
                 ×
@@ -192,6 +195,7 @@ export function FindingsTable({
                         <div className="w-20 shrink-0 text-right">
                           <button
                             type="button"
+                            aria-expanded={isExpanded}
                             onClick={() => setExpandedId(isExpanded ? null : item.id)}
                             className="rounded border border-zinc-700 bg-zinc-800 px-2 py-1 text-[11px] text-zinc-200 hover:border-zinc-600 hover:bg-zinc-700"
                           >
@@ -209,7 +213,7 @@ export function FindingsTable({
                               <div>
                                 <div className="mb-1 flex items-center justify-between text-[11px] font-semibold uppercase tracking-wider text-red-400">
                                   <span>Adversarial Probe Payload</span>
-                                  <span className="font-mono text-zinc-500">{item.probe_id}</span>
+                                  <span className="font-mono text-zinc-400">{item.probe_id}</span>
                                 </div>
                                 <div className="rounded border border-zinc-800 bg-zinc-900/90 p-2.5 font-mono text-xs text-zinc-300">
                                   {item.attack_prompt}
@@ -220,7 +224,12 @@ export function FindingsTable({
                                 <div className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-amber-400">
                                   Observed Model Output
                                 </div>
-                                <div className="max-h-36 overflow-y-auto rounded border border-zinc-800 bg-zinc-900/90 p-2.5 font-mono text-xs text-zinc-300">
+                                <div
+                                  tabIndex={0}
+                                  role="region"
+                                  aria-label="Observed Model Output"
+                                  className="max-h-36 overflow-y-auto rounded border border-zinc-800 bg-zinc-900/90 p-2.5 font-mono text-xs text-zinc-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
+                                >
                                   {item.observed_output}
                                 </div>
                               </div>

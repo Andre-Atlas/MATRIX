@@ -5,7 +5,7 @@ import type { VectorDriftResponse, VectorProjectionResponse } from "@/lib/types"
 import { VectorProjector } from "./vector-projector";
 import { DriftMonitor } from "./drift-monitor";
 import { ClusterGapList } from "./cluster-gap-list";
-import { Kpi } from "@/components/ui";
+import { Kpi, SimulatedBadge } from "@/components/ui";
 
 interface VectorsDashboardProps {
   projection: VectorProjectionResponse;
@@ -19,8 +19,28 @@ export function VectorsDashboard({ projection, drift }: VectorsDashboardProps) {
     ? projection.clusters.find((c) => c.id === selectedClusterId)
     : null;
 
+  const isSimulated =
+    projection.simulated === true ||
+    drift.simulated === true ||
+    projection.engine === "pca-lite" ||
+    drift.mode === "demo";
+
   return (
     <div className="space-y-6">
+      {isSimulated && (
+        <div
+          role="status"
+          className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-700/60 bg-amber-950/30 px-3.5 py-2.5 text-xs text-amber-200"
+        >
+          <SimulatedBadge reason={projection.engine || "pca-lite / demo"} />
+          <span>
+            Vector projection ({projection.engine || "pca-lite"} ·{" "}
+            {projection.embedding || "hash-3gram (demo)"}) and drift metrics are running in
+            simulated demo mode.
+          </span>
+        </div>
+      )}
+
       {/* Top KPI Cards Row */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
         <Kpi

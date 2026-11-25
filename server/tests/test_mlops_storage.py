@@ -1,7 +1,5 @@
-"""`main`'s MLOps tables after T4: runs are `runs`, checkpoints are `model_artifacts` (metadata
-over the G0 blob store), metric points live in the G1 `MetricStore` (`run_metrics`). The tests of
-`main`'s own metric store (`MergeTree`, no dedup, averaging downsampling, NaN refused by the store)
-were replaced by the same checks on the G1 store fed through `mlops.compat` (the adapter path)."""
+"""`main`'s MLOps tables after compat removal: runs are `runs`, checkpoints are `model_artifacts`
+(metadata over the G0 blob store), metric points live in the G1 `MetricStore` (`run_metrics`)."""
 
 import math
 import os
@@ -13,7 +11,6 @@ from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 
 from matrix_server.config import Settings
-from matrix_server.mlops import compat
 from matrix_server.runs import service
 from matrix_server.runs.models import Run, RunReport
 from matrix_server.runs.store import MemoryMetricStore, MetricStore, build_metric_store
@@ -51,13 +48,11 @@ def session(request, tmp_path):
     eng.dispose()
 
 
-def _insert(store: MetricStore, project_id: str, run_id: str, main_points: list[dict]) -> int:
-    """`main` points through the adapter's translation and the G1 validation into the store."""
-    raw, _ = compat.points_in(main_points)
-    parsed, rejected = service.parse_points(raw, datetime.now(UTC))
+def _insert(store: MetricStore, project_id: str, run_id: str, points: list[dict]) -> int:
+    parsed, rejected = service.parse_points(points, datetime.now(UTC))
     assert rejected == []
     store.insert(project_id, run_id, [p for _, p in parsed])
-    return len(main_points)
+    return len(points)
 
 
 def test_mlops_models_crud_and_multitenant_isolation(session):
@@ -81,10 +76,13 @@ def test_mlops_models_crud_and_multitenant_isolation(session):
     session.add_all([sweep_p1, sweep_p2])
     session.flush()
 
-    classic_eval_payload = {
-        "roc_auc": 0.942,
+    report_payload = {
+        "labels": ["neg", "pos"],
+        "metrics": {"roc_auc": 0.942},
+        "per_class": [],
         "confusion_matrix": [[120, 8], [5, 117]],
-        "shap_importance": [{"feature": "token_entropy", "importance": 0.41}],
+        "roc": [],
+        "pr": [],
     }
     run_p1 = Run(
         project_id="p1",
@@ -99,8 +97,7 @@ def test_mlops_models_crud_and_multitenant_isolation(session):
     run_p2 = Run(project_id="p2", name="qwen-lora-01", run_type="sft", sweep_id=sweep_p2.id)
     session.add_all([run_p1, run_p2])
     session.flush()
-    for kind, name, data in compat.classic_eval_to_reports(classic_eval_payload):
-        session.add(RunReport(run_id=run_p1.id, project_id="p1", kind=kind, name=name, data=data))
+    session.add(RunReport(run_id=run_p1.id, project_id="p1", kind="classification", name="classic_eval", data=report_payload))
 
     sweep_p1.best_run_id = run_p1.id
     sweep_p1.best_metric_value = 0.312
@@ -187,15 +184,14 @@ def test_mlops_models_crud_and_multitenant_isolation(session):
 
     loaded_run = session.get(Run, run_p1.id)
     assert loaded_run is not None and loaded_run.status == "running" and loaded_run.run_type == "lora"
-    reports = session.execute(
-        select(RunReport.kind, RunReport.data).where(RunReport.run_id == run_p1.id, RunReport.name == "classic_eval")
-    ).all()
-    assert compat.reports_to_classic_eval([(k, d) for k, d in reports]) == classic_eval_payload
+    loaded_report = session.scalars(
+        select(RunReport).where(RunReport.run_id == run_p1.id, RunReport.name == "classic_eval")
+    ).one()
+    assert loaded_report.data == report_payload
     loaded_art = session.get(ModelArtifact, art_p1.id)
     assert loaded_art is not None
     assert loaded_art.size_bytes == large_size
 
-    # Multi-tenant isolation checks
     p1_runs = session.scalars(select(Run).where(Run.project_id == "p1")).all()
     assert [r.id for r in p1_runs] == [run_p1.id]
     p2_models = session.scalars(select(RegisteredModel).where(RegisteredModel.project_id == "p2")).all()
@@ -234,19 +230,16 @@ def test_mlops_unique_constraints_and_cascades(session):
     session.add(ModelAlias(project_id="p1", model_id=model.id, alias="champion", version=1))
     session.commit()
 
-    # Duplicate version fails
     session.add(ModelVersion(project_id="p1", model_id=model.id, version=1))
     with pytest.raises(IntegrityError):
         session.commit()
     session.rollback()
 
-    # Duplicate alias fails
     session.add(ModelAlias(project_id="p1", model_id=model.id, alias="champion", version=1))
     with pytest.raises(IntegrityError):
         session.commit()
     session.rollback()
 
-    # Cascade delete on RegisteredModel removes versions and aliases
     session.execute(delete(RegisteredModel).where(RegisteredModel.id == model.id))
     session.commit()
     assert session.scalars(select(ModelVersion)).all() == []
@@ -259,7 +252,7 @@ def test_metric_store_protocol_and_builder():
     assert isinstance(store, MetricStore)
 
 
-def test_adapter_points_land_in_the_g1_store_with_isolation():
+def test_canonical_points_land_in_the_g1_store_with_isolation():
     store = MemoryMetricStore()
     t0 = datetime(2026, 11, 13, 12, 0, tzinfo=UTC)
     inserted = _insert(
@@ -267,36 +260,34 @@ def test_adapter_points_land_in_the_g1_store_with_isolation():
         "p1",
         "run-1",
         [
-            {"category": "train", "metric_name": "loss", "step": 1, "epoch": 0.1, "value": 2.5, "recorded_at": t0},
-            {"category": "train", "metric_name": "loss", "step": 2, "epoch": 0.2, "value": 2.0, "recorded_at": t0 + timedelta(seconds=1)},
-            {"category": "eval", "metric_name": "eval/loss", "step": 2, "epoch": 0.2, "value": 2.1, "recorded_at": t0 + timedelta(seconds=2)},
-            {"category": "system", "metric_name": "gpu.0.utilization", "step": 2, "value": 95.0, "recorded_at": t0 + timedelta(seconds=3)},
-            {"category": "train", "metric_name": "lr", "step": 3, "value": 1e-4, "recorded_at": t0 + timedelta(seconds=4)},
+            {"key": "loss", "step": 1, "value": 2.5, "ts": t0.isoformat()},
+            {"key": "epoch", "step": 1, "value": 0.1, "ts": t0.isoformat()},
+            {"key": "loss", "step": 2, "value": 2.0, "ts": (t0 + timedelta(seconds=1)).isoformat()},
+            {"key": "epoch", "step": 2, "value": 0.2, "ts": (t0 + timedelta(seconds=1)).isoformat()},
+            {"key": "eval/loss", "step": 2, "value": 2.1, "ts": (t0 + timedelta(seconds=2)).isoformat()},
+            {"key": "sys/gpu.0.utilization", "step": 2, "value": 95.0, "ts": (t0 + timedelta(seconds=3)).isoformat()},
+            {"key": "lr", "step": 3, "value": 1e-4, "ts": (t0 + timedelta(seconds=4)).isoformat()},
         ],
     )
-    assert inserted == 5
-    # category "system" -> sys/ prefix; the epoch is its own key at the same step
+    assert inserted == 7
     assert store.keys("p1", "run-1") == ["epoch", "eval/loss", "loss", "lr", "sys/gpu.0.utilization"]
     series, _ = store.read_series("p1", ["run-1"], ["epoch"])
     assert series["run-1"]["epoch"].steps == [1, 2] and series["run-1"]["epoch"].values == [0.1, 0.2]
-    # summary skips sys/ keys; last_steps is the highest non-sys step
     assert store.summaries("p1", ["run-1"])["run-1"] == {"epoch": 0.2, "eval/loss": 2.1, "loss": 2.0, "lr": 1e-4}
     assert store.last_steps("p1", ["run-1"]) == {"run-1": 3}
 
-    _insert(store, "p2", "run-1", [{"category": "train", "metric_name": "loss", "step": 1, "value": 99.0}])
+    _insert(store, "p2", "run-1", [{"key": "loss", "step": 1, "value": 99.0}])
     assert store.keys("p3", "run-1") == []
     p2, _ = store.read_series("p2", ["run-1"], ["loss"])
     assert p2["run-1"]["loss"].values == [99.0]
-    # step range filter
     ranged, _ = store.read_series("p1", ["run-1"], ["loss", "lr"], from_step=2, to_step=3)
     assert ranged["run-1"]["loss"].steps == [2] and ranged["run-1"]["lr"].steps == [3]
 
 
 def test_resending_a_point_replaces_it():
-    """`main`'s MergeTree duplicated re-sent points; run_metrics keeps one per (key, step)."""
     store = MemoryMetricStore()
-    _insert(store, "p1", "r", [{"metric_name": "loss", "step": 5, "value": 1.0}])
-    _insert(store, "p1", "r", [{"metric_name": "loss", "step": 5, "value": 0.5}])
+    _insert(store, "p1", "r", [{"key": "loss", "step": 5, "value": 1.0}])
+    _insert(store, "p1", "r", [{"key": "loss", "step": 5, "value": 0.5}])
     series, _ = store.read_series("p1", ["r"], ["loss"])
     assert series["r"]["loss"].steps == [5] and series["r"]["loss"].values == [0.5]
 
@@ -306,24 +297,21 @@ def test_m4_downsampling_is_deterministic_and_keeps_the_ends(total_points: int, 
     store = MemoryMetricStore()
     t0 = datetime(2026, 11, 13, 12, 0, tzinfo=UTC)
     points = [
-        {"category": "train", "metric_name": "loss", "step": i, "value": float(total_points - i),
-         "recorded_at": t0 + timedelta(seconds=i)}
+        {"key": "loss", "step": i, "value": float(total_points - i), "ts": (t0 + timedelta(seconds=i)).isoformat()}
         for i in range(total_points)
     ]
     _insert(store, "p1", "run-ds", points)
     res1, down1 = store.read_series("p1", ["run-ds"], ["loss"], max_points=max_points)
     res2, _ = store.read_series("p1", ["run-ds"], ["loss"], max_points=max_points)
     series = res1["run-ds"]["loss"]
-    assert series == res2["run-ds"]["loss"]  # deterministic
+    assert series == res2["run-ds"]["loss"]
     assert down1 is (total_points > max_points)
     assert 1 <= len(series.steps) <= max_points
     assert series.steps == sorted(series.steps)
-    assert series.steps[0] == 0 and series.steps[-1] == total_points - 1  # first and last survive
+    assert series.steps[0] == 0 and series.steps[-1] == total_points - 1
 
 
 def test_non_finite_values_are_stored_and_read_as_null():
-    """`main`'s store refused NaN/Inf; G1 keeps them and reads them as null. The deprecated JSON
-    adapter still refuses them in the body (422, see test_mlops_api)."""
     store = MemoryMetricStore()
     parsed, _ = service.parse_points([{"key": "loss", "step": 1, "value": "nan"}], datetime.now(UTC))
     store.insert("p1", "run-1", [p for _, p in parsed])
@@ -336,7 +324,7 @@ def test_memory_metric_store_thread_safety():
     store = MemoryMetricStore()
 
     def worker(worker_id: int) -> None:
-        _insert(store, "p1", "run-mt", [{"metric_name": "loss", "step": worker_id * 20 + i, "value": float(i)} for i in range(20)])
+        _insert(store, "p1", "run-mt", [{"key": "loss", "step": worker_id * 20 + i, "value": float(i)} for i in range(20)])
         store.read_series("p1", ["run-mt"], ["loss"], max_points=52)
 
     with ThreadPoolExecutor(max_workers=8) as pool:

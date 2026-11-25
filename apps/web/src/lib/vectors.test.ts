@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  adaptVectorsData,
   calculateClusterMetrics,
   evaluateOverallDrift,
   filterKnowledgeGaps,
@@ -303,5 +304,13 @@ describe("Vector Mock API responses", () => {
     expect(drift.metrics.centroid_cosine.value).toBeGreaterThan(0);
     expect(drift.timeline.length).toBeGreaterThanOrEqual(5);
     expect(["healthy", "warning", "critical"]).toContain(drift.status);
+  });
+
+  it("preserves simulated, engine, embedding and mode metadata in adaptVectorsData", () => {
+    const { projection, drift } = adaptVectorsData(mockVectorProjection(), mockVectorDrift());
+    expect(projection.simulated).toBe(true);
+    expect(projection.engine).toBe("pca-lite");
+    expect(drift.simulated).toBe(true);
+    expect(drift.mode).toBe("demo");
   });
 });

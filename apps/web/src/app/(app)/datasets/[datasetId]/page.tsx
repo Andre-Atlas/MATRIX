@@ -1,4 +1,4 @@
-import { notFound } from "next/navigation";
+import { notFound, unstable_rethrow } from "next/navigation";
 import { apiGet, isNotFound } from "@/lib/api";
 import type { DatasetBranch, DatasetCommit, DatasetDetail } from "@/lib/types";
 import { DatasetStudioClient } from "@/components/datasets/dataset-studio-client";
@@ -11,6 +11,7 @@ export default async function DatasetPage({ params }: { params: Promise<{ datase
   try {
     detail = await apiGet<DatasetDetail>(`/api/v1/datasets/${encodeURIComponent(datasetId)}`);
   } catch (e) {
+    unstable_rethrow(e);
     if (isNotFound(e)) notFound();
     throw e;
   }
@@ -21,20 +22,9 @@ export default async function DatasetPage({ params }: { params: Promise<{ datase
       `/api/v1/datasets/${encodeURIComponent(datasetId)}/branches`
     );
     branches = brRes.items || [];
-  } catch {
-    branches = [
-      {
-        id: "br-main",
-        project_id: "proj-default",
-        dataset_id: datasetId,
-        name: "main",
-        head_commit_id: "c-main-02",
-        is_default: true,
-        created_by: "system",
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      },
-    ];
+  } catch (e) {
+    unstable_rethrow(e);
+    branches = [];
   }
 
   let commits: DatasetCommit[] = [];
@@ -43,7 +33,8 @@ export default async function DatasetPage({ params }: { params: Promise<{ datase
       `/api/v1/datasets/${encodeURIComponent(datasetId)}/commits`
     );
     commits = comRes.items || [];
-  } catch {
+  } catch (e) {
+    unstable_rethrow(e);
     commits = [];
   }
 

@@ -2,6 +2,7 @@
 
 import React, { useEffect, useRef, useState } from "react";
 import { BRANCH_DIFF_STYLE, PRIMARY_BTN_CLASS } from "@/lib/mlops-tokens";
+import { proxy } from "@/lib/proxy-client";
 import type { DatasetBranch, DatasetDiffResult, MergeBranchesRequest } from "@/lib/types";
 
 export interface DiffBranchesDrawerProps {
@@ -66,15 +67,12 @@ export function DiffBranchesDrawer({
       setLoading(true);
       setError(null);
       try {
-        const res = await fetch(
-          `/api/proxy/api/v1/datasets/${encodeURIComponent(datasetId)}/diff?base=${encodeURIComponent(
+        const data = await proxy<DatasetDiffResult>(
+          "GET",
+          `datasets/${encodeURIComponent(datasetId)}/diff?base=${encodeURIComponent(
             baseBranch
-          )}&head=${encodeURIComponent(compareBranch)}`
+          )}&head=${encodeURIComponent(compareBranch)}`,
         );
-        if (!res.ok) {
-          throw new Error(`Failed to calculate diff (HTTP ${res.status})`);
-        }
-        const data: DatasetDiffResult = await res.json();
         if (!cancelled) {
           setDiffResult(data);
           setMergeMessage(`Merge branch '${compareBranch}' into '${baseBranch}'`);
@@ -126,16 +124,7 @@ export function DiffBranchesDrawer({
         message: mergeMessage.trim() || undefined,
       };
 
-      const res = await fetch(`/api/proxy/api/v1/datasets/${encodeURIComponent(datasetId)}/merge`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({ detail: "Merge failed" }));
-        throw new Error(errData.detail || `Server returned HTTP ${res.status}`);
-      }
+      await proxy("POST", `datasets/${encodeURIComponent(datasetId)}/merge`, payload);
 
       setMergeSuccess(true);
       if (onMerged) onMerged();

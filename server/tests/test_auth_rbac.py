@@ -47,9 +47,9 @@ def env(tmp_path):
 READS = [
     "/api/v1/benchmarks/catalog",
     "/api/v1/benchmarks/runs",
-    "/api/v1/mlops/runs",
-    "/api/v1/mlops/sweeps",
-    "/api/v1/mlops/artifacts",
+    "/api/v1/runs",
+    "/api/v1/sweeps",
+    "/api/v1/artifacts",
     "/api/v1/mlops/models",
     "/api/v1/sandboxes/runs",
     "/api/v1/safety/scans",
@@ -85,11 +85,11 @@ def test_reads_need_viewer_and_stay_in_the_project(env, path):
 def test_member_writes_viewer_and_read_key_cannot(env):
     client, roles = env["client"], env["roles"]
     writes = [
-        ("/api/v1/mlops/runs", {"name": "r1"}),
+        ("/api/v1/runs", {"name": "r1"}),
         ("/api/v1/mlops/models", {"name": "m1"}),
         ("/api/v1/safety/scans", {"categories": ["LLM01"]}),
         ("/api/v1/sandboxes/runs", {"name": "s1"}),
-        ("/api/v1/gateway/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}),
+        ("/api/v1/gateway/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "provider": "mock"}),
     ]
     for path, body in writes:
         for denied in (roles["viewer"], env["read_key"]):
@@ -118,14 +118,20 @@ def test_promote_and_archive_are_admin_only(env, stage):
     client, roles = env["client"], env["roles"]
     model_id = _model_with_version(client, roles["member"])
     url = f"/api/v1/mlops/models/{model_id}/versions/1/stage"
+    canonical_url = f"/api/v1/models/{model_id}/versions/1/stage"
     for denied in (roles["viewer"], roles["member"], env["key"]):
         assert client.patch(url, json={"stage": stage}, headers=denied).status_code == 403
+        assert client.post(canonical_url, json={"stage": stage}, headers=denied).status_code == 403
     # creating a version straight into the stage is the same decision
     created = client.post(f"/api/v1/mlops/models/{model_id}/versions", json={"stage": stage}, headers=env["key"])
     assert created.status_code == 403
     assert client.patch(url, json={"stage": "staging"}, headers=roles["member"]).status_code == 200
-    for allowed in (roles["admin"], roles["owner"]):
-        assert client.patch(url, json={"stage": stage}, headers=allowed).status_code == 200
+    assert client.post(canonical_url, json={"stage": "staging"}, headers=env["key"]).status_code == 200
+    assert client.post(canonical_url, json={"stage": stage}, headers=roles["admin"]).status_code == 200
+    if stage == "production":
+        for denied in (roles["member"], env["key"]):
+            assert client.post(canonical_url, json={"stage": "staging"}, headers=denied).status_code == 403
+    assert client.patch(url, json={"stage": stage}, headers=roles["owner"]).status_code == 200
 
 
 def test_protected_alias_and_model_delete_are_admin_only(env):
@@ -133,19 +139,73 @@ def test_protected_alias_and_model_delete_are_admin_only(env):
     model_id = _model_with_version(client, roles["member"])
     url = f"/api/v1/mlops/models/{model_id}/aliases"
     assert client.post(url, json={"alias": "candidate", "version": 1}, headers=env["key"]).status_code == 200
+    assert (
+        client.put(f"/api/v1/models/{model_id}/aliases/challenger", json={"version": 1}, headers=env["key"]).status_code
+        == 200
+    )
+    assert (
+        client.delete(f"/api/v1/models/{model_id}/aliases/challenger", headers=env["key"]).status_code == 200
+    )
     for denied in (roles["member"], env["key"]):
         assert client.post(url, json={"alias": "@production", "version": 1}, headers=denied).status_code == 403
+        assert (
+            client.put(
+                f"/api/v1/models/{model_id}/aliases/production", json={"version": 1}, headers=denied
+            ).status_code
+            == 403
+        )
+        assert (
+            client.put(
+                f"/api/v1/models/{model_id}/aliases/champion", json={"version": 1}, headers=denied
+            ).status_code
+            == 403
+        )
         assert client.delete(f"/api/v1/mlops/models/{model_id}", headers=denied).status_code == 403
+    assert (
+        client.put(
+            f"/api/v1/models/{model_id}/aliases/champion", json={"version": 1}, headers=roles["admin"]
+        ).status_code
+        == 200
+    )
+    for denied in (roles["member"], env["key"]):
+        assert client.delete(f"/api/v1/models/{model_id}/aliases/champion", headers=denied).status_code == 403
+    assert client.delete(f"/api/v1/models/{model_id}/aliases/champion", headers=roles["admin"]).status_code == 200
     assert client.post(url, json={"alias": "@production", "version": 1}, headers=roles["admin"]).status_code == 200
     assert client.delete(f"/api/v1/mlops/models/{model_id}?force=true", headers=roles["owner"]).status_code == 200
 
 
-def test_sandbox_network_needs_an_admin_principal(env):
+def test_sweep_delete_and_webhook_list_reject_api_key(env):
+    client, roles = env["client"], env["roles"]
+    sweep = client.post(
+        "/api/v1/sweeps",
+        json={
+            "name": "rbac-sweep",
+            "config": {
+                "method": "random",
+                "metric": {"key": "loss", "goal": "minimize"},
+                "parameters": {"lr": {"type": "float", "min": 0.001, "max": 0.01}},
+            },
+        },
+        headers=roles["member"],
+    )
+    assert sweep.status_code == 201, sweep.text
+    sweep_id = sweep.json()["id"]
+    for denied in (roles["viewer"], roles["member"], env["key"], env["read_key"]):
+        assert client.delete(f"/api/v1/sweeps/{sweep_id}", headers=denied).status_code == 403
+    assert client.delete(f"/api/v1/sweeps/{sweep_id}", headers=roles["admin"]).status_code == 204
+
+    model_id = _model_with_version(client, roles["member"], name="wh-rbac")
+    for denied in (roles["viewer"], roles["member"], env["key"], env["read_key"]):
+        assert client.get(f"/api/v1/models/{model_id}/webhooks", headers=denied).status_code == 403
+        assert client.get(f"/api/v1/mlops/models/{model_id}/webhooks", headers=denied).status_code == 403
+    assert client.get(f"/api/v1/models/{model_id}/webhooks", headers=roles["admin"]).status_code == 200
+    assert client.get(f"/api/v1/mlops/models/{model_id}/webhooks", headers=roles["admin"]).status_code == 200
+
+
+def test_sandbox_network_is_rejected_until_egress_proxy_exists(env):
     client, roles = env["client"], env["roles"]
     policy = {"network_mode": "bridge"}
-    for denied in (roles["member"], env["key"]):
-        resp = client.post("/api/v1/sandboxes/runs", json={"name": "n", "sandbox_policy": policy}, headers=denied)
-        assert resp.status_code == 403
-    resp = client.post("/api/v1/sandboxes/runs", json={"name": "n", "sandbox_policy": policy}, headers=roles["admin"])
-    assert resp.status_code == 201, resp.text
-    assert resp.json()["sandbox_policy"]["network_approved_by"]
+    for principal in (roles["member"], env["key"], roles["admin"]):
+        resp = client.post("/api/v1/sandboxes/runs", json={"name": "n", "sandbox_policy": policy}, headers=principal)
+        assert resp.status_code == 422, resp.text
+        assert "egress proxy" in resp.json()["detail"]

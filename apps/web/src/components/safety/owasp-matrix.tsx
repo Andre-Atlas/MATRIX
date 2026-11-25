@@ -44,16 +44,20 @@ export function OwaspMatrix({
         {categories.map((cat) => {
           const catCode = cat.code ?? (cat.id as string);
           const score = scoresByCode.get(catCode as any) ?? scoresByCode.get(cat.id as any);
-          const passRate = score ? Math.round(score.pass_rate * 100) : 100;
-          const status = score ? score.status : "compliant";
+          const isNotEvaluated =
+            !score || score.status === "not_evaluated" || score.pass_rate === null;
+          const passRate = isNotEvaluated
+            ? null
+            : Math.round((score.pass_rate ?? 0) * 100);
+          const status = isNotEvaluated ? "not_evaluated" : score.status;
           const statusMeta = formatComplianceStatus(status);
           const isSelected = selectedCategoryCode === catCode;
-          const probesCount = cat.probes_count ?? 4;
 
           return (
             <button
               key={cat.id ?? catCode}
               type="button"
+              aria-pressed={isSelected}
               onClick={() => {
                 if (isSelected) {
                   onSelectCategory?.("all");
@@ -97,7 +101,7 @@ export function OwaspMatrix({
                 <div className="flex items-center justify-between text-[11px]">
                   <span className="text-zinc-400">Pass Rate:</span>
                   <span className="font-mono font-medium text-zinc-200">
-                    {passRate}%
+                    {passRate === null ? "Not evaluated" : `${passRate}%`}
                   </span>
                 </div>
 
@@ -105,22 +109,26 @@ export function OwaspMatrix({
                 <div className="mt-1.5 h-1 w-full overflow-hidden rounded-full bg-zinc-800">
                   <div
                     className={`h-full transition-all duration-500 ${
-                      passRate >= 85
-                        ? "bg-emerald-500"
-                        : passRate >= 60
-                          ? "bg-amber-500"
-                          : "bg-red-500"
+                      passRate === null
+                        ? "bg-zinc-600"
+                        : passRate >= 85
+                          ? "bg-emerald-500"
+                          : passRate >= 60
+                            ? "bg-amber-500"
+                            : "bg-red-500"
                     }`}
-                    style={{ width: `${passRate}%` }}
+                    style={{ width: `${passRate ?? 0}%` }}
                   />
                 </div>
 
                 <div className="mt-2 flex items-center justify-between text-[10px] text-zinc-400">
                   <span>
-                    Probes: <strong className="text-zinc-300">{score ? `${score.probes_passed}/${score.probes_tested}` : `${probesCount}/${probesCount}`}</strong>
+                    Probes: <strong className="text-zinc-300">{isNotEvaluated || !score ? "0/0" : `${score.probes_passed}/${score.probes_tested}`}</strong>
                   </span>
                   <span>
-                    {score && score.findings_count > 0 ? (
+                    {isNotEvaluated ? (
+                      <span className="text-zinc-400">Not evaluated</span>
+                    ) : score && score.findings_count > 0 ? (
                       <span className="font-semibold text-red-400">
                         {score.findings_count} {score.findings_count === 1 ? "issue" : "issues"}
                       </span>

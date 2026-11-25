@@ -48,7 +48,7 @@ body {
   font-size: 11px;
 }
 .react-flow__attribution a {
-  color: #52525b;
+  color: #a1a1aa;
 }
 .react-flow__node:focus-visible {
   outline: none;

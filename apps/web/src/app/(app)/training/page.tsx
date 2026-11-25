@@ -1,9 +1,20 @@
+import { unstable_rethrow } from "next/navigation";
 import { apiGet } from "@/lib/api";
+import {
+  canonicalRunMetricKeys,
+  canonicalRunToTrainingRun,
+  canonicalSeriesToTrainingSeries,
+  canonicalSweepDetailToSweepDetail,
+  canonicalSweepToMLOpsSweep,
+} from "@/lib/training-canonical";
+import type { MetricKeyStat, Report, Run, SeriesResponse } from "@/lib/runs/types";
 import type {
+  CanonicalSweep,
+  CanonicalSweepDetail,
   ListResponse,
   MLOpsSweep,
   SweepDetail,
-  TrainingMetricSeries,
+  TrainingMetricPoint,
   TrainingRun,
 } from "@/lib/types";
 import { TrainingStudioClient } from "@/components/training/training-studio-client";
@@ -20,43 +31,83 @@ export default async function TrainingPage({ searchParams }: TrainingPageProps) 
   const initialTab =
     sp.tab === "sweeps" || sp.tab === "classic" || sp.tab === "runs" ? sp.tab : "runs";
 
-  let runs: TrainingRun[] = [];
+  let rawRuns: Run[] = [];
   let sweeps: MLOpsSweep[] = [];
   let initialError: string | null = null;
 
   try {
     const [runsResp, sweepsResp] = await Promise.all([
-      apiGet<ListResponse<TrainingRun>>("/api/v1/mlops/runs", { limit: 100 }),
-      apiGet<ListResponse<MLOpsSweep>>("/api/v1/mlops/sweeps"),
+      apiGet<ListResponse<Run>>("/api/v1/runs", { limit: 100 }),
+      apiGet<ListResponse<CanonicalSweep | MLOpsSweep>>("/api/v1/sweeps"),
     ]);
-    runs = Array.isArray(runsResp?.items) ? runsResp.items : [];
-    sweeps = Array.isArray(sweepsResp?.items) ? sweepsResp.items : [];
+    rawRuns = Array.isArray(runsResp?.items) ? runsResp.items : [];
+    const rawSweeps = Array.isArray(sweepsResp?.items) ? sweepsResp.items : [];
+    sweeps = rawSweeps.map((s) => canonicalSweepToMLOpsSweep(s));
   } catch (err) {
+    unstable_rethrow(err);
     initialError = err instanceof Error ? err.message : "Failed to load training runs and sweeps.";
   }
 
+  // Pre-fetch reports for classic ML evaluation across initial runs
+  const reportsByRun: Record<string, Report[]> = {};
+  if (rawRuns.length > 0) {
+    const reportSlice = rawRuns.slice(0, 12);
+    const reportResults = await Promise.allSettled(
+      reportSlice.map((r) =>
+        apiGet<{ items: Report[] }>(`/api/v1/runs/${encodeURIComponent(r.id)}/reports`),
+      ),
+    );
+    reportResults.forEach((res, idx) => {
+      if (res.status === "rejected") {
+        unstable_rethrow(res.reason);
+      } else if (Array.isArray(res.value?.items)) {
+        reportsByRun[reportSlice[idx].id] = res.value.items;
+      }
+    });
+  }
+
+  const runs: TrainingRun[] = rawRuns.map((r) =>
+    canonicalRunToTrainingRun(r, reportsByRun[r.id]),
+  );
+
   // Pre-fetch metric series for the targeted run (if any) + first 2 runs
-  const candidateRunIds: string[] = [];
-  if (initialRunId && runs.some((r) => r.id === initialRunId)) {
-    candidateRunIds.push(initialRunId);
+  const candidateRuns: TrainingRun[] = [];
+  if (initialRunId) {
+    const target = runs.find((r) => r.id === initialRunId);
+    if (target) candidateRuns.push(target);
   }
   for (const r of runs) {
-    if (candidateRunIds.length >= 3) break;
-    if (!candidateRunIds.includes(r.id)) {
-      candidateRunIds.push(r.id);
+    if (candidateRuns.length >= 3) break;
+    if (!candidateRuns.some((c) => c.id === r.id)) {
+      candidateRuns.push(r);
     }
   }
 
-  const initialSeriesByRun: Record<string, TrainingMetricSeries["series"]> = {};
-  if (candidateRunIds.length > 0) {
+  const initialSeriesByRun: Record<string, Record<string, TrainingMetricPoint[]>> = {};
+  if (candidateRuns.length > 0) {
     const seriesResults = await Promise.allSettled(
-      candidateRunIds.map((id) =>
-        apiGet<TrainingMetricSeries>(`/api/v1/mlops/runs/${encodeURIComponent(id)}/metrics`),
-      ),
+      candidateRuns.map(async (run) => {
+        const keyStats = await apiGet<{ keys: MetricKeyStat[] }>(
+          `/api/v1/runs/${encodeURIComponent(run.id)}/metric-keys`,
+        )
+          .then((r) => r.keys)
+          .catch((err) => {
+            unstable_rethrow(err);
+            return undefined;
+          });
+        const keys = canonicalRunMetricKeys(run, keyStats);
+        const seriesResp = await apiGet<SeriesResponse>(
+          `/api/v1/runs/${encodeURIComponent(run.id)}/metrics`,
+          { keys: keys.join(",") },
+        );
+        return { runId: run.id, series: canonicalSeriesToTrainingSeries(seriesResp) };
+      }),
     );
     for (const res of seriesResults) {
-      if (res.status === "fulfilled" && res.value?.run_id) {
-        initialSeriesByRun[res.value.run_id] = res.value.series ?? {};
+      if (res.status === "rejected") {
+        unstable_rethrow(res.reason);
+      } else {
+        initialSeriesByRun[res.value.runId] = res.value.series;
       }
     }
   }
@@ -64,16 +115,19 @@ export default async function TrainingPage({ searchParams }: TrainingPageProps) 
   let initialSweepDetail: SweepDetail | null = null;
   if (sweeps.length > 0) {
     try {
-      initialSweepDetail = await apiGet<SweepDetail>(
-        `/api/v1/mlops/sweeps/${encodeURIComponent(sweeps[0].id)}`,
+      const rawDetail = await apiGet<CanonicalSweepDetail | SweepDetail>(
+        `/api/v1/sweeps/${encodeURIComponent(sweeps[0].id)}`,
       );
-    } catch {
+      initialSweepDetail = canonicalSweepDetailToSweepDetail(rawDetail);
+    } catch (err) {
+      unstable_rethrow(err);
       initialSweepDetail = null;
     }
   }
 
   return (
     <TrainingStudioClient
+      key={`${initialTab ?? "runs"}:${initialRunId ?? ""}`}
       initialRuns={runs}
       initialSweeps={sweeps}
       initialSeriesByRun={initialSeriesByRun}

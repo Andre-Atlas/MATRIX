@@ -30,6 +30,8 @@ class Run(Base):
         Index("ix_runs_project_group", "project_id", "group_name"),
         Index("ix_runs_project_sweep", "project_id", "sweep_id"),
         Index("ix_runs_status_heartbeat", "status", "heartbeat_at"),
+        Index("ix_runs_project_dataset_version", "project_id", "dataset_version_id"),
+        Index("ix_runs_project_parent_run", "project_id", "parent_run_id"),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)

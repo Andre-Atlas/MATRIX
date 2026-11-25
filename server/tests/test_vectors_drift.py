@@ -421,3 +421,109 @@ def test_projection_with_ingested_trace(client_env):
     # Verify trace spans are reflected
     trace_ids = {p["trace_id"] for p in data["points"] if p.get("trace_id")}
     assert len(trace_ids) > 0
+
+
+# ==============================================================================
+# 6. T8: Simulated/Demo Labeling, ProjectionEngine Stubs & Project Isolation
+# ==============================================================================
+
+
+def test_projection_engine_interface_and_stubs():
+    from matrix_server.vectors import (
+        EngineUnavailable,
+        PCALiteEngine,
+        get_projection_engine,
+    )
+
+    pca = get_projection_engine("pca-lite")
+    assert isinstance(pca, PCALiteEngine)
+    assert pca.name == "pca-lite"
+    assert pca.simulated is True
+
+    vecs = [[float(i + j) * 0.1 for j in range(8)] for i in range(6)]
+    p1 = pca.project(vecs, n_components=3, seed=42)
+    p2 = pca.project(vecs, n_components=3, seed=42)
+    assert p1 == p2
+    assert len(p1) == 6
+    assert all(len(row) == 3 for row in p1)
+
+    labels, centroids = pca.cluster(vecs, k=2, seed=42)
+    assert len(labels) == 6
+    assert len(centroids) == 2
+
+    umap_engine = get_projection_engine("umap")
+    with pytest.raises(EngineUnavailable):
+        umap_engine.project(vecs)
+
+    hdbscan_engine = get_projection_engine("hdbscan")
+    with pytest.raises(EngineUnavailable):
+        hdbscan_engine.cluster(vecs)
+
+    with pytest.raises(EngineUnavailable):
+        get_projection_engine("nonexistent-engine")
+
+
+def test_vectors_api_simulated_labels_and_determinism(client_env):
+    client, auth = client_env
+
+    # Projection endpoint labels engine/embedding/simulated and is deterministic
+    p1 = client.get("/api/v1/vectors/projection", headers=auth)
+    p2 = client.get("/api/v1/vectors/projection", headers=auth)
+    assert p1.status_code == 200
+    assert p2.status_code == 200
+    d1, d2 = p1.json(), p2.json()
+    assert d1["engine"] == "pca-lite"
+    assert d1["embedding"] == "hash-3gram (demo)"
+    assert d1["simulated"] is True
+    assert d1["metadata"]["engine"] == "pca-lite"
+    assert d1["metadata"]["embedding"] == "hash-3gram (demo)"
+    assert d1["metadata"]["simulated"] is True
+    # Coordinates and cluster assignments are deterministic across calls
+    coords1 = [(pt["id"], pt["x"], pt["y"], pt["z"], pt["cluster_id"]) for pt in d1["points"]]
+    coords2 = [(pt["id"], pt["x"], pt["y"], pt["z"], pt["cluster_id"]) for pt in d2["points"]]
+    assert coords1 == coords2
+
+    # Drift endpoint labels engine/embedding/simulated
+    drift_res = client.get("/api/v1/vectors/drift", headers=auth)
+    assert drift_res.status_code == 200
+    drift = drift_res.json()
+    assert drift["engine"] == "pca-lite"
+    assert drift["embedding"] == "hash-3gram (demo)"
+    assert drift["simulated"] is True
+    assert drift["metadata"]["engine"] == "pca-lite"
+    assert drift["metadata"]["embedding"] == "hash-3gram (demo)"
+    assert drift["metadata"]["simulated"] is True
+
+
+def test_vectors_api_project_isolation(client_env):
+    client, auth_a = client_env
+    auth_b = _create_project(client, "vector-isolated-proj-b")
+
+    # Ingest real OTLP trace into Project A only
+    resp_ingest = client.post(
+        "/v1/traces",
+        content=full_request().SerializeToString(),
+        headers={"Content-Type": "application/x-protobuf", **auth_a},
+    )
+    assert resp_ingest.status_code == 200
+
+    proj_a = client.get("/api/v1/vectors/projection", headers=auth_a).json()
+    proj_b = client.get("/api/v1/vectors/projection", headers=auth_b).json()
+
+    real_traces_a = {
+        p["trace_id"] for p in proj_a["points"] if p.get("trace_id") and not p["trace_id"].startswith("tr-syn-")
+    }
+    real_traces_b = {
+        p["trace_id"] for p in proj_b["points"] if p.get("trace_id") and not p["trace_id"].startswith("tr-syn-")
+    }
+    assert len(real_traces_a) > 0
+    assert real_traces_b == set()
+    assert real_traces_a.isdisjoint({p.get("trace_id") for p in proj_b["points"]})
+
+    # Drift endpoint is also independently accessible and isolated per project
+    drift_a = client.get("/api/v1/vectors/drift", headers=auth_a)
+    drift_b = client.get("/api/v1/vectors/drift", headers=auth_b)
+    assert drift_a.status_code == 200
+    assert drift_b.status_code == 200
+    assert drift_a.json()["simulated"] is True
+    assert drift_b.json()["simulated"] is True

@@ -13,7 +13,6 @@ from matrix_server.api import (
     gateway,
     ingest,
     mlops,
-    mlops_compat,
     online_evals,
     projects,
     prompts,
@@ -22,6 +21,7 @@ from matrix_server.api import (
     runs,
     safety,
     sandboxes,
+    sweeps,
     vectors,
 )
 from matrix_server.config import Settings, get_settings
@@ -74,14 +74,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         auth,
         projects,
         runs,
+        sweeps,
         # modules merged from main (ADR-013; ported to require(...) in T3)
         safety,
         vectors,
         gateway,
         mlops,
-        mlops_compat,  # deprecated /mlops/runs* and /mlops/artifacts* adapters over runs/artifacts (T4)
         benchmarks,
         sandboxes,
     ):
         app.include_router(module.router)
+    app.include_router(mlops.canonical_router)
     return app

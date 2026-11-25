@@ -8,6 +8,8 @@ import {
   MOCK_SAFETY_CATEGORIES,
 } from "./mock-data";
 import {
+  adaptSafetyData,
+  adaptSafetyScan,
   calculateSafetyScore,
   filterFindings,
   formatComplianceStatus,
@@ -335,5 +337,124 @@ describe("OWASP Top 10 data & mock API integration", () => {
     const scansAfter = await mockGet<SafetyScansResponse>("/api/v1/safety/scans");
     const found = scansAfter.scans.find((s) => s.id === createdScan.id);
     expect(found).toBeDefined();
+  });
+});
+
+describe("Safety regression guards (no fabricated Compliant / Low Risk)", () => {
+  it("summarizeScan marks categories not_evaluated with null pass_rate when findings are empty and categories_tested is empty", () => {
+    const scan: SafetyScan = {
+      id: "scan-empty-cats",
+      name: "No details scan",
+      target_model: "gpt-4o",
+      status: "completed",
+      categories_tested: [],
+      total_probes: 10,
+      probes_passed: 10,
+      probes_failed: 0,
+      safety_score: 92,
+      risk_level: "low",
+      findings_count: 0,
+      created_at: "2026-11-24T00:00:00Z",
+    };
+
+    const report = summarizeScan(scan, [], MOCK_SAFETY_CATEGORIES);
+    expect(report.category_scores.length).toBe(MOCK_SAFETY_CATEGORIES.length);
+    for (const cat of report.category_scores) {
+      expect(cat.status).toBe("not_evaluated");
+      expect(cat.pass_rate).toBeNull();
+      expect(cat.probes_tested).toBe(0);
+    }
+  });
+
+  it("summarizeScan marks categories not_evaluated when details/findings are missing despite non-empty categories_tested", () => {
+    const scan: SafetyScan = {
+      id: "scan-missing-details",
+      name: "Detail fetch failed scan",
+      target_model: "gpt-4o",
+      status: "completed",
+      categories_tested: ["LLM01", "LLM02"],
+      total_probes: 12,
+      probes_passed: 8,
+      probes_failed: 4,
+      safety_score: 70,
+      risk_level: "medium",
+      findings_count: 4,
+      created_at: "2026-11-24T00:00:00Z",
+    };
+
+    const report = summarizeScan(scan, [], MOCK_SAFETY_CATEGORIES);
+    for (const cat of report.category_scores) {
+      expect(cat.status).toBe("not_evaluated");
+      expect(cat.pass_rate).toBeNull();
+    }
+  });
+
+  it("summarizeScan treats undefined safety_score and global_score as not_evaluated instead of 100", () => {
+    const scan = {
+      id: "scan-undef-score",
+      name: "Missing score scan",
+      target_model: "gpt-4o",
+      status: "completed",
+      categories_tested: ["LLM01"],
+      total_probes: 0,
+      probes_passed: 0,
+      probes_failed: 0,
+      risk_level: undefined,
+      findings_count: 0,
+      created_at: "2026-11-24T00:00:00Z",
+    } as unknown as SafetyScan;
+
+    const report = summarizeScan(scan, [], MOCK_SAFETY_CATEGORIES);
+    expect(report.summary.not_evaluated).toBe(true);
+    expect(report.summary.score).toBeNull();
+    expect(report.summary.compliance_rate).toBeNull();
+    expect(report.summary.risk_level).toBe("not_evaluated");
+  });
+
+  it("adaptSafetyScan catches undefined/null missing scores via == null and never defaults to 100 / low", () => {
+    const onlyNullGlobal = adaptSafetyScan({
+      id: "s-1",
+      status: "completed",
+      global_score: null,
+    });
+    expect(onlyNullGlobal.safety_score).toBeNull();
+    expect(onlyNullGlobal.risk_level).toBe("not_evaluated");
+
+    const bothMissing = adaptSafetyScan({ id: "s-2" });
+    expect(bothMissing.safety_score).toBeNull();
+    expect(bothMissing.risk_level).toBe("not_evaluated");
+
+    const zeroScore = adaptSafetyScan({
+      id: "s-3",
+      status: "failed",
+      safety_score: 0,
+    });
+    expect(zeroScore.safety_score).toBe(0);
+    expect(zeroScore.risk_level).toBe("critical");
+
+    const globalOnly = adaptSafetyScan({
+      id: "s-4",
+      status: "completed",
+      global_score: 75,
+    });
+    expect(globalOnly.safety_score).toBe(75);
+    expect(globalOnly.risk_level).toBe("medium");
+
+    const adaptedNullReport = adaptSafetyData(MOCK_SAFETY_CATEGORIES, [{ id: "s-2" }], null);
+    expect(adaptedNullReport.scans[0].safety_score).toBeNull();
+    expect(adaptedNullReport.scans[0].risk_level).toBe("not_evaluated");
+  });
+
+  it("formatRiskLevel and formatComplianceStatus return Not Evaluated / Unknown on unknown values instead of Low Risk / Compliant", () => {
+    const unknownRisk = formatRiskLevel("unrecognized_risk");
+    expect(unknownRisk.label).toBe("Not Evaluated");
+    expect(unknownRisk.label).not.toBe("Low Risk");
+
+    const undefRisk = formatRiskLevel(undefined);
+    expect(undefRisk.label).toBe("Not Evaluated");
+
+    const unknownStatus = formatComplianceStatus("mystery_status");
+    expect(unknownStatus.label).toBe("Unknown");
+    expect(unknownStatus.label).not.toBe("Compliant");
   });
 });

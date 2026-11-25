@@ -2,6 +2,10 @@ import { ApiError } from "./api-error";
 import type {
   ArtifactDownloadUrlResponse,
   ArtifactRecord,
+  CanonicalSweep,
+  CanonicalSweepConfig,
+  CanonicalSweepDetail,
+  CanonicalSweepRun,
   CreateModelRequest,
   CreateModelVersionRequest,
   CreateSweepRequest,
@@ -15,7 +19,11 @@ import type {
   LineageNode,
   MLOpsSweep,
   ModelAlias,
+  ModelStage,
+  ModelStageHistoryItem,
   ModelVersion,
+  ModelWebhook,
+  ModelWebhookEvent,
   PresignArtifactUploadRequest,
   RegisteredModel,
   RegisteredModelDetail,
@@ -29,6 +37,7 @@ import type {
   TrainingRun,
   UpdateModelStageRequest,
   UpdateTrainingRunRequest,
+  WebhookDelivery,
 } from "./types";
 
 type Params = Record<string, string | number | undefined>;
@@ -39,10 +48,16 @@ interface MockMlopsState {
   sweeps: MLOpsSweep[];
   sweepTrials: Record<string, TrainingRun[]>;
   sweepAnalysis: Record<string, SweepAnalysis>;
+  canonicalSweeps: CanonicalSweep[];
+  canonicalSweepRuns: Record<string, CanonicalSweepRun[]>;
+  canonicalSweepImportance: Record<string, { importance: Record<string, number>[] | null; note: string | null }>;
   artifacts: ArtifactRecord[];
   models: RegisteredModel[];
   versionsByModel: Record<string, ModelVersion[]>;
   aliasesByModel: Record<string, Record<string, number>>;
+  stageHistoryByModel: Record<string, ModelStageHistoryItem[]>;
+  webhooksByModel: Record<string, ModelWebhook[]>;
+  deliveriesByWebhook: Record<string, WebhookDelivery[]>;
   runLineage: Record<string, LineageGraph>;
   modelLineage: Record<string, LineageGraph>;
   seq: number;
@@ -1194,6 +1209,274 @@ function buildInitialState(): MockMlopsState {
     ],
   };
 
+  const canonicalSweeps: CanonicalSweep[] = [
+    {
+      id: "swp-tpe-01",
+      name: "llama3-support-lora-tpe",
+      description: "TPE optimization over LoRA rank, alpha, LR and scheduler with ASHA early stopping.",
+      status: "running",
+      config: {
+        method: "tpe",
+        metric: { key: "eval/loss", goal: "minimize" },
+        parameters: {
+          learning_rate: { type: "float", min: 1e-5, max: 5e-4, log: true },
+          r: { type: "choice", values: [8, 16, 32, 64] },
+          lora_dropout: { type: "float", min: 0.0, max: 0.15 },
+          scheduler: { type: "choice", values: ["cosine", "linear", "constant"] },
+        },
+        early_stop: { type: "asha", min_iter: 150, eta: 3, max_iter: 1200 },
+        max_runs: 16,
+      },
+      created_at: "2026-11-12T08:00:00.000Z",
+      created_by: "admin@matrix.local",
+      run_count: 6,
+      best_run_id: "run-lora-01",
+      best_value: 0.468,
+    },
+    {
+      id: "swp-grid-02",
+      name: "mistral-qlora-rank-grid",
+      description: "Exhaustive grid over LoRA rank and learning rate for Mistral 7B QLoRA.",
+      status: "finished",
+      config: {
+        method: "grid",
+        metric: { key: "eval/loss", goal: "minimize" },
+        parameters: {
+          r: { type: "choice", values: [16, 32, 64] },
+          learning_rate: { type: "choice", values: [1e-4, 1.5e-4] },
+        },
+        early_stop: null,
+        max_runs: 6,
+      },
+      created_at: "2026-11-11T12:00:00.000Z",
+      created_by: "admin@matrix.local",
+      run_count: 3,
+      best_run_id: "run-qlora-03",
+      best_value: 0.521,
+    },
+  ];
+
+  const canonicalSweepRuns: Record<string, CanonicalSweepRun[]> = {
+    "swp-tpe-01": [
+      {
+        run_id: "run-lora-01",
+        status: "finished",
+        params: { learning_rate: 2.0e-4, r: 16, lora_dropout: 0.05, scheduler: "cosine" },
+        last_value: 0.468,
+        best_value: 0.468,
+        pruned: false,
+        step: 1200,
+      },
+      {
+        run_id: "run-sw1-06",
+        status: "finished",
+        params: { learning_rate: 2.4e-4, r: 32, lora_dropout: 0.03, scheduler: "cosine" },
+        last_value: 0.476,
+        best_value: 0.476,
+        pruned: false,
+        step: 1200,
+      },
+      {
+        run_id: "run-sw1-03",
+        status: "finished",
+        params: { learning_rate: 1.8e-4, r: 16, lora_dropout: 0.04, scheduler: "cosine" },
+        last_value: 0.489,
+        best_value: 0.489,
+        pruned: false,
+        step: 1200,
+      },
+      {
+        run_id: "run-sw1-02",
+        status: "killed",
+        params: { learning_rate: 4.5e-4, r: 64, lora_dropout: 0.12, scheduler: "constant" },
+        last_value: 0.691,
+        best_value: 0.691,
+        pruned: true,
+        step: 300,
+      },
+      {
+        run_id: "run-sw1-04",
+        status: "killed",
+        params: { learning_rate: 2.1e-5, r: 8, lora_dropout: 0.14, scheduler: "constant" },
+        last_value: 0.715,
+        best_value: 0.715,
+        pruned: true,
+        step: 300,
+      },
+      {
+        run_id: "run-sw1-10",
+        status: "running",
+        params: { learning_rate: 1.9e-4, r: 16, lora_dropout: 0.04, scheduler: "cosine" },
+        last_value: 0.492,
+        best_value: 0.492,
+        pruned: false,
+        step: 600,
+      },
+    ],
+    "swp-grid-02": [
+      {
+        run_id: "run-qlora-03",
+        status: "finished",
+        params: { r: 32, learning_rate: 1.5e-4 },
+        last_value: 0.521,
+        best_value: 0.521,
+        pruned: false,
+        step: 1000,
+      },
+      {
+        run_id: "run-sw2-03",
+        status: "finished",
+        params: { r: 32, learning_rate: 1.0e-4 },
+        last_value: 0.534,
+        best_value: 0.534,
+        pruned: false,
+        step: 1000,
+      },
+      {
+        run_id: "run-sw2-01",
+        status: "finished",
+        params: { r: 16, learning_rate: 1.0e-4 },
+        last_value: 0.562,
+        best_value: 0.562,
+        pruned: false,
+        step: 1000,
+      },
+    ],
+  };
+
+  const canonicalSweepImportance: Record<string, { importance: Record<string, number>[] | null; note: string | null }> = {
+    "swp-tpe-01": {
+      importance: [
+        { learning_rate: 0.44 },
+        { scheduler: 0.27 },
+        { r: 0.18 },
+        { lora_dropout: 0.11 },
+      ],
+      note: null,
+    },
+    "swp-grid-02": {
+      importance: null,
+      note: "At least 5 completed runs with valid metric values are required to compute hyperparameter importance.",
+    },
+  };
+
+  const stageHistoryByModel: Record<string, ModelStageHistoryItem[]> = {
+    "model-lora-01": [
+      {
+        id: "sh-lora-01",
+        project_id: "proj-default",
+        model_id: "model-lora-01",
+        version: 3,
+        from_stage: "staging",
+        to_stage: "production",
+        actor_kind: "user",
+        actor_id: "admin@matrix.local",
+        comment: "Passed OWASP safety scan (96.2) and eval gate.",
+        ts: "2026-11-12T12:30:00.000Z",
+      },
+      {
+        id: "sh-lora-02",
+        project_id: "proj-default",
+        model_id: "model-lora-01",
+        version: 1,
+        from_stage: "production",
+        to_stage: "archived",
+        actor_kind: "user",
+        actor_id: "admin@matrix.local",
+        comment: "Auto-demoted when v3 promoted to production.",
+        ts: "2026-11-12T12:30:00.000Z",
+      },
+      {
+        id: "sh-lora-03",
+        project_id: "proj-default",
+        model_id: "model-lora-01",
+        version: 2,
+        from_stage: "none",
+        to_stage: "staging",
+        actor_kind: "user",
+        actor_id: "admin@matrix.local",
+        comment: "TPE sweep trial 3 shadow candidate.",
+        ts: "2026-11-11T16:20:00.000Z",
+      },
+    ],
+    "model-llm-02": [
+      {
+        id: "sh-llm-01",
+        project_id: "proj-default",
+        model_id: "model-llm-02",
+        version: 2,
+        from_stage: "none",
+        to_stage: "staging",
+        actor_kind: "user",
+        actor_id: "admin@matrix.local",
+        comment: "RAG groundedness eval passed.",
+        ts: "2026-11-11T20:10:00.000Z",
+      },
+    ],
+    "model-cls-03": [
+      {
+        id: "sh-cls-01",
+        project_id: "proj-default",
+        model_id: "model-cls-03",
+        version: 1,
+        from_stage: "none",
+        to_stage: "production",
+        actor_kind: "user",
+        actor_id: "admin@matrix.local",
+        comment: "Initial production release.",
+        ts: "2026-11-10T15:00:00.000Z",
+      },
+    ],
+  };
+
+  const webhooksByModel: Record<string, ModelWebhook[]> = {
+    "model-lora-01": [
+      {
+        id: "wh-lora-01",
+        project_id: "proj-default",
+        model_id: "model-lora-01",
+        url: "https://ci.acme.internal/hooks/matrix-deploy",
+        events: ["stage.changed", "alias.moved"],
+        active: true,
+        created_by: "admin@matrix.local",
+        created_at: "2026-11-10T10:00:00.000Z",
+      },
+    ],
+  };
+
+  const deliveriesByWebhook: Record<string, WebhookDelivery[]> = {
+    "wh-lora-01": [
+      {
+        id: "del-01",
+        project_id: "proj-default",
+        webhook_id: "wh-lora-01",
+        model_id: "model-lora-01",
+        event: "stage.changed",
+        status: "delivered",
+        attempts: 1,
+        last_status_code: 200,
+        last_error: null,
+        created_at: "2026-11-12T12:30:02.000Z",
+        last_attempt_at: "2026-11-12T12:30:03.000Z",
+        delivered_at: "2026-11-12T12:30:03.000Z",
+      },
+      {
+        id: "del-02",
+        project_id: "proj-default",
+        webhook_id: "wh-lora-01",
+        model_id: "model-lora-01",
+        event: "alias.moved",
+        status: "delivered",
+        attempts: 1,
+        last_status_code: 202,
+        last_error: null,
+        created_at: "2026-11-12T12:31:00.000Z",
+        last_attempt_at: "2026-11-12T12:31:01.000Z",
+        delivered_at: "2026-11-12T12:31:01.000Z",
+      },
+    ],
+  };
+
   return {
     runs,
     seriesByRun,
@@ -1203,10 +1486,16 @@ function buildInitialState(): MockMlopsState {
       [gridSweep.id]: gridTrialRuns,
     },
     sweepAnalysis,
+    canonicalSweeps,
+    canonicalSweepRuns,
+    canonicalSweepImportance,
     artifacts,
     models,
     versionsByModel,
     aliasesByModel,
+    stageHistoryByModel,
+    webhooksByModel,
+    deliveriesByWebhook,
     runLineage: {
       "run-lora-01": { run_id: "run-lora-01", nodes: loraLineageNodes, edges: loraLineageEdges },
       "run-qlora-03": { run_id: "run-qlora-03", nodes: llmLineage.nodes, edges: llmLineage.edges },
@@ -1263,44 +1552,6 @@ export function mlopsGet(path: string, params: Params = {}): unknown {
   const s = state();
   let m: RegExpExecArray | null;
 
-  if (path === "/api/v1/mlops/runs") {
-    let items = [...s.runs];
-    if (params.status) items = items.filter((r) => r.status === String(params.status));
-    if (params.sweep_id) items = items.filter((r) => r.sweep_id === String(params.sweep_id));
-    if (params.run_type) items = items.filter((r) => r.run_type === String(params.run_type));
-    if (params.base_model) items = items.filter((r) => r.base_model === String(params.base_model));
-    const limit = Math.min(500, Math.max(1, Number(params.limit ?? 50)));
-    const offset = Number(params.cursor ?? 0) || 0;
-    const slice = items.slice(offset, offset + limit);
-    return {
-      items: slice,
-      next_cursor: offset + limit < items.length ? String(offset + limit) : null,
-    };
-  }
-
-  if ((m = /^\/api\/v1\/mlops\/runs\/([^/]+)\/metrics$/.exec(path))) {
-    const runId = m[1];
-    const run = s.runs.find((r) => r.id === runId);
-    if (!run) throw new ApiError(404, "training run not found");
-    const allSeries = s.seriesByRun[runId] ?? {};
-    const requestedNames = params.metric_names
-      ? String(params.metric_names)
-          .split(",")
-          .map((x) => x.trim())
-          .filter(Boolean)
-      : null;
-    const minStep = params.min_step !== undefined ? Number(params.min_step) : -Infinity;
-    const maxStep = params.max_step !== undefined ? Number(params.max_step) : Infinity;
-
-    const series: Record<string, TrainingMetricPoint[]> = {};
-    for (const [k, pts] of Object.entries(allSeries)) {
-      if (requestedNames && !requestedNames.includes(k)) continue;
-      series[k] = pts.filter((pt) => pt.step >= minStep && pt.step <= maxStep);
-    }
-    const resp: TrainingMetricSeries = { run_id: runId, series };
-    return resp;
-  }
-
   if ((m = /^\/api\/v1\/mlops\/runs\/([^/]+)\/lineage$/.exec(path))) {
     const runId = m[1];
     const run = s.runs.find((r) => r.id === runId);
@@ -1320,57 +1571,6 @@ export function mlopsGet(path: string, params: Params = {}): unknown {
         edges: [],
       }
     );
-  }
-
-  if ((m = /^\/api\/v1\/mlops\/runs\/([^/]+)$/.exec(path))) {
-    const runId = m[1];
-    const run = s.runs.find((r) => r.id === runId);
-    if (!run) throw new ApiError(404, "training run not found");
-    const artifacts = s.artifacts.filter((a) => a.run_id === run.id);
-    return { ...run, artifacts };
-  }
-
-  if (path === "/api/v1/mlops/sweeps") {
-    return { items: [...s.sweeps] };
-  }
-
-  if ((m = /^\/api\/v1\/mlops\/sweeps\/([^/]+)$/.exec(path))) {
-    const sweepId = m[1];
-    const sweep = s.sweeps.find((sw) => sw.id === sweepId);
-    if (!sweep) throw new ApiError(404, "sweep not found");
-    const detail: SweepDetail = {
-      ...sweep,
-      trials: s.sweepTrials[sweepId] ?? [],
-      analysis: s.sweepAnalysis[sweepId] ?? {
-        metric_name: sweep.metric_name,
-        metric_goal: sweep.metric_goal,
-        importance: [],
-        parallel_coordinates: { axes: [], trials: [] },
-      },
-    };
-    return detail;
-  }
-
-  if (path === "/api/v1/mlops/artifacts") {
-    let items = [...s.artifacts];
-    if (params.run_id) items = items.filter((a) => a.run_id === String(params.run_id));
-    if (params.kind) items = items.filter((a) => a.kind === String(params.kind));
-    if (params.status) items = items.filter((a) => a.status === String(params.status));
-    if (params.name) items = items.filter((a) => a.name === String(params.name));
-    return { items };
-  }
-
-  if ((m = /^\/api\/v1\/mlops\/artifacts\/([^/]+)\/download-url$/.exec(path))) {
-    const art = s.artifacts.find((a) => a.id === m![1]);
-    if (!art) throw new ApiError(404, "artifact not found");
-    const resp: ArtifactDownloadUrlResponse = {
-      artifact_id: art.id,
-      download_url: `https://mock-storage.matrix.local/download/${art.id}?sha256=${art.sha256}`,
-      storage_backend: art.storage_backend,
-      sha256: art.sha256,
-      size_bytes: art.size_bytes,
-    };
-    return resp;
   }
 
   if (path === "/api/v1/mlops/models") {
@@ -1396,202 +1596,119 @@ export function mlopsGet(path: string, params: Params = {}): unknown {
     return detail;
   }
 
+  // ── Canonical G2 Sweeps (/api/v1/sweeps*) ──────────────────────────────
+  if (path === "/api/v1/sweeps") {
+    let items = [...s.canonicalSweeps];
+    if (params.status) items = items.filter((sw) => sw.status === String(params.status));
+    if (params.method) items = items.filter((sw) => sw.config.method === String(params.method));
+    return { items, next_cursor: null };
+  }
+
+  if ((m = /^\/api\/v1\/sweeps\/([^/]+)$/.exec(path))) {
+    const sweepId = m[1];
+    const sweep = s.canonicalSweeps.find((sw) => sw.id === sweepId);
+    if (!sweep) throw new ApiError(404, "sweep not found");
+    const imp = s.canonicalSweepImportance[sweepId] ?? { importance: null, note: null };
+    const detail: CanonicalSweepDetail = {
+      sweep,
+      runs: s.canonicalSweepRuns[sweepId] ?? [],
+      importance: imp.importance,
+      importance_note: imp.note,
+    };
+    return detail;
+  }
+
+  // ── Canonical Artifacts (/api/v1/artifacts*) ───────────────────────────
+  if (path === "/api/v1/artifacts") {
+    let items = [...s.artifacts];
+    if (params.run_id) items = items.filter((a) => a.run_id === String(params.run_id));
+    if (params.kind) items = items.filter((a) => a.kind === String(params.kind));
+    if (params.status) items = items.filter((a) => a.status === String(params.status));
+    if (params.name) items = items.filter((a) => a.name === String(params.name));
+    return { items, next_cursor: null };
+  }
+
+  if ((m = /^\/api\/v1\/artifacts\/([^/]+)\/download-url$/.exec(path))) {
+    const art = s.artifacts.find((a) => a.id === m![1]);
+    if (!art) throw new ApiError(404, "artifact not found");
+    const resp: ArtifactDownloadUrlResponse = {
+      artifact_id: art.id,
+      download_url: `https://mock-storage.matrix.local/download/${art.id}?sha256=${art.sha256}`,
+      storage_backend: art.storage_backend,
+      sha256: art.sha256,
+      size_bytes: art.size_bytes,
+    };
+    return resp;
+  }
+
+  // ── Canonical G3 Model Registry (/api/v1/models*) ──────────────────────
+  if (path === "/api/v1/models") {
+    return { items: s.models.map((mod) => ({ ...mod })) };
+  }
+
+  if ((m = /^\/api\/v1\/models\/([^/]+)\/history$/.exec(path))) {
+    const modelId = m[1];
+    const mod = s.models.find((x) => x.id === modelId);
+    if (!mod) throw new ApiError(404, "registered model not found");
+    return { items: [...(s.stageHistoryByModel[modelId] ?? [])] };
+  }
+
+  if ((m = /^\/api\/v1\/models\/([^/]+)\/webhooks$/.exec(path))) {
+    const modelId = m[1];
+    const mod = s.models.find((x) => x.id === modelId);
+    if (!mod) throw new ApiError(404, "registered model not found");
+    return { items: [...(s.webhooksByModel[modelId] ?? [])] };
+  }
+
+  if ((m = /^\/api\/v1\/models\/([^/]+)\/webhooks\/([^/]+)\/deliveries$/.exec(path))) {
+    const webhookId = m[2];
+    return { items: [...(s.deliveriesByWebhook[webhookId] ?? [])] };
+  }
+
+  if ((m = /^\/api\/v1\/models\/([^/]+)$/.exec(path))) {
+    const modelId = m[1];
+    const mod = s.models.find((x) => x.id === modelId);
+    if (!mod) throw new ApiError(404, "registered model not found");
+    const detail: RegisteredModelDetail = {
+      ...mod,
+      versions: [...(s.versionsByModel[modelId] ?? [])],
+      aliases: { ...(s.aliasesByModel[modelId] ?? {}) },
+    };
+    return detail;
+  }
+
+  // ── Canonical Bounded Lineage (/api/v1/lineage) ────────────────────────
+  if (path === "/api/v1/lineage") {
+    const nodeRef = String(params.node ?? "model_version:mv-lora-v3");
+    const rawDirection = String(params.direction ?? "both");
+    const direction: "up" | "down" | "both" =
+      rawDirection === "up" || rawDirection === "upstream"
+        ? "up"
+        : rawDirection === "down" || rawDirection === "downstream"
+          ? "down"
+          : "both";
+    const depth = Math.min(5, Math.max(1, Number(params.depth ?? 3) || 3));
+    // Match against known model or run lineage graphs, falling back to lora lineage
+    const baseGraph =
+      Object.values(s.modelLineage).find((g) => g.nodes.some((n) => n.id === nodeRef || n.entity_id === nodeRef)) ??
+      Object.values(s.runLineage).find((g) => g.nodes.some((n) => n.id === nodeRef || n.entity_id === nodeRef)) ??
+      s.modelLineage["model-lora-01"];
+    return {
+      root: nodeRef,
+      direction,
+      depth,
+      truncated: depth < 2 || params.truncated === "true",
+      nodes: baseGraph.nodes,
+      edges: baseGraph.edges,
+    } satisfies LineageGraph;
+  }
+
   return undefined;
 }
 
 export function mlopsSend(method: string, path: string, body?: unknown): unknown {
   const s = state();
   let m: RegExpExecArray | null;
-
-  if (method === "POST" && path === "/api/v1/mlops/runs") {
-    const req = (body ?? {}) as CreateTrainingRunRequest;
-    const now = new Date().toISOString();
-    const run: TrainingRun = {
-      id: nextId("run"),
-      project_id: "proj-default",
-      name: req.name || "untitled-run",
-      run_type: req.run_type ?? "sft",
-      status: req.status ?? "running",
-      base_model: req.base_model ?? null,
-      dataset_id: req.dataset_id ?? null,
-      sweep_id: req.sweep_id ?? null,
-      parent_run_id: req.parent_run_id ?? null,
-      hyperparams: req.hyperparams ?? {},
-      summary_metrics: {},
-      latest_metrics: {},
-      hardware_info: req.hardware_info ?? null,
-      classic_eval: req.classic_eval ?? null,
-      tags: req.tags ?? [],
-      total_steps: 0,
-      error: null,
-      last_heartbeat_at: now,
-      created_at: now,
-      started_at: (req.status ?? "running") === "running" ? now : null,
-      finished_at: null,
-    };
-    s.runs.unshift(run);
-    s.seriesByRun[run.id] = {};
-    return run;
-  }
-
-  if (method === "PATCH" && (m = /^\/api\/v1\/mlops\/runs\/([^/]+)$/.exec(path))) {
-    const run = s.runs.find((r) => r.id === m![1]);
-    if (!run) throw new ApiError(404, "training run not found");
-    const req = (body ?? {}) as UpdateTrainingRunRequest;
-    if (req.status !== undefined) run.status = req.status;
-    if (req.total_steps !== undefined) run.total_steps = req.total_steps;
-    if (req.hardware_info !== undefined) run.hardware_info = req.hardware_info;
-    if (req.classic_eval !== undefined) run.classic_eval = req.classic_eval;
-    if (req.summary_metrics !== undefined) {
-      run.summary_metrics = { ...run.summary_metrics, ...req.summary_metrics };
-      run.latest_metrics = { ...run.summary_metrics };
-    }
-    if (req.error !== undefined) run.error = req.error;
-    if (req.finished_at !== undefined) run.finished_at = req.finished_at;
-    return run;
-  }
-
-  if (method === "POST" && (m = /^\/api\/v1\/mlops\/runs\/([^/]+)\/metrics$/.exec(path))) {
-    const run = s.runs.find((r) => r.id === m![1]);
-    if (!run) throw new ApiError(404, "training run not found");
-    const req = (body ?? { points: [] }) as IngestMetricsRequest;
-    const series = (s.seriesByRun[run.id] ??= {});
-    let accepted = 0;
-    for (const pt of req.points ?? []) {
-      const arr = (series[pt.metric_name] ??= []);
-      arr.push({
-        step: pt.step,
-        value: pt.value,
-        epoch: pt.epoch ?? null,
-        recorded_at: pt.recorded_at ?? new Date().toISOString(),
-      });
-      run.summary_metrics[pt.metric_name] = pt.value;
-      run.latest_metrics[pt.metric_name] = pt.value;
-      run.total_steps = Math.max(run.total_steps ?? 0, pt.step);
-      accepted += 1;
-    }
-    run.last_heartbeat_at = new Date().toISOString();
-    const resp: IngestMetricsResponse = { accepted, should_stop: false, stop_reason: null };
-    return resp;
-  }
-
-  if (method === "POST" && path === "/api/v1/mlops/sweeps") {
-    const req = (body ?? {}) as CreateSweepRequest;
-    const sweep: MLOpsSweep = {
-      id: nextId("sweep"),
-      project_id: "proj-default",
-      name: req.name || "untitled-sweep",
-      description: req.description ?? null,
-      method: req.method ?? "random",
-      metric_name: req.metric_name || "eval/loss",
-      metric_goal: req.metric_goal ?? "minimize",
-      search_space: req.search_space ?? {},
-      early_stopping: req.early_stopping ?? null,
-      max_trials: req.max_trials ?? null,
-      status: "running",
-      best_run_id: null,
-      best_metric_value: null,
-      created_at: new Date().toISOString(),
-      stopped_at: null,
-    };
-    s.sweeps.unshift(sweep);
-    s.sweepTrials[sweep.id] = [];
-    s.sweepAnalysis[sweep.id] = {
-      metric_name: sweep.metric_name,
-      metric_goal: sweep.metric_goal,
-      importance: [],
-      parallel_coordinates: { axes: [], trials: [] },
-    };
-    return sweep;
-  }
-
-  if (method === "POST" && (m = /^\/api\/v1\/mlops\/sweeps\/([^/]+)\/trials\/next$/.exec(path))) {
-    const sweep = s.sweeps.find((sw) => sw.id === m![1]);
-    if (!sweep) throw new ApiError(404, "sweep not found");
-    const req = (body ?? {}) as SuggestNextTrialRequest;
-    const existing = s.sweepTrials[sweep.id] ?? [];
-    const idx = existing.length;
-    const now = new Date().toISOString();
-    const hyperparams = { learning_rate: 1.5e-4, r: 16 };
-    const run: TrainingRun = {
-      id: nextId("run"),
-      project_id: "proj-default",
-      name: req.name || `${sweep.name}-trial-${idx + 1}`,
-      run_type: req.run_type ?? "lora",
-      status: "running",
-      base_model: req.base_model ?? "meta-llama/Llama-3.1-8B-Instruct",
-      dataset_id: req.dataset_id ?? null,
-      sweep_id: sweep.id,
-      parent_run_id: null,
-      hyperparams,
-      summary_metrics: {},
-      latest_metrics: {},
-      hardware_info: null,
-      classic_eval: null,
-      tags: req.tags ?? ["sweep"],
-      total_steps: 0,
-      error: null,
-      last_heartbeat_at: now,
-      created_at: now,
-      started_at: now,
-      finished_at: null,
-    };
-    existing.push(run);
-    s.sweepTrials[sweep.id] = existing;
-    s.runs.unshift(run);
-    const resp: SuggestNextTrialResponse = {
-      sweep_id: sweep.id,
-      trial_index: idx,
-      hyperparams,
-      run,
-    };
-    return resp;
-  }
-
-  if (method === "POST" && (m = /^\/api\/v1\/mlops\/sweeps\/([^/]+)\/stop$/.exec(path))) {
-    const sweep = s.sweeps.find((sw) => sw.id === m![1]);
-    if (!sweep) throw new ApiError(404, "sweep not found");
-    sweep.status = "cancelled";
-    sweep.stopped_at = new Date().toISOString();
-    return { ...sweep, stopped: true };
-  }
-
-  if (method === "POST" && path === "/api/v1/mlops/artifacts/presign-upload") {
-    const req = (body ?? {}) as PresignArtifactUploadRequest;
-    const existing = s.artifacts.find(
-      (a) => a.sha256 === req.sha256 && a.status === "committed",
-    );
-    const now = new Date().toISOString();
-    const art: ArtifactRecord = {
-      id: nextId("art"),
-      project_id: "proj-default",
-      run_id: req.run_id ?? null,
-      name: req.name,
-      kind: req.kind ?? "checkpoint",
-      version: s.artifacts.filter((a) => a.name === req.name).length + 1,
-      storage_backend: req.external_uri ? "external" : "local",
-      storage_uri: req.external_uri ?? existing?.storage_uri ?? `local://proj-default/${req.sha256}`,
-      sha256: req.sha256,
-      size_bytes: req.size_bytes,
-      content_type: req.content_type ?? "application/octet-stream",
-      status: existing ? "committed" : "pending_upload",
-      metadata: req.metadata ?? {},
-      created_at: now,
-      committed_at: existing ? now : null,
-      deduplicated: Boolean(existing),
-      upload_url: existing || req.external_uri ? null : `https://mock-storage.matrix.local/upload/${req.sha256}`,
-    };
-    s.artifacts.unshift(art);
-    return art;
-  }
-
-  if (method === "POST" && (m = /^\/api\/v1\/mlops\/artifacts\/([^/]+)\/commit$/.exec(path))) {
-    const art = s.artifacts.find((a) => a.id === m![1]);
-    if (!art) throw new ApiError(404, "artifact not found");
-    art.status = "committed";
-    art.committed_at = art.committed_at ?? new Date().toISOString();
-    return art;
-  }
 
   if (method === "POST" && path === "/api/v1/mlops/models") {
     const req = (body ?? {}) as CreateModelRequest;
@@ -1706,6 +1823,186 @@ export function mlopsSend(method: string, path: string, body?: unknown): unknown
       version: mv.version,
     };
     return resp;
+  }
+
+  // ── Canonical G2 Sweeps write routes (/api/v1/sweeps*) ─────────────────
+  if (method === "POST" && path === "/api/v1/sweeps") {
+    const req = (body ?? {}) as { name?: string; description?: string | null; config?: CanonicalSweepConfig };
+    const name = (req.name ?? "").trim();
+    if (!name) throw new ApiError(422, "sweep name is required");
+    const cfg: CanonicalSweepConfig = req.config ?? {
+      method: "random",
+      metric: { key: "eval/loss", goal: "minimize" },
+      parameters: {},
+    };
+    const sweep: CanonicalSweep = {
+      id: nextId("swp"),
+      name,
+      description: req.description ?? null,
+      status: "running",
+      config: cfg,
+      created_at: new Date().toISOString(),
+      created_by: "admin@matrix.local",
+      run_count: 0,
+      best_run_id: null,
+      best_value: null,
+    };
+    s.canonicalSweeps.unshift(sweep);
+    s.canonicalSweepRuns[sweep.id] = [];
+    s.canonicalSweepImportance[sweep.id] = {
+      importance: null,
+      note: "Importance requires at least 5 completed runs.",
+    };
+    return sweep;
+  }
+
+  if (method === "PATCH" && (m = /^\/api\/v1\/sweeps\/([^/]+)$/.exec(path))) {
+    const sweep = s.canonicalSweeps.find((sw) => sw.id === m![1]);
+    if (!sweep) throw new ApiError(404, "sweep not found");
+    const req = (body ?? {}) as { status?: CanonicalSweep["status"]; name?: string; description?: string | null };
+    if (req.status) {
+      sweep.status = req.status;
+    }
+    if (req.name !== undefined) sweep.name = req.name;
+    if (req.description !== undefined) sweep.description = req.description;
+    return sweep;
+  }
+
+  if (method === "DELETE" && (m = /^\/api\/v1\/sweeps\/([^/]+)$/.exec(path))) {
+    const idx = s.canonicalSweeps.findIndex((sw) => sw.id === m![1]);
+    if (idx === -1) throw new ApiError(404, "sweep not found");
+    const [removed] = s.canonicalSweeps.splice(idx, 1);
+    delete s.canonicalSweepRuns[removed.id];
+    delete s.canonicalSweepImportance[removed.id];
+    return { deleted: true, id: removed.id };
+  }
+
+  // ── Canonical G3 Model Registry write routes (/api/v1/models*) ─────────
+  if (
+    method === "POST" &&
+    (m = /^\/api\/v1\/models\/([^/]+)\/versions\/(\d+)\/stage$/.exec(path))
+  ) {
+    const mod = s.models.find((x) => x.id === m![1]);
+    if (!mod) throw new ApiError(404, "registered model not found");
+    const verNum = Number(m[2]);
+    const versions = s.versionsByModel[mod.id] ?? [];
+    const mv = versions.find((v) => v.version === verNum);
+    if (!mv) throw new ApiError(404, "model version not found");
+    const req = (body ?? {}) as { stage: ModelStage; comment?: string | null };
+    const now = new Date().toISOString();
+    const history = (s.stageHistoryByModel[mod.id] ??= []);
+
+    // Enforce unique production stage: auto-archive any existing production version
+    if (req.stage === "production") {
+      for (const other of versions) {
+        if (other.version !== mv.version && other.stage === "production") {
+          history.unshift({
+            id: nextId("sh"),
+            project_id: "proj-default",
+            model_id: mod.id,
+            version: other.version,
+            from_stage: "production",
+            to_stage: "archived",
+            actor_kind: "user",
+            actor_id: "admin@matrix.local",
+            comment: `Auto-demoted when v${mv.version} promoted to production.`,
+            ts: now,
+          });
+          other.stage = "archived";
+        }
+      }
+    }
+
+    const fromStage = mv.stage;
+    mv.stage = req.stage;
+    history.unshift({
+      id: nextId("sh"),
+      project_id: "proj-default",
+      model_id: mod.id,
+      version: mv.version,
+      from_stage: fromStage,
+      to_stage: req.stage,
+      actor_kind: "user",
+      actor_id: "admin@matrix.local",
+      comment: req.comment ?? null,
+      ts: now,
+    });
+    syncModelSummary(mod);
+    return mv;
+  }
+
+  if (
+    method === "PUT" &&
+    (m = /^\/api\/v1\/models\/([^/]+)\/aliases\/([^/]+)$/.exec(path))
+  ) {
+    const mod = s.models.find((x) => x.id === m![1]);
+    if (!mod) throw new ApiError(404, "registered model not found");
+    const alias = decodeURIComponent(m[2]).trim().replace(/^@/, "");
+    const req = (body ?? {}) as { version: number };
+    const mv = (s.versionsByModel[mod.id] ?? []).find((v) => v.version === req.version);
+    if (!mv) throw new ApiError(404, "model version not found");
+    const aliases = (s.aliasesByModel[mod.id] ??= {});
+    aliases[alias] = req.version;
+    syncModelSummary(mod);
+    return { model_id: mod.id, alias, version: req.version } satisfies ModelAlias;
+  }
+
+  if (
+    method === "DELETE" &&
+    (m = /^\/api\/v1\/models\/([^/]+)\/aliases\/([^/]+)$/.exec(path))
+  ) {
+    const mod = s.models.find((x) => x.id === m![1]);
+    if (!mod) throw new ApiError(404, "registered model not found");
+    const alias = decodeURIComponent(m[2]);
+    if (s.aliasesByModel[mod.id]) {
+      delete s.aliasesByModel[mod.id][alias];
+    }
+    syncModelSummary(mod);
+    return { deleted: true, alias };
+  }
+
+  if (method === "POST" && (m = /^\/api\/v1\/models\/([^/]+)\/webhooks$/.exec(path))) {
+    const mod = s.models.find((x) => x.id === m![1]);
+    if (!mod) throw new ApiError(404, "registered model not found");
+    const req = (body ?? {}) as { url?: string; events?: ModelWebhookEvent[] };
+    const url = (req.url ?? "").trim();
+    if (!url || !/^https?:\/\//i.test(url)) {
+      throw new ApiError(422, "Webhook URL must start with http:// or https://");
+    }
+    const events: ModelWebhookEvent[] =
+      req.events && req.events.length > 0 ? req.events : ["stage.changed"];
+    const wh: ModelWebhook = {
+      id: nextId("wh"),
+      project_id: "proj-default",
+      model_id: mod.id,
+      url,
+      events,
+      active: true,
+      created_by: "admin@matrix.local",
+      created_at: new Date().toISOString(),
+    };
+    const list = (s.webhooksByModel[mod.id] ??= []);
+    list.unshift(wh);
+    s.deliveriesByWebhook[wh.id] = [];
+    // Return one-time secret only on creation
+    return {
+      ...wh,
+      secret: `whsec_mock_${wh.id}_${Math.random().toString(36).slice(2, 14)}`,
+    };
+  }
+
+  if (
+    method === "DELETE" &&
+    (m = /^\/api\/v1\/models\/([^/]+)\/webhooks\/([^/]+)$/.exec(path))
+  ) {
+    const mod = s.models.find((x) => x.id === m![1]);
+    if (!mod) throw new ApiError(404, "registered model not found");
+    const list = s.webhooksByModel[mod.id] ?? [];
+    const idx = list.findIndex((w) => w.id === m![2]);
+    if (idx === -1) throw new ApiError(404, "webhook not found");
+    const [removed] = list.splice(idx, 1);
+    delete s.deliveriesByWebhook[removed.id];
+    return { deleted: true, id: removed.id };
   }
 
   return undefined;

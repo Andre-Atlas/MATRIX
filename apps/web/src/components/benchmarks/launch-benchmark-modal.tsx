@@ -2,6 +2,7 @@
 
 import React, { useEffect, useId, useRef, useState } from "react";
 import { PRIMARY_BTN_CLASS } from "@/lib/mlops-tokens";
+import { proxy } from "@/lib/proxy-client";
 import type {
   BenchmarkCatalogTask,
   BenchmarkEvalMode,
@@ -131,18 +132,7 @@ export function LaunchBenchmarkModal({
     };
 
     try {
-      const res = await fetch("/api/proxy/api/v1/benchmarks/runs", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(text || `Request failed with status ${res.status}`);
-      }
-
-      const createdRun = (await res.json()) as BenchmarkRun;
+      const createdRun = await proxy<BenchmarkRun>("POST", "benchmarks/runs", payload);
       onCreated(createdRun);
       onClose();
     } catch (err) {

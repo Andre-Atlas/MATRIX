@@ -42,12 +42,18 @@ class VectorProjectionMetadata(BaseModel):
     total_documents: int
     total_gaps: int
     gap_ratio: float
+    engine: str = "pca-lite"
+    embedding: str = "hash-3gram (demo)"
+    simulated: bool = True
 
 
 class VectorProjectionResponse(BaseModel):
     points: list[VectorPoint]
     clusters: list[ClusterSummary]
     metadata: VectorProjectionMetadata
+    engine: str = "pca-lite"
+    embedding: str = "hash-3gram (demo)"
+    simulated: bool = True
 
 
 # --- Helpers for Span Extraction and Synthetic Fallbacks ---
@@ -60,11 +66,14 @@ def _extract_items_from_spans(
 ) -> tuple[list[QueryItem], list[DocumentItem]]:
     """Extracts queries and retrieved documents from stored project spans."""
     traces, _ = store.list_traces(project_id=project_id, limit=max_traces)
+    if not traces:
+        return [], []
+    by_trace = store.get_traces_batch(project_id, [t.trace_id for t in traces])
     queries: list[QueryItem] = []
     documents: list[DocumentItem] = []
 
     for t in traces:
-        res = store.get_trace(project_id=project_id, trace_id=t.trace_id)
+        res = by_trace.get(t.trace_id)
         if not res:
             continue
         summary, spans = res
@@ -243,18 +252,21 @@ def get_vector_drift(
 
     # Check if real spans allow direct computation
     if len(traces_ref) >= 5 and len(traces_prod) >= 3:
+        all_trace_ids = [t.trace_id for t in traces_ref] + [t.trace_id for t in traces_prod]
+        by_trace = store.get_traces_batch(principal.project_id, all_trace_ids)
+
         ref_queries: list[QueryItem] = []
         prod_queries: list[QueryItem] = []
 
         for t in traces_ref:
-            res = store.get_trace(project_id=principal.project_id, trace_id=t.trace_id)
+            res = by_trace.get(t.trace_id)
             if res and res[1]:
                 s = res[1][0]
                 if s.input:
                     ref_queries.append(QueryItem(id=s.span_id, text=s.input))
 
         for t in traces_prod:
-            res = store.get_trace(project_id=principal.project_id, trace_id=t.trace_id)
+            res = by_trace.get(t.trace_id)
             if res and res[1]:
                 s = res[1][0]
                 if s.input:
@@ -323,6 +335,9 @@ def get_vector_drift(
 
     return DriftReport(
         status=status,
+        engine="pca-lite",
+        embedding="hash-3gram (demo)",
+        simulated=True,
         metrics={
             "jsd": jsd,
             "psi": psi,
@@ -339,6 +354,9 @@ def get_vector_drift(
             "reference_window_days": reference_window_days,
             "production_window_days": production_window_days,
             "num_clusters": num_clusters,
-            "mode": "computed",
+            "engine": "pca-lite",
+            "embedding": "hash-3gram (demo)",
+            "simulated": True,
+            "mode": "demo",
         },
     )

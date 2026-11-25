@@ -5,6 +5,7 @@ import Link from "next/link";
 import { formatTimestamp } from "@/lib/format";
 import { inputPreview } from "@/lib/eval-matrix";
 import { PRIMARY_BTN_CLASS } from "@/lib/mlops-tokens";
+import { proxy } from "@/lib/proxy-client";
 import type { Dataset, DatasetBranch, DatasetCommit, DatasetCommitItem, DatasetItem } from "@/lib/types";
 import { EmptyState, Mono, td, th } from "@/components/ui";
 import { AddItemForm } from "@/components/evals/add-item-form";
@@ -56,30 +57,22 @@ export function DatasetStudioClient({
       try {
         setLoadingItems(true);
         // Fetch commits for this branch
-        const commitsRes = await fetch(
-          `/api/proxy/api/v1/datasets/${encodeURIComponent(dataset.id)}/commits?branch=${encodeURIComponent(
-            activeBranch
-          )}`
+        const cData = await proxy<{ items?: DatasetCommit[] }>(
+          "GET",
+          `datasets/${encodeURIComponent(dataset.id)}/commits?branch=${encodeURIComponent(activeBranch)}`,
         );
-        if (commitsRes.ok) {
-          const cData = await commitsRes.json();
-          if (!cancelled && Array.isArray(cData.items)) {
-            setCommits(cData.items);
-            const head = cData.items[0];
-            if (head) {
-              // Fetch items for head commit
-              const itemsRes = await fetch(
-                `/api/proxy/api/v1/datasets/${encodeURIComponent(dataset.id)}/commits/${encodeURIComponent(
-                  head.id
-                )}/items`
-              );
-              if (itemsRes.ok) {
-                const iData = await itemsRes.json();
-                if (!cancelled && Array.isArray(iData.items) && iData.items.length > 0) {
-                  setItems(iData.items);
-                  return;
-                }
-              }
+        if (!cancelled && Array.isArray(cData?.items)) {
+          setCommits(cData.items);
+          const head = cData.items[0];
+          if (head) {
+            // Fetch items for head commit
+            const iData = await proxy<{ items?: DatasetCommitItem[] }>(
+              "GET",
+              `datasets/${encodeURIComponent(dataset.id)}/commits/${encodeURIComponent(head.id)}/items`,
+            );
+            if (!cancelled && Array.isArray(iData?.items) && iData.items.length > 0) {
+              setItems(iData.items);
+              return;
             }
           }
         }

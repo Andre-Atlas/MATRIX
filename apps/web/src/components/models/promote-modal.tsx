@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getAliasStyle, getModelStageStyle, PRIMARY_BTN_CLASS } from "@/lib/mlops-tokens";
+import { explain, proxy } from "@/lib/proxy-client";
 import type { ModelStage, ModelVersion, RegisteredModelDetail } from "@/lib/types";
 
 export interface PromoteModalProps {
@@ -32,16 +33,30 @@ export function PromoteModal({
 }: PromoteModalProps) {
   const [activeMode, setActiveMode] = useState<"stage" | "alias">(initialMode);
   const [targetStage, setTargetStage] = useState<ModelStage>(version.stage);
+  const [comment, setComment] = useState<string>("");
   const [aliasInput, setAliasInput] = useState<string>("champion");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
 
   useEffect(() => {
+    if (open) {
+      previousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    }
     if (!open) return;
     setActiveMode(initialMode);
     setTargetStage(version.stage);
+    setComment("");
     setAliasInput(initialMode === "alias" ? "champion" : "challenger");
     setError(null);
+    const id = requestAnimationFrame(() => dialogRef.current?.focus());
+    return () => {
+      cancelAnimationFrame(id);
+      previousFocusRef.current?.focus();
+    };
   }, [open, initialMode, version]);
 
   useEffect(() => {
@@ -49,12 +64,12 @@ export function PromoteModal({
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
-        onClose();
+        onCloseRef.current();
       }
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [open, onClose]);
+  }, [open]);
 
   if (!open) return null;
 
@@ -83,40 +98,29 @@ export function PromoteModal({
 
     try {
       if (activeMode === "stage") {
-        const res = await fetch(
-          `/api/proxy/api/v1/mlops/models/${encodeURIComponent(model.id)}/versions/${version.version}/stage`,
+        await proxy(
+          "POST",
+          `models/${encodeURIComponent(model.id)}/versions/${version.version}/stage`,
           {
-            method: "PATCH",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ stage: targetStage }),
+            stage: targetStage,
+            ...(comment.trim() ? { comment: comment.trim() } : {}),
           },
         );
-        if (!res.ok) {
-          const text = await res.text();
-          throw new Error(text || `Failed to update stage (${res.status})`);
-        }
       } else {
         if (!normalizedAlias) {
           throw new Error("Alias name is required.");
         }
-        const res = await fetch(
-          `/api/proxy/api/v1/mlops/models/${encodeURIComponent(model.id)}/aliases`,
-          {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ alias: normalizedAlias, version: version.version }),
-          },
+        await proxy(
+          "PUT",
+          `models/${encodeURIComponent(model.id)}/aliases/${encodeURIComponent(normalizedAlias)}`,
+          { version: version.version },
         );
-        if (!res.ok) {
-          const text = await res.text();
-          throw new Error(text || `Failed to assign alias (${res.status})`);
-        }
       }
 
       await onSuccess();
       onClose();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Operation failed");
+      setError(explain(err));
     } finally {
       setSubmitting(false);
     }
@@ -130,10 +134,12 @@ export function PromoteModal({
       }}
     >
       <div
+        ref={dialogRef}
+        tabIndex={-1}
         role="dialog"
         aria-modal="true"
         aria-labelledby="promote-modal-title"
-        className="w-full max-w-lg rounded-lg border border-zinc-800 bg-zinc-950 p-5 shadow-2xl"
+        className="w-full max-w-lg rounded-lg border border-zinc-800 bg-zinc-950 p-5 shadow-2xl focus:outline-none"
       >
         <div className="flex items-start justify-between gap-3">
           <div>
@@ -222,6 +228,19 @@ export function PromoteModal({
                     </label>
                   );
                 })}
+              </div>
+              <div className="pt-1">
+                <label htmlFor="stage-comment-input" className="block text-xs font-medium text-zinc-300">
+                  Transition Note <span className="font-normal text-zinc-400">(optional)</span>
+                </label>
+                <input
+                  id="stage-comment-input"
+                  type="text"
+                  value={comment}
+                  onChange={(e) => setComment(e.target.value)}
+                  placeholder="e.g., Passed OWASP safety audit and eval gate"
+                  className="mt-1.5 h-8 w-full rounded-md border border-zinc-700 bg-zinc-900 px-2.5 text-xs text-zinc-100 placeholder:text-zinc-400 focus:border-emerald-500 focus:outline-none"
+                />
               </div>
             </fieldset>
           ) : (

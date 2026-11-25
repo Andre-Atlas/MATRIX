@@ -2,17 +2,19 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { formatScore, formatTimestamp } from "@/lib/format";
-import { filterModels } from "@/lib/mlops";
+import { adaptLineageGraph, filterModels } from "@/lib/mlops";
 import {
   getAliasStyle,
   getModelStageStyle,
   getTaskTypeStyle,
   PRIMARY_BTN_CLASS,
 } from "@/lib/mlops-tokens";
+import { ProxyError, explain, proxy } from "@/lib/proxy-client";
 import type {
   ArtifactRecord,
   LineageGraph,
   ModelStage,
+  ModelStageHistoryItem,
   ModelType,
   ModelVersion,
   RegisteredModel,
@@ -21,23 +23,29 @@ import type {
 import { LineageDagTab } from "./lineage-dag-tab";
 import { ModelCardTab } from "./model-card-tab";
 import { PromoteModal } from "./promote-modal";
+import { StageHistoryTab } from "./stage-history-tab";
 import { VersionDiffDrawer } from "./version-diff-drawer";
 import { VersionsTab } from "./versions-tab";
+import { WebhooksTab } from "./webhooks-tab";
 
 export interface ModelsRegistryClientProps {
   initialModels: RegisteredModel[];
   initialDetail: RegisteredModelDetail | null;
   initialLineage: LineageGraph | null;
+  initialLineageError?: string | null;
+  initialHistory?: ModelStageHistoryItem[];
   initialArtifacts: ArtifactRecord[];
   initialSelectedId: string | null;
   initialError?: string | null;
   initialTab?: DetailTabId;
 }
 
-type DetailTabId = "versions" | "lineage" | "card";
+type DetailTabId = "versions" | "history" | "webhooks" | "lineage" | "card";
 
 const DETAIL_TABS: { id: DetailTabId; label: string }[] = [
   { id: "versions", label: "Versions & Promotion" },
+  { id: "history", label: "Stage History" },
+  { id: "webhooks", label: "CI/CD Webhooks" },
   { id: "lineage", label: "Lineage DAG" },
   { id: "card", label: "Model Card & Artifacts" },
 ];
@@ -55,6 +63,8 @@ export function ModelsRegistryClient({
   initialModels,
   initialDetail,
   initialLineage,
+  initialLineageError = null,
+  initialHistory = [],
   initialArtifacts,
   initialSelectedId,
   initialError = null,
@@ -66,6 +76,8 @@ export function ModelsRegistryClient({
   const [lineage, setLineage] = useState<LineageGraph>(
     initialLineage ?? { nodes: [], edges: [] },
   );
+  const [lineageError, setLineageError] = useState<string | null>(initialLineageError);
+  const [history, setHistory] = useState<ModelStageHistoryItem[]>(initialHistory);
   const [artifacts, setArtifacts] = useState<ArtifactRecord[]>(initialArtifacts);
 
   const [listLoading, setListLoading] = useState(false);
@@ -80,10 +92,12 @@ export function ModelsRegistryClient({
 
   // Detail Tabs (WAI-ARIA)
   const [activeTab, setActiveTab] = useState<DetailTabId>(
-    initialTab === "lineage" || initialTab === "card" ? initialTab : "versions",
+    initialTab && DETAIL_TABS.some((t) => t.id === initialTab) ? initialTab : "versions",
   );
   const tabRefs = useRef<Record<DetailTabId, HTMLButtonElement | null>>({
     versions: null,
+    history: null,
+    webhooks: null,
     lineage: null,
     card: null,
   });
@@ -120,31 +134,60 @@ export function ModelsRegistryClient({
   const [verModelCard, setVerModelCard] = useState("");
   const [verSubmitting, setVerSubmitting] = useState(false);
   const [verError, setVerError] = useState<string | null>(null);
+  const detailReqIdRef = useRef(0);
 
   const loadModelDetail = useCallback(async (modelId: string) => {
+    const reqId = ++detailReqIdRef.current;
     setDetailLoading(true);
+    setLineageError(null);
     try {
-      const [detailRes, lineageRes] = await Promise.all([
-        fetch(`/api/proxy/api/v1/mlops/models/${encodeURIComponent(modelId)}`, {
-          cache: "no-store",
-        }),
-        fetch(`/api/proxy/api/v1/mlops/models/${encodeURIComponent(modelId)}/lineage`, {
-          cache: "no-store",
-        }),
+      const [nextDetail, historyResp] = await Promise.all([
+        proxy<RegisteredModelDetail>("GET", `mlops/models/${encodeURIComponent(modelId)}`),
+        proxy<{ items?: ModelStageHistoryItem[] }>(
+          "GET",
+          `models/${encodeURIComponent(modelId)}/history`,
+        ).catch(() => ({ items: [] as ModelStageHistoryItem[] })),
       ]);
-      if (!detailRes.ok) {
-        throw new Error(`Failed to load model detail (${detailRes.status})`);
+
+      const latestVersion = nextDetail?.versions?.[0];
+      let nextLineage: LineageGraph | null = null;
+      let nextLineageError: string | null = null;
+      if (latestVersion?.id) {
+        try {
+          const rawLineage = await proxy<LineageGraph>(
+            "GET",
+            `lineage?node=${encodeURIComponent(`model_version:${latestVersion.id}`)}&direction=both&depth=3`,
+          );
+          nextLineage = adaptLineageGraph(rawLineage);
+        } catch (err) {
+          if (err instanceof ProxyError && err.status === 404) {
+            // Fall through to model-level lineage endpoint below
+          } else {
+            nextLineageError = explain(err);
+          }
+        }
       }
-      const nextDetail = (await detailRes.json()) as RegisteredModelDetail;
-      const nextLineage = lineageRes.ok
-        ? ((await lineageRes.json()) as LineageGraph)
-        : { model_id: modelId, nodes: [], edges: [] };
+      if (!nextLineage && !nextLineageError) {
+        try {
+          const rawModelLineage = await proxy<LineageGraph>(
+            "GET",
+            `mlops/models/${encodeURIComponent(modelId)}/lineage`,
+          );
+          nextLineage = adaptLineageGraph(rawModelLineage);
+        } catch (err) {
+          nextLineageError = explain(err);
+        }
+      }
+
+      if (detailReqIdRef.current !== reqId) return;
       setDetail(nextDetail);
-      setLineage(nextLineage);
+      setHistory(historyResp?.items ?? []);
+      setLineage(nextLineage ?? { nodes: [], edges: [] });
+      setLineageError(nextLineageError);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load model detail");
+      if (detailReqIdRef.current === reqId) setError(explain(err));
     } finally {
-      setDetailLoading(false);
+      if (detailReqIdRef.current === reqId) setDetailLoading(false);
     }
   }, []);
 
@@ -153,21 +196,15 @@ export function ModelsRegistryClient({
       setListLoading(true);
       setError(null);
       try {
-        const [modelsRes, artRes] = await Promise.all([
-          fetch("/api/proxy/api/v1/mlops/models", { cache: "no-store" }),
-          fetch("/api/proxy/api/v1/mlops/artifacts", { cache: "no-store" }),
+        const [modelsJson, artJson] = await Promise.all([
+          proxy<{ items?: RegisteredModel[] }>("GET", "mlops/models"),
+          proxy<{ items?: ArtifactRecord[] }>("GET", "artifacts").catch(() => ({
+            items: [] as ArtifactRecord[],
+          })),
         ]);
-        if (!modelsRes.ok) {
-          throw new Error(`Failed to load models (${modelsRes.status})`);
-        }
-        const modelsJson = (await modelsRes.json()) as { items?: RegisteredModel[] };
-        const items = modelsJson.items ?? [];
+        const items = modelsJson?.items ?? [];
         setModels(items);
-
-        if (artRes.ok) {
-          const artJson = (await artRes.json()) as { items?: ArtifactRecord[] };
-          setArtifacts(artJson.items ?? []);
-        }
+        setArtifacts(artJson?.items ?? []);
 
         const targetId =
           preferId && items.some((m) => m.id === preferId)
@@ -181,10 +218,12 @@ export function ModelsRegistryClient({
           await loadModelDetail(targetId);
         } else {
           setDetail(null);
+          setHistory([]);
           setLineage({ nodes: [], edges: [] });
+          setLineageError(null);
         }
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to load model registry");
+        setError(explain(err));
       } finally {
         setListLoading(false);
       }
@@ -291,22 +330,13 @@ export function ModelsRegistryClient({
         .split(",")
         .map((t) => t.trim())
         .filter(Boolean);
-      const res = await fetch("/api/proxy/api/v1/mlops/models", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          name: trimmedName,
-          model_type: newModelType,
-          base_model: newBaseModel.trim() || null,
-          description: newModelDesc.trim() || null,
-          tags,
-        }),
+      const created = await proxy<RegisteredModel>("POST", "mlops/models", {
+        name: trimmedName,
+        model_type: newModelType,
+        base_model: newBaseModel.trim() || null,
+        description: newModelDesc.trim() || null,
+        tags,
       });
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(text || `Failed to register model (${res.status})`);
-      }
-      const created = (await res.json()) as RegisteredModel;
       setRegisterModalOpen(false);
       setNewModelName("");
       setNewBaseModel("");
@@ -314,7 +344,7 @@ export function ModelsRegistryClient({
       setNewModelTags("");
       await refreshAll(created.id);
     } catch (err) {
-      setRegisterError(err instanceof Error ? err.message : "Failed to register model");
+      setRegisterError(explain(err));
     } finally {
       setRegisterSubmitting(false);
     }
@@ -334,24 +364,13 @@ export function ModelsRegistryClient({
           ? { r: rVal, lora_alpha: alphaVal }
           : null;
 
-      const res = await fetch(
-        `/api/proxy/api/v1/mlops/models/${encodeURIComponent(detail.id)}/versions`,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            run_id: verRunId.trim() || null,
-            artifact_id: verArtifactId.trim() || null,
-            stage: verStage,
-            lora_config: loraConfig,
-            model_card: verModelCard.trim() || null,
-          }),
-        },
-      );
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(text || `Failed to register version (${res.status})`);
-      }
+      await proxy("POST", `mlops/models/${encodeURIComponent(detail.id)}/versions`, {
+        run_id: verRunId.trim() || null,
+        artifact_id: verArtifactId.trim() || null,
+        stage: verStage,
+        lora_config: loraConfig,
+        model_card: verModelCard.trim() || null,
+      });
       setRegisterVersionOpen(false);
       setVerRunId("");
       setVerArtifactId("");
@@ -359,7 +378,7 @@ export function ModelsRegistryClient({
       setVerModelCard("");
       await refreshAll(detail.id);
     } catch (err) {
-      setVerError(err instanceof Error ? err.message : "Failed to register version");
+      setVerError(explain(err));
     } finally {
       setVerSubmitting(false);
     }
@@ -627,7 +646,7 @@ export function ModelsRegistryClient({
                           e.stopPropagation();
                           handleSelectModel(m.id);
                         }}
-                        className="text-left focus:outline-none"
+                        className="text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 rounded"
                       >
                         <div className="font-mono text-xs font-semibold text-zinc-100">
                           {m.name}
@@ -792,6 +811,25 @@ export function ModelsRegistryClient({
                 })}
               </div>
 
+              {/* Lineage error notice when viewing non-lineage tabs */}
+              {lineageError && activeTab !== "lineage" && (
+                <div
+                  role="alert"
+                  className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-red-800/70 bg-red-950/50 px-4 py-2.5 text-xs text-red-200"
+                >
+                  <div>
+                    <span className="font-semibold text-red-100">Lineage error:</span> {lineageError}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void loadModelDetail(detail.id)}
+                    className="inline-flex h-7 items-center rounded border border-red-700/70 bg-red-900/40 px-2.5 text-xs font-medium text-red-100 hover:bg-red-900/60"
+                  >
+                    Retry
+                  </button>
+                </div>
+              )}
+
               {/* Tabpanels */}
               <div
                 id={`panel-${activeTab}`}
@@ -816,8 +854,19 @@ export function ModelsRegistryClient({
                     }}
                   />
                 )}
+                {activeTab === "history" && (
+                  <StageHistoryTab history={history} loading={detailLoading} />
+                )}
+                {activeTab === "webhooks" && (
+                  <WebhooksTab modelId={detail.id} />
+                )}
                 {activeTab === "lineage" && (
-                  <LineageDagTab lineage={lineage} loading={detailLoading} />
+                  <LineageDagTab
+                    lineage={lineage}
+                    loading={detailLoading}
+                    error={lineageError}
+                    onRetry={() => void loadModelDetail(detail.id)}
+                  />
                 )}
                 {activeTab === "card" && (
                   <ModelCardTab model={detail} artifacts={artifacts} lineage={lineage} />

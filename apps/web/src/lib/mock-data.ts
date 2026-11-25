@@ -815,11 +815,17 @@ export function mockVectorProjection(params?: Record<string, string | number | u
     dimensions,
     total_points: points.length,
     reduction_method: "umap",
+    engine: "pca-lite",
+    simulated: true,
   };
 }
 
 export function mockVectorDrift(_params?: Record<string, string | number | undefined>): VectorDriftResponse {
-  return MOCK_DRIFT_RESPONSE;
+  return {
+    ...MOCK_DRIFT_RESPONSE,
+    mode: "demo",
+    simulated: true,
+  };
 }
 
 // ── Safety & OWASP Top 10 Mock Data & Handlers ──

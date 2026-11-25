@@ -114,7 +114,7 @@ export function NewSandboxModal({ open, onClose, onCreated }: NewSandboxModalPro
     };
 
     try {
-      const created = await proxy<SandboxRun>("POST", "api/v1/sandboxes/runs", payload);
+      const created = await proxy<SandboxRun>("POST", "sandboxes/runs", payload);
       onCreated(created);
       onClose();
     } catch (err) {

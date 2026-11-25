@@ -5,6 +5,7 @@ import { formatDuration, formatPercent, formatTimestamp, formatTokens } from "@/
 import { PRIMARY_BTN_CLASS, scoreTone } from "@/lib/mlops-tokens";
 import { proxy } from "@/lib/proxy-client";
 import type { ListResponse, SandboxRun, SandboxTaskTranscript } from "@/lib/types";
+import { SimulatedBadge } from "@/components/ui";
 import { InspectView } from "./inspect-view";
 import { NewSandboxModal } from "./new-sandbox-modal";
 
@@ -73,7 +74,7 @@ export function SandboxesClient({
     try {
       const resp = await proxy<
         ListResponse<SandboxTaskTranscript> | SandboxTaskTranscript[]
-      >("GET", `api/v1/sandboxes/runs/${encodeURIComponent(runId)}/transcripts`);
+      >("GET", `sandboxes/runs/${encodeURIComponent(runId)}/transcripts`);
       const items = Array.isArray(resp) ? resp : resp?.items ?? [];
       setTranscriptsByRun((prev) => ({ ...prev, [runId]: items }));
     } catch {
@@ -90,7 +91,7 @@ export function SandboxesClient({
     try {
       const resp = await proxy<ListResponse<SandboxRun> | SandboxRun[]>(
         "GET",
-        "api/v1/sandboxes/runs",
+        "sandboxes/runs",
       );
       const items = Array.isArray(resp) ? resp : resp?.items ?? [];
       setRuns(items);
@@ -108,7 +109,7 @@ export function SandboxesClient({
   const handleCancelRun = async (runId: string, e: React.MouseEvent) => {
     e.stopPropagation();
     try {
-      await proxy("POST", `api/v1/sandboxes/runs/${encodeURIComponent(runId)}/cancel`);
+      await proxy("POST", `sandboxes/runs/${encodeURIComponent(runId)}/cancel`);
       setRuns((prev) =>
         prev.map((r) => (r.id === runId ? { ...r, status: "cancelled" } : r)),
       );
@@ -151,9 +152,7 @@ export function SandboxesClient({
     const avgStepsStr =
       totalTranscriptsCount > 0
         ? (totalStepsCount / totalTranscriptsCount).toFixed(1)
-        : totalRuns > 0
-          ? "4.0"
-          : "—";
+        : "—";
 
     // Active containers
     const activeDocker = runningList.filter((r) => r.runner_backend === "docker").length;
@@ -236,6 +235,23 @@ export function SandboxesClient({
       )}
 
       {/* 4 KPIs Section */}
+      {runs.some(
+        (r) =>
+          r.simulated === true ||
+          r.runner_backend === "fake" ||
+          r.runner_backend === "local_sandbox",
+      ) && (
+        <div
+          role="status"
+          className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-700/60 bg-amber-950/30 px-3.5 py-2 text-xs text-amber-200"
+        >
+          <SimulatedBadge reason="fake / local_sandbox" />
+          <span>
+            One or more sandbox runs executed against the local/fake runner backend and display simulated transcripts.
+          </span>
+        </div>
+      )}
+
       <section
         aria-label="Agent Sandboxes Summary Metrics"
         className="grid grid-cols-2 gap-3 lg:grid-cols-4"
@@ -515,21 +531,30 @@ export function SandboxesClient({
 
                     {/* Runtime */}
                     <td className={tableTd}>
-                      <span
-                        className={`inline-flex items-center rounded border px-1.5 py-0.5 font-mono text-[11px] font-medium ${
-                          r.runner_backend === "docker"
-                            ? "border-sky-800/70 bg-sky-950/40 text-sky-300"
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span
+                          className={`inline-flex items-center rounded border px-1.5 py-0.5 font-mono text-[11px] font-medium ${
+                            r.runner_backend === "docker"
+                              ? "border-sky-800/70 bg-sky-950/40 text-sky-300"
+                              : r.runner_backend === "k8s"
+                                ? "border-indigo-800/70 bg-indigo-950/40 text-indigo-300"
+                                : "border-zinc-700 bg-zinc-900 text-zinc-300"
+                          }`}
+                        >
+                          {r.runner_backend === "docker"
+                            ? "Docker"
                             : r.runner_backend === "k8s"
-                              ? "border-indigo-800/70 bg-indigo-950/40 text-indigo-300"
-                              : "border-zinc-700 bg-zinc-900 text-zinc-300"
-                        }`}
-                      >
-                        {r.runner_backend === "docker"
-                          ? "Docker"
-                          : r.runner_backend === "k8s"
-                            ? "K8s"
-                            : "Local"}
-                      </span>
+                              ? "K8s"
+                              : r.runner_backend === "fake"
+                                ? "Fake"
+                                : "Local"}
+                        </span>
+                        {(r.simulated === true ||
+                          r.runner_backend === "fake" ||
+                          r.runner_backend === "local_sandbox") && (
+                          <SimulatedBadge reason={r.runner_backend || "fake"} />
+                        )}
+                      </div>
                     </td>
 
                     {/* Steps */}

@@ -2,12 +2,41 @@
 
 from __future__ import annotations
 
+import importlib.util
 import math
 import random
 import re
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field
+
+DEFAULT_PROJECTION_ENGINE = "pca-lite"
+DEFAULT_EMBEDDING_LABEL = "hash-3gram (demo)"
+
+
+class EngineUnavailable(RuntimeError):
+    """Raised when an optional analytics projection/clustering engine is not installed (ADR-009)."""
+
+
+class ProjectionEngine(Protocol):
+    """Interface for dimensional projection and clustering engines (ADR-009)."""
+
+    name: str
+    simulated: bool
+
+    def project(
+        self,
+        embeddings: list[list[float]],
+        n_components: int = 3,
+        seed: int = 42,
+    ) -> list[list[float]]: ...
+
+    def cluster(
+        self,
+        embeddings: list[list[float]],
+        k: int = 4,
+        seed: int = 42,
+    ) -> tuple[list[int], list[list[float]]]: ...
 
 
 class VectorPoint(BaseModel):
@@ -322,20 +351,17 @@ def identify_knowledge_gaps(
     2. Faithfulness/retrieval confidence score < faithfulness_threshold.
     """
     gap_ids: set[str] = set()
+    doc_embeddings = [d.embedding or deterministic_text_embedding(d.text) for d in documents]
 
     for q in queries:
         q_emb = q.embedding or deterministic_text_embedding(q.text)
         is_gap = False
 
         # Check retrieval semantic distance
-        if not documents:
+        if not doc_embeddings:
             is_gap = True
         else:
-            min_dist = float("inf")
-            for d in documents:
-                d_emb = d.embedding or deterministic_text_embedding(d.text)
-                dist = cosine_distance(q_emb, d_emb)
-                min_dist = min(min_dist, dist)
+            min_dist = min(cosine_distance(q_emb, d_emb) for d_emb in doc_embeddings)
             if min_dist > distance_threshold:
                 is_gap = True
 
@@ -361,22 +387,31 @@ def build_vector_projection(
     faithfulness_threshold: float = 0.60,
 ) -> tuple[list[VectorPoint], list[ClusterSummary]]:
     """Builds the complete 2D/3D projection with clustering, knowledge gaps, and metadata."""
+    q_embs = [q.embedding or deterministic_text_embedding(q.text) for q in queries]
+    d_embs = [d.embedding or deterministic_text_embedding(d.text) for d in documents]
+    q_items = [
+        q if q.embedding else q.model_copy(update={"embedding": emb})
+        for q, emb in zip(queries, q_embs, strict=True)
+    ]
+    d_items = [
+        d if d.embedding else d.model_copy(update={"embedding": emb})
+        for d, emb in zip(documents, d_embs, strict=True)
+    ]
+
     gap_ids = identify_knowledge_gaps(
-        queries=queries,
-        documents=documents,
+        queries=q_items,
+        documents=d_items,
         distance_threshold=distance_threshold,
         faithfulness_threshold=faithfulness_threshold,
     )
 
     all_items: list[tuple[str, str, Literal["query", "document", "gap"], list[float], float | None, str | None, str | None]] = []
 
-    for q in queries:
-        emb = q.embedding or deterministic_text_embedding(q.text)
+    for q, emb in zip(queries, q_embs, strict=True):
         kind: Literal["query", "document", "gap"] = "gap" if q.id in gap_ids else "query"
         all_items.append((q.id, q.text, kind, emb, q.score, q.trace_id, q.timestamp))
 
-    for d in documents:
-        emb = d.embedding or deterministic_text_embedding(d.text)
+    for d, emb in zip(documents, d_embs, strict=True):
         all_items.append((d.id, d.text, "document", emb, d.score, d.trace_id, d.timestamp))
 
     if not all_items:
@@ -440,3 +475,110 @@ def build_vector_projection(
         )
 
     return points, clusters
+
+
+# --- Projection Engine Implementations & Optional Analytics Stubs (ADR-009) ---
+
+
+class PCALiteEngine:
+    """Pure-Python deterministic PCA-lite projection & k-means clustering engine (demo/simulated)."""
+
+    name: str = DEFAULT_PROJECTION_ENGINE
+    simulated: bool = True
+
+    def project(
+        self,
+        embeddings: list[list[float]],
+        n_components: int = 3,
+        seed: int = 42,
+    ) -> list[list[float]]:
+        return project_embeddings(embeddings, n_components=n_components, seed=seed)
+
+    def cluster(
+        self,
+        embeddings: list[list[float]],
+        k: int = 4,
+        seed: int = 42,
+    ) -> tuple[list[int], list[list[float]]]:
+        return cluster_embeddings(embeddings, k=k, seed=seed)
+
+
+class UMAPProjectionEngine:
+    """Stub for UMAP projection engine (requires optional worker 'analytics' extra, ADR-009)."""
+
+    name: str = "umap"
+    simulated: bool = False
+
+    def _ensure_installed(self) -> None:
+        if importlib.util.find_spec("umap") is None:
+            raise EngineUnavailable(
+                "UMAP projection engine is unavailable: install optional extra 'analytics' (umap-learn)."
+            )
+        raise EngineUnavailable(
+            "UMAP projection runs asynchronously in the analytics worker (ADR-009), not inline in the API."
+        )
+
+    def project(
+        self,
+        embeddings: list[list[float]],
+        n_components: int = 3,
+        seed: int = 42,
+    ) -> list[list[float]]:
+        self._ensure_installed()
+        return []  # pragma: no cover
+
+    def cluster(
+        self,
+        embeddings: list[list[float]],
+        k: int = 4,
+        seed: int = 42,
+    ) -> tuple[list[int], list[list[float]]]:
+        self._ensure_installed()
+        return [], []  # pragma: no cover
+
+
+class HDBSCANClusterEngine:
+    """Stub for HDBSCAN clustering engine (requires optional worker 'analytics' extra, ADR-009)."""
+
+    name: str = "hdbscan"
+    simulated: bool = False
+
+    def _ensure_installed(self) -> None:
+        if importlib.util.find_spec("hdbscan") is None:
+            raise EngineUnavailable(
+                "HDBSCAN clustering engine is unavailable: install optional extra 'analytics' (hdbscan)."
+            )
+        raise EngineUnavailable(
+            "HDBSCAN clustering runs asynchronously in the analytics worker (ADR-009), not inline in the API."
+        )
+
+    def project(
+        self,
+        embeddings: list[list[float]],
+        n_components: int = 3,
+        seed: int = 42,
+    ) -> list[list[float]]:
+        self._ensure_installed()
+        return []  # pragma: no cover
+
+    def cluster(
+        self,
+        embeddings: list[list[float]],
+        k: int = 4,
+        seed: int = 42,
+    ) -> tuple[list[int], list[list[float]]]:
+        self._ensure_installed()
+        return [], []  # pragma: no cover
+
+
+def get_projection_engine(name: str = DEFAULT_PROJECTION_ENGINE) -> ProjectionEngine:
+    """Returns a ProjectionEngine instance by name ('pca-lite', 'umap', 'hdbscan')."""
+    norm = name.strip().lower()
+    if norm in ("pca-lite", "pca", "default"):
+        return PCALiteEngine()
+    if norm == "umap":
+        return UMAPProjectionEngine()
+    if norm == "hdbscan":
+        return HDBSCANClusterEngine()
+    raise EngineUnavailable(f"Unknown projection engine '{name}'. Supported: pca-lite, umap, hdbscan.")
+

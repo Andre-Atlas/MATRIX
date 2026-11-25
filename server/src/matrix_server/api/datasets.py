@@ -19,6 +19,7 @@ from matrix_server.auth import Principal, Role, project_of, require
 from matrix_server.datasets.versioning import (
     BranchExistsError,
     BranchNotFoundError,
+    CommitItemLimitError,
     CommitNotFoundError,
     DatasetNotFoundError,
     InvalidBranchNameError,
@@ -637,6 +638,7 @@ def list_commits_route(
 @router.post("/datasets/{dataset_id}/commits", status_code=201)
 def create_commit_route(
     dataset_id: str,
+    request: Request,
     db: DbSession,
     principal: MemberAuth,
     payload: Annotated[dict[str, Any], Body()],
@@ -644,6 +646,7 @@ def create_commit_route(
     """Create a commit on a branch."""
     get_dataset_or_404(db, principal.project_id, dataset_id)
     body = parse_body(CommitCreate, payload)
+    max_items = request.app.state.settings.max_dataset_commit_items
     try:
         author = body.author or principal.actor_id
         commit = commit_changes(
@@ -655,7 +658,10 @@ def create_commit_route(
             changes=body.changes,
             snapshot_from_working_tree=body.snapshot_from_working_tree,
             author=author,
+            max_items=max_items,
         )
+    except CommitItemLimitError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except (DatasetNotFoundError, BranchNotFoundError, CommitNotFoundError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return commit_out(commit)
@@ -762,6 +768,7 @@ def diff_route(
 @router.post("/datasets/{dataset_id}/merge")
 def merge_route(
     dataset_id: str,
+    request: Request,
     db: DbSession,
     principal: MemberAuth,
     payload: Annotated[dict[str, Any], Body()],
@@ -769,6 +776,7 @@ def merge_route(
     """Merge source_branch into target_branch."""
     get_dataset_or_404(db, principal.project_id, dataset_id)
     body = parse_body(MergeCreate, payload)
+    max_items = request.app.state.settings.max_dataset_commit_items
     try:
         merge_commit = merge_branches(
             session=db,
@@ -779,7 +787,10 @@ def merge_route(
             conflict_strategy=body.conflict_strategy,
             message=body.message,
             author=body.author or principal.actor_id,
+            max_items=max_items,
         )
+    except CommitItemLimitError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except MergeConflictError as exc:
         raise HTTPException(
             status_code=409,
@@ -801,6 +812,7 @@ def merge_route(
 @router.post("/datasets/{dataset_id}/revert", status_code=201)
 def revert_route(
     dataset_id: str,
+    request: Request,
     db: DbSession,
     principal: MemberAuth,
     payload: Annotated[dict[str, Any], Body()],
@@ -808,6 +820,7 @@ def revert_route(
     """Revert a branch to a previous commit state by creating a new commit."""
     get_dataset_or_404(db, principal.project_id, dataset_id)
     body = parse_body(RevertCreate, payload)
+    max_items = request.app.state.settings.max_dataset_commit_items
     try:
         revert_commit = revert_branch(
             session=db,
@@ -817,7 +830,10 @@ def revert_route(
             target_commit_id=body.target_commit_id,
             message=body.message,
             author=body.author or principal.actor_id,
+            max_items=max_items,
         )
+    except CommitItemLimitError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except (DatasetNotFoundError, BranchNotFoundError, CommitNotFoundError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return commit_out(revert_commit)

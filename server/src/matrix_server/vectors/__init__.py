@@ -1,4 +1,4 @@
-"""Vector Projection and Statistical/Semantic Drift package (Module 5)."""
+"""Vector Projection and Statistical/Semantic Drift package (Module 5 / T8)."""
 
 from matrix_server.vectors.drift import (
     HEALTHY_THRESHOLD,
@@ -15,9 +15,16 @@ from matrix_server.vectors.drift import (
     compute_psi,
 )
 from matrix_server.vectors.projection import (
+    DEFAULT_EMBEDDING_LABEL,
+    DEFAULT_PROJECTION_ENGINE,
     ClusterSummary,
     DocumentItem,
+    EngineUnavailable,
+    HDBSCANClusterEngine,
+    PCALiteEngine,
+    ProjectionEngine,
     QueryItem,
+    UMAPProjectionEngine,
     VectorPoint,
     assign_cluster_labels,
     build_vector_projection,
@@ -25,11 +32,14 @@ from matrix_server.vectors.projection import (
     cosine_distance,
     cosine_similarity,
     deterministic_text_embedding,
+    get_projection_engine,
     identify_knowledge_gaps,
     project_embeddings,
 )
 
 __all__ = [
+    "DEFAULT_EMBEDDING_LABEL",
+    "DEFAULT_PROJECTION_ENGINE",
     "HEALTHY_THRESHOLD",
     "WARNING_THRESHOLD",
     "ClusterSummary",
@@ -37,8 +47,13 @@ __all__ = [
     "DriftLevel",
     "DriftMetrics",
     "DriftReport",
+    "EngineUnavailable",
+    "HDBSCANClusterEngine",
+    "PCALiteEngine",
+    "ProjectionEngine",
     "QueryItem",
     "TemporalDriftPoint",
+    "UMAPProjectionEngine",
     "VectorPoint",
     "assign_cluster_labels",
     "build_vector_projection",
@@ -52,6 +67,7 @@ __all__ = [
     "cosine_distance",
     "cosine_similarity",
     "deterministic_text_embedding",
+    "get_projection_engine",
     "identify_knowledge_gaps",
     "project_embeddings",
 ]

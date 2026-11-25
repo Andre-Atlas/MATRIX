@@ -16,6 +16,8 @@ export function CompareDrawer({ open, runs, onClose }: CompareDrawerProps) {
   const [diffOnly, setDiffOnly] = useState(false);
   const closeBtnRef = useRef<HTMLButtonElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
 
   useEffect(() => {
     if (!open) return;
@@ -25,7 +27,7 @@ export function CompareDrawer({ open, runs, onClose }: CompareDrawerProps) {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
-        onClose();
+        onCloseRef.current();
       }
     };
     window.addEventListener("keydown", onKeyDown);
@@ -33,7 +35,7 @@ export function CompareDrawer({ open, runs, onClose }: CompareDrawerProps) {
       window.removeEventListener("keydown", onKeyDown);
       previousFocusRef.current?.focus();
     };
-  }, [open, onClose]);
+  }, [open]);
 
   const hpDiff = useMemo(() => computeHyperparamDiff(runs), [runs]);
 

@@ -1,4 +1,5 @@
 import type { GatewayProviderStatus } from "@/lib/types";
+import { SimulatedBadge } from "@/components/ui";
 import {
   formatLatencyMs,
   getCircuitStateConfig,
@@ -82,16 +83,19 @@ export function ProviderCircuitBoard({ providers }: ProviderCircuitBoardProps) {
               <div>
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
                       <span className="truncate text-sm font-semibold text-zinc-100">
                         {p.name}
                       </span>
                       <span className="rounded bg-zinc-800 px-1.5 py-0.5 text-[10px] font-mono text-zinc-400">
                         {p.provider ?? p.name.toLowerCase()}
                       </span>
+                      {(p.provider ?? p.name).toLowerCase() === "mock" && (
+                        <SimulatedBadge reason="mock provider" />
+                      )}
                     </div>
                     {p.endpoint && (
-                      <p className="mt-0.5 truncate text-[11px] font-mono text-zinc-500" title={p.endpoint}>
+                      <p className="mt-0.5 truncate text-[11px] font-mono text-zinc-400" title={p.endpoint}>
                         {p.endpoint}
                       </p>
                     )}
@@ -189,7 +193,12 @@ export function ProviderCircuitBoard({ providers }: ProviderCircuitBoardProps) {
                     {health.label}
                   </span>
                 </div>
-                <div className="flex flex-wrap gap-1 max-h-16 overflow-y-auto">
+                <div
+                  tabIndex={0}
+                  role="region"
+                  aria-label={`Modelos registrados para ${p.name}`}
+                  className="flex flex-wrap gap-1 max-h-16 overflow-y-auto focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-emerald-400"
+                >
                   {models.map((m) => (
                     <span
                       key={m}

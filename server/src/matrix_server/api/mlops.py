@@ -5,35 +5,48 @@ from __future__ import annotations
 import base64
 import json
 import math
+import re
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from matrix_server.api.runs import _check_tags, capacity_http
+from matrix_server import audit
+from matrix_server.api.artifacts import get_store
+from matrix_server.artifacts.models import Artifact as BlobArtifact
 from matrix_server.auth import Principal, Role, ensure_role, require
-from matrix_server.mlops.compat import status_out
-from matrix_server.mlops.sweeps import (
-    InvalidSearchSpaceError,
-    SweepExhaustedError,
-    build_sweep_analysis,
-    suggest_next_params,
-    validate_search_space,
+from matrix_server.mlops.lineage import (
+    DEFAULT_LINEAGE_DEPTH,
+    MAX_LINEAGE_DEPTH,
+    MAX_LINEAGE_NODES,
+    Direction,
+    node_exists_in_project,
+    parse_node_ref,
+    query_bounded_lineage,
 )
-from matrix_server.mlops.views import render_run, render_runs
-from matrix_server.runs import service
+from matrix_server.mlops.registry_models import ModelStageHistory, ModelWebhook, WebhookDelivery
+from matrix_server.mlops.webhooks import (
+    SecretKeyMissingError,
+    WebhookValidationError,
+    dispatch_model_event,
+    encrypt_secret,
+    generate_webhook_secret,
+    resolve_secret_key,
+    validate_webhook_events,
+    validate_webhook_url,
+)
 from matrix_server.runs.models import Run
 from matrix_server.storage.db import as_utc, get_db, utcnow
 from matrix_server.storage.jobs import enqueue
 from matrix_server.storage.models import (
     ArtifactLineage,
+    BenchmarkRun,
     Dataset,
     Experiment,
-    MLOpsSweep,
     ModelAlias,
     ModelVersion,
     RegisteredModel,
@@ -42,6 +55,7 @@ from matrix_server.storage.models import (
 from matrix_server.storage.models import ModelArtifact as Artifact
 
 router = APIRouter(prefix="/api/v1/mlops", tags=["mlops"])
+canonical_router = APIRouter(prefix="/api/v1", tags=["mlops"])
 
 DbSession = Annotated[Session, Depends(get_db)]
 ViewerAuth = Annotated[Principal, Depends(require(Role.VIEWER))]
@@ -55,6 +69,7 @@ VALID_MODEL_STAGES = {"none", "staging", "production", "archived"}
 ADMIN_ONLY_ALIASES = {"production", "champion"}
 # Promoting to production and archiving are ADMIN decisions (an API key is never ADMIN).
 ADMIN_ONLY_STAGES = {"production", "archived"}
+ALIAS_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,49}$")
 
 
 # ---------------------------------------------------------------------------
@@ -124,13 +139,6 @@ def _get_dataset_or_404(db: Session, project_id: str, dataset_id: str) -> Datase
     return row
 
 
-def _get_sweep_or_404(db: Session, project_id: str, sweep_id: str) -> MLOpsSweep:
-    row = db.scalars(select(MLOpsSweep).where(MLOpsSweep.id == sweep_id, MLOpsSweep.project_id == project_id)).first()
-    if row is None:
-        raise HTTPException(status_code=404, detail="sweep not found")
-    return row
-
-
 def _get_run_or_404(db: Session, project_id: str, run_id: str) -> Run:
     row = db.scalars(select(Run).where(Run.id == run_id, Run.project_id == project_id)).first()
     if row is None:
@@ -138,23 +146,72 @@ def _get_run_or_404(db: Session, project_id: str, run_id: str) -> Run:
     return row
 
 
-def _sweep_trials(request: Request, db: Session, project_id: str, sweep_id: str) -> list[dict[str, Any]]:
-    """The sweep's runs in `main`'s shape (hyperparams, summary_metrics): what the sweep engine reads."""
-    runs = list(
-        db.scalars(
-            select(Run)
-            .where(Run.project_id == project_id, Run.sweep_id == sweep_id)
-            .order_by(Run.started_at.asc(), Run.id.asc())
-        )
-    )
-    return render_runs(db, request.app.state.metric_store, runs)
-
-
 def _get_artifact_or_404(db: Session, project_id: str, artifact_id: str) -> Artifact:
     row = db.scalars(select(Artifact).where(Artifact.id == artifact_id, Artifact.project_id == project_id)).first()
     if row is None:
         raise HTTPException(status_code=404, detail="artifact not found")
     return row
+
+
+def _resolve_or_bridge_artifact(
+    db: Session,
+    project_id: str,
+    artifact_id: str,
+    run_id: str | None,
+) -> Artifact:
+    """Resolve a ModelArtifact by ID, or bridge a ready G0 BlobArtifact into a committed ModelArtifact."""
+    row = db.scalars(select(Artifact).where(Artifact.id == artifact_id, Artifact.project_id == project_id)).first()
+    if row is not None:
+        return row
+
+    blob = db.scalars(
+        select(BlobArtifact).where(BlobArtifact.id == artifact_id, BlobArtifact.project_id == project_id)
+    ).first()
+    if blob is None:
+        raise HTTPException(status_code=404, detail="artifact not found")
+    if blob.status != "ready":
+        raise HTTPException(status_code=409, detail="artifact is not ready")
+
+    existing = db.scalars(
+        select(Artifact)
+        .where(Artifact.project_id == project_id, Artifact.artifact_id == blob.id)
+        .order_by(Artifact.created_at.desc(), Artifact.id.desc())
+    ).first()
+    if existing is not None:
+        if existing.run_id is None and run_id is not None:
+            existing.run_id = run_id
+        return existing
+
+    name = (blob.name or "artifact")[:200]
+    for attempt in range(MAX_CREATE_ATTEMPTS):
+        try:
+            with db.begin_nested():
+                current_ver = db.scalar(
+                    select(func.max(Artifact.version)).where(
+                        Artifact.project_id == project_id,
+                        Artifact.name == name,
+                    )
+                )
+                bridged = Artifact(
+                    project_id=project_id,
+                    run_id=run_id,
+                    artifact_id=blob.id,
+                    name=name,
+                    kind="model",
+                    version=(current_ver or 0) + 1,
+                    sha256=blob.sha256,
+                    size_bytes=blob.size,
+                    content_type=blob.media_type,
+                    status="committed",
+                    committed_at=utcnow(),
+                )
+                db.add(bridged)
+                db.flush()
+            return bridged
+        except IntegrityError:
+            if attempt == MAX_CREATE_ATTEMPTS - 1:
+                raise HTTPException(status_code=409, detail="concurrent artifact registration, retry") from None
+    raise HTTPException(status_code=409, detail="concurrent artifact registration, retry")
 
 
 def _get_experiment_or_404(db: Session, project_id: str, experiment_id: str) -> Experiment:
@@ -240,26 +297,6 @@ def _add_lineage_edge(
 # ---------------------------------------------------------------------------
 
 
-def _sweep_out(sweep: MLOpsSweep) -> dict[str, Any]:
-    return {
-        "id": sweep.id,
-        "project_id": sweep.project_id,
-        "name": sweep.name,
-        "description": sweep.description,
-        "method": sweep.method,
-        "metric_name": sweep.metric_name,
-        "metric_goal": sweep.metric_goal,
-        "search_space": dict(sweep.search_space or {}),
-        "early_stopping": sweep.early_stopping,
-        "max_trials": sweep.max_trials,
-        "status": sweep.status,
-        "best_run_id": sweep.best_run_id,
-        "best_metric_value": sweep.best_metric_value,
-        "created_at": _iso_utc(sweep.created_at),
-        "stopped_at": _iso_utc(sweep.stopped_at),
-    }
-
-
 def _model_out(model: RegisteredModel) -> dict[str, Any]:
     return {
         "id": model.id,
@@ -294,32 +331,59 @@ def _version_out(mv: ModelVersion) -> dict[str, Any]:
     }
 
 
+def _history_out(h: ModelStageHistory) -> dict[str, Any]:
+    return {
+        "id": h.id,
+        "project_id": h.project_id,
+        "model_id": h.model_id,
+        "version": h.version,
+        "from_stage": h.from_stage,
+        "to_stage": h.to_stage,
+        "actor_kind": h.actor_kind,
+        "actor_id": h.actor_id,
+        "comment": h.comment,
+        "ts": _iso_utc(h.ts),
+    }
+
+
+def _webhook_out(wh: ModelWebhook, *, secret: str | None = None) -> dict[str, Any]:
+    """Serialize a webhook. `secret` is ONLY included on the initial 201 creation response."""
+    out: dict[str, Any] = {
+        "id": wh.id,
+        "project_id": wh.project_id,
+        "model_id": wh.model_id,
+        "url": wh.url,
+        "events": list(wh.events or []),
+        "active": bool(wh.active),
+        "created_by": wh.created_by,
+        "created_at": _iso_utc(wh.created_at),
+    }
+    if secret is not None:
+        out["secret"] = secret
+    return out
+
+
+def _delivery_out(d: WebhookDelivery) -> dict[str, Any]:
+    """Serialize a webhook delivery status. Never exposes response body or secret."""
+    return {
+        "id": d.id,
+        "project_id": d.project_id,
+        "webhook_id": d.webhook_id,
+        "model_id": d.model_id,
+        "event": d.event,
+        "status": d.status,
+        "attempts": d.attempts,
+        "last_status_code": d.last_status_code,
+        "last_error": d.last_error,
+        "created_at": _iso_utc(d.created_at),
+        "last_attempt_at": _iso_utc(d.last_attempt_at),
+        "delivered_at": _iso_utc(d.delivered_at),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Pydantic Schemas
 # ---------------------------------------------------------------------------
-
-
-class SweepCreate(BaseModel):
-    model_config = ConfigDict(allow_inf_nan=False, extra="ignore")
-
-    name: str = Field(min_length=1, max_length=200)
-    description: str | None = Field(default=None, max_length=10_000)
-    method: Literal["grid", "random", "bayes"] = "random"
-    metric_name: str = Field(min_length=1, max_length=200)
-    metric_goal: Literal["minimize", "maximize"] = "minimize"
-    search_space: dict[str, Any]
-    early_stopping: dict[str, Any] | None = None
-    max_trials: int | None = Field(default=None, ge=1)
-
-
-class SweepNextTrialIn(BaseModel):
-    model_config = ConfigDict(allow_inf_nan=False, extra="ignore")
-
-    name: str | None = Field(default=None, min_length=1, max_length=200)
-    run_type: str = Field(default="sft", min_length=1, max_length=32)
-    base_model: str | None = Field(default=None, max_length=200)
-    dataset_id: str | None = Field(default=None, max_length=32)
-    tags: list[str] = Field(default_factory=list, max_length=50)
 
 
 class ModelCreate(BaseModel):
@@ -350,6 +414,7 @@ class ModelStagePatch(BaseModel):
     model_config = ConfigDict(allow_inf_nan=False, extra="ignore")
 
     stage: Literal["none", "staging", "production", "archived"]
+    comment: str | None = Field(default=None, max_length=2000)
 
 
 class ModelAliasIn(BaseModel):
@@ -357,6 +422,20 @@ class ModelAliasIn(BaseModel):
 
     alias: str = Field(min_length=1, max_length=100)
     version: int = Field(ge=1)
+
+
+class ModelAliasVersionIn(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False, extra="ignore")
+
+    version: int = Field(ge=1)
+
+
+class WebhookCreate(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False, extra="ignore")
+
+    url: str = Field(min_length=1, max_length=2000)
+    events: list[str] = Field(min_length=1, max_length=10)
+    secret: str | None = Field(default=None, min_length=8, max_length=256)
 
 
 class ModelEvaluateIn(BaseModel):
@@ -368,327 +447,60 @@ class ModelEvaluateIn(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Lineage Graph Helpers & Endpoints
+# Lineage Graph Endpoints (Bounded, Indexed Per-Hop BFS)
 # ---------------------------------------------------------------------------
 
 
-def _build_lineage_graph(
-    db: Session,
-    project_id: str,
-    seed_nodes: list[tuple[str, str]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Traverse ArtifactLineage + direct structural FKs in `project_id` from `seed_nodes`."""
-    all_edges = list(
-        db.scalars(select(ArtifactLineage).where(ArtifactLineage.project_id == project_id))
+@canonical_router.get("/lineage")
+def get_bounded_lineage(
+    db: DbSession,
+    principal: ViewerAuth,
+    node: Annotated[str, Query(min_length=3, max_length=100)],
+    direction: Direction = "both",
+    depth: Annotated[int, Query(ge=0, le=MAX_LINEAGE_DEPTH)] = DEFAULT_LINEAGE_DEPTH,
+    max_nodes: Annotated[int, Query(ge=1, le=MAX_LINEAGE_NODES)] = MAX_LINEAGE_NODES,
+) -> dict[str, Any]:
+    try:
+        kind, entity_id = parse_node_ref(node)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not node_exists_in_project(db, principal.project_id, kind, entity_id):
+        raise HTTPException(status_code=404, detail="lineage node not found")
+    nodes, edges, truncated = query_bounded_lineage(
+        db,
+        principal.project_id,
+        [(kind, entity_id)],
+        direction=direction,
+        depth=depth,
+        max_nodes=max_nodes,
     )
-
-    edge_map: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
-    adj: dict[tuple[str, str], list[tuple[str, str]]] = {}
-
-    def _register_edge(
-        src_type: str,
-        src_id: str,
-        tgt_type: str,
-        tgt_id: str,
-        relation: str,
-        edge_id: str | None = None,
-        metadata: dict[str, Any] | None = None,
-    ) -> None:
-        key = (src_type, src_id, tgt_type, tgt_id, relation)
-        if key not in edge_map:
-            edge_map[key] = {
-                "id": edge_id or f"{src_type}:{src_id}->{tgt_type}:{tgt_id}:{relation}",
-                "source": f"{src_type}:{src_id}",
-                "target": f"{tgt_type}:{tgt_id}",
-                "source_type": src_type,
-                "source_id": src_id,
-                "target_type": tgt_type,
-                "target_id": tgt_id,
-                "relation": relation,
-                "metadata": metadata or {},
-            }
-            adj.setdefault((src_type, src_id), []).append((tgt_type, tgt_id))
-            adj.setdefault((tgt_type, tgt_id), []).append((src_type, src_id))
-
-    for e in all_edges:
-        _register_edge(
-            e.source_type,
-            e.source_id,
-            e.target_type,
-            e.target_id,
-            e.relation,
-            edge_id=e.id,
-            metadata=dict(e.metadata_ or {}),
-        )
-
-    # Also ensure structural FKs are represented even if created out-of-band
-    for run in db.scalars(select(Run).where(Run.project_id == project_id)):
-        if run.dataset_version_id:
-            _register_edge("dataset", run.dataset_version_id, "run", run.id, "trained_on")
-        if run.parent_run_id:
-            _register_edge("run", run.parent_run_id, "run", run.id, "forked_from")
-    for art in db.scalars(select(Artifact).where(Artifact.project_id == project_id)):
-        if art.run_id:
-            _register_edge("run", art.run_id, "artifact", art.id, "produced")
-    for mv in db.scalars(select(ModelVersion).where(ModelVersion.project_id == project_id)):
-        if mv.artifact_id:
-            _register_edge("artifact", mv.artifact_id, "model_version", mv.id, "packaged_as")
-        if mv.run_id:
-            _register_edge("run", mv.run_id, "model_version", mv.id, "registered_as")
-        if mv.eval_experiment_id:
-            _register_edge("model_version", mv.id, "experiment", mv.eval_experiment_id, "evaluated_by")
-        if mv.safety_scan_id:
-            _register_edge("model_version", mv.id, "safety_scan", mv.safety_scan_id, "audited_by")
-
-    visited: set[tuple[str, str]] = set(seed_nodes)
-    queue: list[tuple[str, str]] = list(seed_nodes)
-    while queue:
-        cur = queue.pop(0)
-        for nxt in adj.get(cur, []):
-            if nxt not in visited:
-                visited.add(nxt)
-                queue.append(nxt)
-
-    # Enrich visited nodes
-    datasets_by_id = {
-        d.id: d
-        for d in db.scalars(select(Dataset).where(Dataset.project_id == project_id))
-        if ("dataset", d.id) in visited
+    return {
+        "root": f"{kind}:{entity_id}",
+        "direction": direction,
+        "depth": depth,
+        "truncated": truncated,
+        "nodes": nodes,
+        "edges": edges,
     }
-    runs_by_id = {
-        r.id: r
-        for r in db.scalars(select(Run).where(Run.project_id == project_id))
-        if ("run", r.id) in visited
-    }
-    artifacts_by_id = {
-        a.id: a
-        for a in db.scalars(select(Artifact).where(Artifact.project_id == project_id))
-        if ("artifact", a.id) in visited
-    }
-    mvs_by_id = {
-        m.id: m
-        for m in db.scalars(select(ModelVersion).where(ModelVersion.project_id == project_id))
-        if ("model_version", m.id) in visited
-    }
-    models_by_id = {
-        rm.id: rm
-        for rm in db.scalars(select(RegisteredModel).where(RegisteredModel.project_id == project_id))
-    }
-    exps_by_id = {
-        ex.id: ex
-        for ex in db.scalars(select(Experiment).where(Experiment.project_id == project_id))
-        if ("experiment", ex.id) in visited
-    }
-    scans_by_id = {
-        sc.id: sc
-        for sc in db.scalars(select(SafetyScan).where(SafetyScan.project_id == project_id))
-        if ("safety_scan", sc.id) in visited
-    }
-
-    nodes: list[dict[str, Any]] = []
-    for ntype, nid in sorted(visited):
-        label = f"{ntype}:{nid}"
-        meta: dict[str, Any] = {}
-        if ntype == "dataset" and nid in datasets_by_id:
-            ds = datasets_by_id[nid]
-            label = ds.name
-            meta = {"description": ds.description}
-        elif ntype == "run" and nid in runs_by_id:
-            r = runs_by_id[nid]
-            label = r.name
-            meta = {"run_type": r.run_type, "status": status_out(r.status), "base_model": r.base_model}
-        elif ntype == "artifact" and nid in artifacts_by_id:
-            a = artifacts_by_id[nid]
-            label = f"{a.name}:v{a.version}"
-            meta = {"kind": a.kind, "sha256": a.sha256, "size_bytes": a.size_bytes, "status": a.status}
-        elif ntype == "model_version" and nid in mvs_by_id:
-            mv = mvs_by_id[nid]
-            rm = models_by_id.get(mv.model_id)
-            label = f"{rm.name if rm else mv.model_id} v{mv.version}"
-            meta = {"model_id": mv.model_id, "version": mv.version, "stage": mv.stage}
-        elif ntype == "experiment" and nid in exps_by_id:
-            ex = exps_by_id[nid]
-            label = ex.name
-            meta = {"status": ex.status}
-        elif ntype == "safety_scan" and nid in scans_by_id:
-            sc = scans_by_id[nid]
-            label = f"SafetyScan ({sc.status})"
-            meta = {"status": sc.status, "global_score": sc.global_score}
-
-        nodes.append(
-            {
-                "id": f"{ntype}:{nid}",
-                "node_type": ntype,
-                "entity_id": nid,
-                "label": label,
-                "metadata": meta,
-            }
-        )
-
-    edges = [
-        edge
-        for edge in edge_map.values()
-        if (edge["source_type"], edge["source_id"]) in visited
-        and (edge["target_type"], edge["target_id"]) in visited
-    ]
-    edges.sort(key=lambda e: (e["source"], e["target"], e["relation"]))
-    return nodes, edges
 
 
 @router.get("/runs/{run_id}/lineage")
-def get_run_lineage(run_id: str, db: DbSession, principal: ViewerAuth) -> dict[str, Any]:
+def get_run_lineage(
+    run_id: str,
+    db: DbSession,
+    principal: ViewerAuth,
+    direction: Direction = "both",
+    depth: Annotated[int, Query(ge=0, le=MAX_LINEAGE_DEPTH)] = DEFAULT_LINEAGE_DEPTH,
+) -> dict[str, Any]:
     _get_run_or_404(db, principal.project_id, run_id)
-    nodes, edges = _build_lineage_graph(db, principal.project_id, [("run", run_id)])
-    return {"run_id": run_id, "nodes": nodes, "edges": edges}
-
-
-# ---------------------------------------------------------------------------
-# Sweeps
-# ---------------------------------------------------------------------------
-
-
-@router.post("/sweeps", status_code=201)
-def create_sweep(
-    db: DbSession,
-    principal: MemberAuth,
-    payload: Annotated[dict[str, Any], Body()],
-) -> dict[str, Any]:
-    body: SweepCreate = _parse_body(SweepCreate, payload)
-    name = body.name.strip()
-    if not name:
-        raise HTTPException(status_code=422, detail="name must not be blank")
-
-    exists = db.scalar(
-        select(MLOpsSweep.id).where(MLOpsSweep.project_id == principal.project_id, MLOpsSweep.name == name)
-    )
-    if exists is not None:
-        raise HTTPException(status_code=409, detail="sweep name already exists")
-
-    try:
-        normalized_space = validate_search_space(body.search_space)
-    except InvalidSearchSpaceError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    if body.early_stopping is not None:
-        strat = body.early_stopping.get("strategy", "none")
-        if strat not in {"none", "median", "asha"}:
-            raise HTTPException(status_code=422, detail=f"unsupported early stopping strategy '{strat}'")
-
-    sweep = MLOpsSweep(
-        project_id=principal.project_id,
-        name=name,
-        description=body.description,
-        method=body.method,
-        metric_name=body.metric_name.strip(),
-        metric_goal=body.metric_goal,
-        search_space=normalized_space,
-        early_stopping=body.early_stopping,
-        max_trials=body.max_trials,
-        status="running",
-    )
-    db.add(sweep)
-    db.flush()
-    return _sweep_out(sweep)
-
-
-@router.get("/sweeps")
-def list_sweeps(db: DbSession, principal: ViewerAuth) -> dict[str, Any]:
-    rows = list(
-        db.scalars(
-            select(MLOpsSweep)
-            .where(MLOpsSweep.project_id == principal.project_id)
-            .order_by(MLOpsSweep.created_at.desc())
-        )
-    )
-    return {"items": [_sweep_out(s) for s in rows]}
-
-
-@router.get("/sweeps/{sweep_id}")
-def get_sweep(sweep_id: str, request: Request, db: DbSession, principal: ViewerAuth) -> dict[str, Any]:
-    sweep = _get_sweep_or_404(db, principal.project_id, sweep_id)
-    trials = _sweep_trials(request, db, principal.project_id, sweep.id)
-    analysis = build_sweep_analysis(sweep, trials)
-    out = _sweep_out(sweep)
-    out["trials"] = trials
-    out["analysis"] = analysis
-    return out
-
-
-@router.post("/sweeps/{sweep_id}/trials/next", status_code=201)
-def suggest_sweep_trial(
-    sweep_id: str,
-    request: Request,
-    db: DbSession,
-    principal: MemberAuth,
-    payload: Annotated[dict[str, Any] | None, Body()] = None,
-) -> dict[str, Any]:
-    sweep = _get_sweep_or_404(db, principal.project_id, sweep_id)
-    if sweep.status in {"cancelled", "stopped", "completed"}:
-        raise HTTPException(status_code=409, detail=f"sweep is {sweep.status}")
-
-    body: SweepNextTrialIn = _parse_body(SweepNextTrialIn, payload or {})
-    if body.dataset_id is not None:
-        _get_dataset_or_404(db, principal.project_id, body.dataset_id)
-
-    existing_runs = _sweep_trials(request, db, principal.project_id, sweep.id)
-    try:
-        suggested = suggest_next_params(
-            method=sweep.method,
-            search_space=sweep.search_space,
-            completed_or_existing_trials=existing_runs,
-            metric_goal=sweep.metric_goal,
-            seed=sweep.id,
-            max_trials=sweep.max_trials,
-            metric_name=sweep.metric_name,
-        )
-    except SweepExhaustedError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-    trial_idx = len(existing_runs)
-    run_name = body.name.strip() if body.name else f"{sweep.name}-trial-{trial_idx + 1}"
-    tags = list(dict.fromkeys(body.tags))
-    try:
-        _check_tags(tags)
-        service.check_capacity(db, request.app.state.settings, principal.project_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from None
-    except service.CapacityError as exc:
-        raise capacity_http(exc) from None
-    run = service.new_run(
+    nodes, edges, truncated = query_bounded_lineage(
         db,
         principal.project_id,
-        name=run_name,
-        tags=tags,
-        params=suggested,
-        run_type=body.run_type,
-        base_model=body.base_model,
-        dataset_version_id=body.dataset_id,
-        sweep_id=sweep.id,
-        created_by=principal.user_id,
+        [("run", run_id)],
+        direction=direction,
+        depth=depth,
     )
-    sweep.status = "running"
-    db.flush()
-
-    if body.dataset_id is not None:
-        _add_lineage_edge(db, principal.project_id, "dataset", body.dataset_id, "run", run.id, "trained_on")
-
-    return {
-        "sweep_id": sweep.id,
-        "trial_index": trial_idx,
-        "hyperparams": suggested,
-        "run": render_run(db, request.app.state.metric_store, run),
-    }
-
-
-@router.post("/sweeps/{sweep_id}/stop")
-def stop_sweep(sweep_id: str, db: DbSession, principal: MemberAuth) -> dict[str, Any]:
-    sweep = _get_sweep_or_404(db, principal.project_id, sweep_id)
-    sweep.status = "cancelled"
-    sweep.stopped_at = utcnow()
-    db.flush()
-    out = _sweep_out(sweep)
-    out["stopped"] = True
-    return out
+    return {"run_id": run_id, "nodes": nodes, "edges": edges, "truncated": truncated}
 
 
 # ---------------------------------------------------------------------------
@@ -828,6 +640,83 @@ def delete_model(
     return {"deleted": True, "id": model_id}
 
 
+def _lock_model_row(db: Session, project_id: str, model_id: str) -> None:
+    """Serialize concurrent stage promotions / version creations on Postgres."""
+    if db.get_bind().dialect.name == "postgresql":
+        db.scalars(
+            select(RegisteredModel)
+            .where(RegisteredModel.id == model_id, RegisteredModel.project_id == project_id)
+            .with_for_update()
+        ).first()
+
+
+def _demote_existing_production(
+    db: Session,
+    *,
+    project_id: str,
+    model_id: str,
+    promoted_version: int,
+    exclude_version_id: str | None,
+    principal: Principal,
+) -> list[int]:
+    """Demote any existing `production` version of `model_id` to `archived` in the same transaction."""
+    stmt = select(ModelVersion).where(
+        ModelVersion.project_id == project_id,
+        ModelVersion.model_id == model_id,
+        ModelVersion.stage == "production",
+    )
+    if exclude_version_id is not None:
+        stmt = stmt.where(ModelVersion.id != exclude_version_id)
+    prev_rows = list(db.scalars(stmt))
+    demoted: list[int] = []
+    now = utcnow()
+    for prev in prev_rows:
+        prev.stage = "archived"
+        demoted.append(prev.version)
+        db.add(
+            ModelStageHistory(
+                project_id=project_id,
+                model_id=model_id,
+                version=prev.version,
+                from_stage="production",
+                to_stage="archived",
+                actor_kind=principal.actor_kind,
+                actor_id=principal.actor_id,
+                comment=f"Demoted automatically by promotion of v{promoted_version}",
+                ts=now,
+            )
+        )
+    if prev_rows:
+        db.flush()
+    return demoted
+
+
+def _validate_and_normalize_alias(raw_alias: str, principal: Principal) -> str:
+    alias = raw_alias.strip().lstrip("@")
+    if not alias:
+        raise HTTPException(status_code=422, detail="alias must not be blank")
+    # Check admin-only aliases case-insensitively BEFORE regex validation so a member trying
+    # e.g. "CHAMPION" or "Production" gets 403 rather than 422.
+    if alias.lower() in ADMIN_ONLY_ALIASES:
+        ensure_role(principal, Role.ADMIN)
+    if not ALIAS_PATTERN.match(alias):
+        raise HTTPException(status_code=422, detail="alias must match ^[a-z][a-z0-9_-]{0,49}$")
+    return alias
+
+
+def _get_webhook_or_404(db: Session, project_id: str, model_id: str, webhook_id: str) -> ModelWebhook:
+    row = db.scalars(
+        select(ModelWebhook).where(
+            ModelWebhook.id == webhook_id,
+            ModelWebhook.model_id == model_id,
+            ModelWebhook.project_id == project_id,
+        )
+    ).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="webhook not found")
+    return row
+
+
 @router.post("/models/{model_id}/versions", status_code=201)
 def create_model_version(
     model_id: str,
@@ -841,16 +730,22 @@ def create_model_version(
     if body.stage in ADMIN_ONLY_STAGES:
         ensure_role(principal, Role.ADMIN)
 
-    if body.artifact_id is not None:
-        _get_artifact_or_404(db, principal.project_id, body.artifact_id)
     if body.run_id is not None:
         _get_run_or_404(db, principal.project_id, body.run_id)
     if body.eval_experiment_id is not None:
         _get_experiment_or_404(db, principal.project_id, body.eval_experiment_id)
     if body.safety_scan_id is not None:
         _get_safety_scan_or_404(db, principal.project_id, body.safety_scan_id)
+    resolved_artifact_id: str | None = None
+    if body.artifact_id is not None:
+        resolved_artifact_id = _resolve_or_bridge_artifact(
+            db, principal.project_id, body.artifact_id, body.run_id
+        ).id
+
+    _lock_model_row(db, principal.project_id, model.id)
 
     mv: ModelVersion | None = None
+    demoted: list[int] = []
     for attempt in range(MAX_CREATE_ATTEMPTS):
         try:
             with db.begin_nested():
@@ -859,11 +754,21 @@ def create_model_version(
                         ModelVersion.project_id == principal.project_id, ModelVersion.model_id == model.id
                     )
                 )
+                next_ver = (current_ver or 0) + 1
+                if body.stage == "production":
+                    demoted = _demote_existing_production(
+                        db,
+                        project_id=principal.project_id,
+                        model_id=model.id,
+                        promoted_version=next_ver,
+                        exclude_version_id=None,
+                        principal=principal,
+                    )
                 mv = ModelVersion(
                     project_id=principal.project_id,
                     model_id=model.id,
-                    version=(current_ver or 0) + 1,
-                    artifact_id=body.artifact_id,
+                    version=next_ver,
+                    artifact_id=resolved_artifact_id,
                     run_id=body.run_id,
                     eval_experiment_id=body.eval_experiment_id,
                     safety_scan_id=body.safety_scan_id,
@@ -882,8 +787,38 @@ def create_model_version(
                 raise HTTPException(status_code=409, detail="concurrent version creation, retry") from None
 
     assert mv is not None
-    if body.artifact_id is not None:
-        _add_lineage_edge(db, principal.project_id, "artifact", body.artifact_id, "model_version", mv.id, "packaged_as")
+    if body.stage != "none":
+        db.add(
+            ModelStageHistory(
+                project_id=principal.project_id,
+                model_id=model.id,
+                version=mv.version,
+                from_stage="none",
+                to_stage=body.stage,
+                actor_kind=principal.actor_kind,
+                actor_id=principal.actor_id,
+                comment="Initial stage on version creation",
+            )
+        )
+        if body.stage in ADMIN_ONLY_STAGES:
+            audit.record(
+                db,
+                action="model.stage_change",
+                project_id=principal.project_id,
+                actor_kind=principal.actor_kind,
+                actor_id=principal.actor_id,
+                target=f"{model.id}:v{mv.version}",
+                detail={
+                    "model_id": model.id,
+                    "version": mv.version,
+                    "from_stage": "none",
+                    "to_stage": body.stage,
+                    "demoted_versions": demoted,
+                },
+            )
+
+    if resolved_artifact_id is not None:
+        _add_lineage_edge(db, principal.project_id, "artifact", resolved_artifact_id, "model_version", mv.id, "packaged_as")
     if body.run_id is not None:
         _add_lineage_edge(db, principal.project_id, "run", body.run_id, "model_version", mv.id, "registered_as")
     if body.eval_experiment_id is not None:
@@ -895,7 +830,107 @@ def create_model_version(
             db, principal.project_id, "model_version", mv.id, "safety_scan", body.safety_scan_id, "audited_by"
         )
 
+    dispatch_model_event(
+        db,
+        project_id=principal.project_id,
+        model_id=model.id,
+        event="version.created",
+        payload={
+            "event": "version.created",
+            "model_id": model.id,
+            "model_name": model.name,
+            "version": mv.version,
+            "stage": mv.stage,
+            "run_id": mv.run_id,
+            "artifact_id": mv.artifact_id,
+            "created_by": mv.created_by,
+            "ts": _iso_utc(mv.created_at),
+        },
+    )
+
     model.updated_at = utcnow()
+    db.flush()
+    return _version_out(mv)
+
+
+def _change_model_version_stage(
+    model_id: str,
+    version: int,
+    db: Session,
+    principal: Principal,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    model = _get_model_or_404(db, principal.project_id, model_id)
+    body: ModelStagePatch = _parse_body(ModelStagePatch, payload)
+    if body.stage in ADMIN_ONLY_STAGES:
+        ensure_role(principal, Role.ADMIN)
+
+    _lock_model_row(db, principal.project_id, model.id)
+    mv = _get_model_version_or_404(db, principal.project_id, model.id, version)
+    if mv.stage == "production":
+        ensure_role(principal, Role.ADMIN)
+
+    old_stage = mv.stage
+    demoted: list[int] = []
+    if body.stage == "production" and old_stage != "production":
+        demoted = _demote_existing_production(
+            db,
+            project_id=principal.project_id,
+            model_id=model.id,
+            promoted_version=mv.version,
+            exclude_version_id=mv.id,
+            principal=principal,
+        )
+
+    now = utcnow()
+    mv.stage = body.stage
+    db.add(
+        ModelStageHistory(
+            project_id=principal.project_id,
+            model_id=model.id,
+            version=mv.version,
+            from_stage=old_stage,
+            to_stage=body.stage,
+            actor_kind=principal.actor_kind,
+            actor_id=principal.actor_id,
+            comment=body.comment,
+            ts=now,
+        )
+    )
+    audit.record(
+        db,
+        action="model.stage_change",
+        project_id=principal.project_id,
+        actor_kind=principal.actor_kind,
+        actor_id=principal.actor_id,
+        target=f"{model.id}:v{mv.version}",
+        detail={
+            "model_id": model.id,
+            "version": mv.version,
+            "from_stage": old_stage,
+            "to_stage": body.stage,
+            "demoted_versions": demoted,
+        },
+    )
+    dispatch_model_event(
+        db,
+        project_id=principal.project_id,
+        model_id=model.id,
+        event="stage.changed",
+        payload={
+            "event": "stage.changed",
+            "model_id": model.id,
+            "model_name": model.name,
+            "version": mv.version,
+            "from_stage": old_stage,
+            "to_stage": body.stage,
+            "demoted_versions": demoted,
+            "comment": body.comment,
+            "actor_id": principal.actor_id,
+            "ts": _iso_utc(now),
+        },
+    )
+    model.updated_at = now
     db.flush()
     return _version_out(mv)
 
@@ -908,17 +943,172 @@ def update_model_version_stage(
     principal: MemberAuth,
     payload: Annotated[dict[str, Any], Body()],
 ) -> dict[str, Any]:
+    return _change_model_version_stage(model_id, version, db, principal, payload)
+
+
+@router.post("/models/{model_id}/versions/{version}/stage")
+@canonical_router.post("/models/{model_id}/versions/{version}/stage")
+def post_model_version_stage(
+    model_id: str,
+    version: int,
+    db: DbSession,
+    principal: MemberAuth,
+    payload: Annotated[dict[str, Any], Body()],
+) -> dict[str, Any]:
+    return _change_model_version_stage(model_id, version, db, principal, payload)
+
+
+@router.get("/models/{model_id}/history")
+@canonical_router.get("/models/{model_id}/history")
+def get_model_stage_history(
+    model_id: str,
+    db: DbSession,
+    principal: ViewerAuth,
+    version: Annotated[int | None, Query(ge=1)] = None,
+    limit: Annotated[int, Query(ge=1, le=MAX_PAGE)] = 100,
+) -> dict[str, Any]:
     model = _get_model_or_404(db, principal.project_id, model_id)
-    body: ModelStagePatch = _parse_body(ModelStagePatch, payload)
-    if body.stage in ADMIN_ONLY_STAGES:
-        ensure_role(principal, Role.ADMIN)
+    stmt = select(ModelStageHistory).where(
+        ModelStageHistory.project_id == principal.project_id,
+        ModelStageHistory.model_id == model.id,
+    )
+    if version is not None:
+        stmt = stmt.where(ModelStageHistory.version == version)
+    rows = list(db.scalars(stmt.order_by(ModelStageHistory.ts.desc(), ModelStageHistory.id.desc()).limit(limit)))
+    return {"model_id": model.id, "items": [_history_out(h) for h in rows]}
+
+
+@router.get("/models/{model_id}/versions/{version}/files")
+@canonical_router.get("/models/{model_id}/versions/{version}/files")
+def get_model_version_files(
+    model_id: str,
+    version: int,
+    request: Request,
+    response: Response,
+    db: DbSession,
+    principal: ViewerAuth,
+) -> dict[str, Any]:
+    model = _get_model_or_404(db, principal.project_id, model_id)
     mv = _get_model_version_or_404(db, principal.project_id, model.id, version)
-    if mv.stage == "production":
-        ensure_role(principal, Role.ADMIN)
-    mv.stage = body.stage
-    model.updated_at = utcnow()
+
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+
+    files: list[dict[str, Any]] = []
+    if mv.artifact_id is not None:
+        ma = db.scalars(
+            select(Artifact).where(
+                Artifact.id == mv.artifact_id,
+                Artifact.project_id == principal.project_id,
+            )
+        ).first()
+        if ma is not None:
+            if ma.artifact_id is not None:
+                blob = db.scalars(
+                    select(BlobArtifact).where(
+                        BlobArtifact.id == ma.artifact_id,
+                        BlobArtifact.project_id == principal.project_id,
+                    )
+                ).first()
+                if blob is not None and blob.status == "ready":
+                    store = get_store(request.app)
+                    ttl = request.app.state.settings.artifact_url_ttl_seconds
+                    presigned = store.presign_get(
+                        blob.project_id, blob.sha256, ttl, filename=blob.name, media_type=blob.media_type
+                    )
+                    url = presigned.url if presigned is not None else f"/api/v1/artifacts/{blob.id}/download"
+                    files.append(
+                        {
+                            "artifact_id": blob.id,
+                            "model_artifact_id": ma.id,
+                            "path": blob.name,
+                            "size": blob.size,
+                            "sha256": blob.sha256,
+                            "media_type": blob.media_type,
+                            "url": url,
+                        }
+                    )
+            elif ma.external_uri is not None:
+                files.append(
+                    {
+                        "artifact_id": None,
+                        "model_artifact_id": ma.id,
+                        "path": ma.name,
+                        "size": ma.size_bytes,
+                        "sha256": ma.sha256,
+                        "media_type": ma.content_type,
+                        "external_uri": ma.external_uri,
+                        "url": None,
+                    }
+                )
+            elif (ma.metadata_ or {}).get("legacy_storage_uri"):
+                raise HTTPException(
+                    status_code=410,
+                    detail="legacy artifact blob is no longer servable; re-upload a new version",
+                )
+
+    return {"model_id": model.id, "version": mv.version, "files": files}
+
+
+def _upsert_model_alias(
+    db: Session,
+    *,
+    principal: Principal,
+    model_id: str,
+    raw_alias: str,
+    version: int,
+) -> dict[str, Any]:
+    model = _get_model_or_404(db, principal.project_id, model_id)
+    alias = _validate_and_normalize_alias(raw_alias, principal)
+    _get_model_version_or_404(db, principal.project_id, model.id, version)
+
+    existing = db.scalars(
+        select(ModelAlias).where(
+            ModelAlias.project_id == principal.project_id,
+            ModelAlias.model_id == model.id,
+            ModelAlias.alias == alias,
+        )
+    ).first()
+    previous_version = existing.version if existing is not None else None
+    now = utcnow()
+    if existing is None:
+        db.add(ModelAlias(project_id=principal.project_id, model_id=model.id, alias=alias, version=version))
+    else:
+        existing.version = version
+        existing.updated_at = now
+    audit.record(
+        db,
+        action="model.alias_set",
+        project_id=principal.project_id,
+        actor_kind=principal.actor_kind,
+        actor_id=principal.actor_id,
+        target=f"{model.id}:@{alias}",
+        detail={
+            "model_id": model.id,
+            "alias": alias,
+            "previous_version": previous_version,
+            "version": version,
+        },
+    )
+    dispatch_model_event(
+        db,
+        project_id=principal.project_id,
+        model_id=model.id,
+        event="alias.moved",
+        payload={
+            "event": "alias.moved",
+            "model_id": model.id,
+            "model_name": model.name,
+            "alias": alias,
+            "previous_version": previous_version,
+            "version": version,
+            "actor_id": principal.actor_id,
+            "ts": _iso_utc(now),
+        },
+    )
+    model.updated_at = now
     db.flush()
-    return _version_out(mv)
+    return {"model_id": model.id, "alias": alias, "version": version}
 
 
 @router.post("/models/{model_id}/aliases")
@@ -928,35 +1118,203 @@ def set_model_alias(
     principal: MemberAuth,
     payload: Annotated[dict[str, Any], Body()],
 ) -> dict[str, Any]:
-    model = _get_model_or_404(db, principal.project_id, model_id)
     body: ModelAliasIn = _parse_body(ModelAliasIn, payload)
-    alias = body.alias.strip().lstrip("@")
-    if not alias:
-        raise HTTPException(status_code=422, detail="alias must not be blank")
-    if alias.lower() in ADMIN_ONLY_ALIASES:
-        ensure_role(principal, Role.ADMIN)
+    return _upsert_model_alias(db, principal=principal, model_id=model_id, raw_alias=body.alias, version=body.version)
 
-    _get_model_version_or_404(db, principal.project_id, model.id, body.version)
 
+@router.put("/models/{model_id}/aliases/{alias}")
+@canonical_router.put("/models/{model_id}/aliases/{alias}")
+def put_model_alias(
+    model_id: str,
+    alias: str,
+    db: DbSession,
+    principal: MemberAuth,
+    payload: Annotated[dict[str, Any], Body()],
+) -> dict[str, Any]:
+    body: ModelAliasVersionIn = _parse_body(ModelAliasVersionIn, payload)
+    return _upsert_model_alias(db, principal=principal, model_id=model_id, raw_alias=alias, version=body.version)
+
+
+@router.delete("/models/{model_id}/aliases/{alias}")
+@canonical_router.delete("/models/{model_id}/aliases/{alias}")
+def delete_model_alias(
+    model_id: str,
+    alias: str,
+    db: DbSession,
+    principal: MemberAuth,
+) -> dict[str, Any]:
+    model = _get_model_or_404(db, principal.project_id, model_id)
+    cleaned = _validate_and_normalize_alias(alias, principal)
     existing = db.scalars(
         select(ModelAlias).where(
             ModelAlias.project_id == principal.project_id,
             ModelAlias.model_id == model.id,
-            ModelAlias.alias == alias,
+            ModelAlias.alias == cleaned,
         )
     ).first()
     if existing is None:
-        db.add(ModelAlias(project_id=principal.project_id, model_id=model.id, alias=alias, version=body.version))
-    else:
-        existing.version = body.version
-        existing.updated_at = utcnow()
-    model.updated_at = utcnow()
+        raise HTTPException(status_code=404, detail="alias not found")
+    previous_version = existing.version
+    now = utcnow()
+    db.delete(existing)
+    audit.record(
+        db,
+        action="model.alias_delete",
+        project_id=principal.project_id,
+        actor_kind=principal.actor_kind,
+        actor_id=principal.actor_id,
+        target=f"{model.id}:@{cleaned}",
+        detail={"model_id": model.id, "alias": cleaned, "previous_version": previous_version},
+    )
+    dispatch_model_event(
+        db,
+        project_id=principal.project_id,
+        model_id=model.id,
+        event="alias.moved",
+        payload={
+            "event": "alias.moved",
+            "model_id": model.id,
+            "model_name": model.name,
+            "alias": cleaned,
+            "previous_version": previous_version,
+            "version": None,
+            "actor_id": principal.actor_id,
+            "ts": _iso_utc(now),
+        },
+    )
+    model.updated_at = now
     db.flush()
-    return {"model_id": model.id, "alias": alias, "version": body.version}
+    return {"deleted": True, "model_id": model.id, "alias": cleaned}
+
+
+# ---------------------------------------------------------------------------
+# CI/CD Webhooks (ADMIN)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/models/{model_id}/webhooks", status_code=201)
+@canonical_router.post("/models/{model_id}/webhooks", status_code=201)
+def create_model_webhook(
+    model_id: str,
+    request: Request,
+    db: DbSession,
+    principal: AdminAuth,
+    payload: Annotated[dict[str, Any], Body()],
+) -> dict[str, Any]:
+    model = _get_model_or_404(db, principal.project_id, model_id)
+    body: WebhookCreate = _parse_body(WebhookCreate, payload)
+    try:
+        url = validate_webhook_url(body.url)
+        events = validate_webhook_events(body.events)
+    except WebhookValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    try:
+        master_key = resolve_secret_key(request.app.state.settings.secret_key)
+    except SecretKeyMissingError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    plaintext_secret = body.secret if body.secret is not None else generate_webhook_secret()
+    encrypted = encrypt_secret(plaintext_secret, master_key)
+
+    wh = ModelWebhook(
+        project_id=principal.project_id,
+        model_id=model.id,
+        url=url,
+        events=events,
+        secret_encrypted=encrypted,
+        active=True,
+        created_by=principal.actor_id,
+    )
+    db.add(wh)
+    db.flush()
+    audit.record(
+        db,
+        action="model.webhook_create",
+        project_id=principal.project_id,
+        actor_kind=principal.actor_kind,
+        actor_id=principal.actor_id,
+        target=wh.id,
+        detail={"model_id": model.id, "events": events},
+    )
+    return _webhook_out(wh, secret=plaintext_secret)
+
+
+@router.get("/models/{model_id}/webhooks")
+@canonical_router.get("/models/{model_id}/webhooks")
+def list_model_webhooks(
+    model_id: str,
+    db: DbSession,
+    principal: AdminAuth,
+) -> dict[str, Any]:
+    model = _get_model_or_404(db, principal.project_id, model_id)
+    rows = list(
+        db.scalars(
+            select(ModelWebhook)
+            .where(ModelWebhook.project_id == principal.project_id, ModelWebhook.model_id == model.id)
+            .order_by(ModelWebhook.created_at.desc(), ModelWebhook.id.desc())
+        )
+    )
+    return {"model_id": model.id, "items": [_webhook_out(wh) for wh in rows]}
+
+
+@router.delete("/models/{model_id}/webhooks/{webhook_id}")
+@canonical_router.delete("/models/{model_id}/webhooks/{webhook_id}")
+def delete_model_webhook(
+    model_id: str,
+    webhook_id: str,
+    db: DbSession,
+    principal: AdminAuth,
+) -> dict[str, Any]:
+    model = _get_model_or_404(db, principal.project_id, model_id)
+    wh = _get_webhook_or_404(db, principal.project_id, model.id, webhook_id)
+    db.delete(wh)
+    audit.record(
+        db,
+        action="model.webhook_delete",
+        project_id=principal.project_id,
+        actor_kind=principal.actor_kind,
+        actor_id=principal.actor_id,
+        target=webhook_id,
+        detail={"model_id": model.id},
+    )
+    db.flush()
+    return {"deleted": True, "id": webhook_id, "model_id": model.id}
+
+
+@router.get("/models/{model_id}/webhooks/{webhook_id}/deliveries")
+@canonical_router.get("/models/{model_id}/webhooks/{webhook_id}/deliveries")
+def list_webhook_deliveries(
+    model_id: str,
+    webhook_id: str,
+    db: DbSession,
+    principal: ViewerAuth,
+    limit: Annotated[int, Query(ge=1, le=MAX_PAGE)] = 100,
+) -> dict[str, Any]:
+    model = _get_model_or_404(db, principal.project_id, model_id)
+    wh = _get_webhook_or_404(db, principal.project_id, model.id, webhook_id)
+    rows = list(
+        db.scalars(
+            select(WebhookDelivery)
+            .where(
+                WebhookDelivery.project_id == principal.project_id,
+                WebhookDelivery.webhook_id == wh.id,
+            )
+            .order_by(WebhookDelivery.created_at.desc(), WebhookDelivery.id.desc())
+            .limit(limit)
+        )
+    )
+    return {"webhook_id": wh.id, "model_id": model.id, "items": [_delivery_out(d) for d in rows]}
 
 
 @router.get("/models/{model_id}/lineage")
-def get_model_lineage(model_id: str, db: DbSession, principal: ViewerAuth) -> dict[str, Any]:
+def get_model_lineage(
+    model_id: str,
+    db: DbSession,
+    principal: ViewerAuth,
+    direction: Direction = "both",
+    depth: Annotated[int, Query(ge=0, le=MAX_LINEAGE_DEPTH)] = DEFAULT_LINEAGE_DEPTH,
+) -> dict[str, Any]:
     model = _get_model_or_404(db, principal.project_id, model_id)
     mvs = list(
         db.scalars(
@@ -968,9 +1326,15 @@ def get_model_lineage(model_id: str, db: DbSession, principal: ViewerAuth) -> di
     )
     seed_nodes = [("model_version", mv.id) for mv in mvs]
     if not seed_nodes:
-        return {"model_id": model.id, "nodes": [], "edges": []}
-    nodes, edges = _build_lineage_graph(db, principal.project_id, seed_nodes)
-    return {"model_id": model.id, "nodes": nodes, "edges": edges}
+        return {"model_id": model.id, "nodes": [], "edges": [], "truncated": False}
+    nodes, edges, truncated = query_bounded_lineage(
+        db,
+        principal.project_id,
+        seed_nodes,
+        direction=direction,
+        depth=depth,
+    )
+    return {"model_id": model.id, "nodes": nodes, "edges": edges, "truncated": truncated}
 
 
 @router.post("/models/{model_id}/versions/{version}/evaluate", status_code=202)
@@ -988,23 +1352,47 @@ def evaluate_model_version(
     if body.dataset_id is not None:
         _get_dataset_or_404(db, principal.project_id, body.dataset_id)
 
+    eval_name = (body.name or f"{model.name}-v{mv.version}-eval")[:200]
+    benchmark_run = BenchmarkRun(
+        project_id=principal.project_id,
+        name=eval_name,
+        suite="lm_eval",
+        tasks=["gsm8k"],
+        runner_backend="local_sim",
+        runner_config={"metrics": body.metrics} if body.metrics else {},
+        eval_mode="generate_until",
+        num_fewshot=0,
+        target_model=(f"{model.name}:v{mv.version}")[:200],
+        model_version_id=mv.id,
+        dataset_id=body.dataset_id,
+        status="queued",
+        simulated=True,
+        summary_metrics={},
+    )
+    db.add(benchmark_run)
+    db.flush()
+
     job = enqueue(
         db,
         principal.project_id,
         "mlops.evaluate",
         {
+            "benchmark_run_id": benchmark_run.id,
             "model_id": model.id,
             "model_name": model.name,
             "version": mv.version,
             "model_version_id": mv.id,
             "dataset_id": body.dataset_id,
-            "name": body.name or f"{model.name}-v{mv.version}-eval",
+            "name": eval_name,
             "metrics": body.metrics,
         },
     )
+    benchmark_run.job_id = job.id
+    db.flush()
     return {
         "status": "queued",
         "job_id": job.id,
+        "benchmark_run_id": benchmark_run.id,
         "model_id": model.id,
         "version": mv.version,
     }

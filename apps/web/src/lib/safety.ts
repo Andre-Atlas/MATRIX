@@ -144,7 +144,7 @@ export function summarizeScan(
   categories: SafetyCategory[],
 ): SafetyScanReport {
   const scanId = scan.id ?? (scan as any).scan_id;
-  const scanFindings = findings.filter((f) => f.scan_id === scanId || !f.scan_id);
+  const scanFindings = findings.filter((f) => f.scan_id === scanId);
 
   let critical = 0;
   let high = 0;
@@ -160,6 +160,17 @@ export function summarizeScan(
     }
   }
 
+  const probesPassed = scan.probes_passed ?? (scan as any).passed_count ?? 0;
+  const probesFailed = scan.probes_failed ?? (scan as any).failed_count ?? 0;
+  const totalProbes = scan.total_probes ?? probesPassed + probesFailed;
+
+  const isNotEvaluated =
+    scan.status === "not_evaluated" ||
+    scan.risk_level === "not_evaluated" ||
+    (scan.safety_score == null && (scan as any).global_score == null);
+
+  const testedSet = new Set(scan.categories_tested ?? []);
+
   const categoryScores: SafetyCategoryScore[] = categories.map((cat) => {
     const catCode = (cat.code ?? cat.id) as SafetyCategoryCode;
     const catFindings = scanFindings.filter(
@@ -169,12 +180,26 @@ export function summarizeScan(
         f.category_id === catCode ||
         f.category_code === cat.id,
     );
-    const catProbesTested = catFindings.length > 0 ? catFindings.length : cat.probes_count || 1;
+    const explicitlyUntested =
+      testedSet.size > 0 && !testedSet.has(catCode) && !testedSet.has(cat.id) && catFindings.length === 0;
+    if (isNotEvaluated || explicitlyUntested || catFindings.length === 0) {
+      return {
+        category_id: cat.id,
+        category_code: catCode,
+        name: cat.name,
+        probes_tested: 0,
+        probes_passed: 0,
+        probes_failed: 0,
+        pass_rate: null,
+        status: "not_evaluated",
+        findings_count: 0,
+        critical_findings: 0,
+      };
+    }
+
+    const catProbesTested = catFindings.length;
     const failedFindings = catFindings.filter((f) => f.status === "failed");
-    const passedCount =
-      catFindings.length > 0
-        ? catFindings.filter((f) => f.status !== "failed").length
-        : catProbesTested;
+    const passedCount = catFindings.filter((f) => f.status !== "failed").length;
     const catCritical = failedFindings.filter((f) => f.severity === "critical").length;
     const passRate = Number((passedCount / catProbesTested).toFixed(2));
     const status = getComplianceStatus(passRate, catCritical);
@@ -193,17 +218,23 @@ export function summarizeScan(
     };
   });
 
-  const probesPassed = scan.probes_passed ?? (scan as any).passed_count ?? 0;
-  const probesFailed = scan.probes_failed ?? (scan as any).failed_count ?? 0;
-  const totalProbes = scan.total_probes ?? probesPassed + probesFailed;
-  const safetyScore =
-    scan.safety_score ??
-    (scan as any).global_score ??
-    calculateSafetyScore(totalProbes, probesPassed, scanFindings);
-  const riskLevel = scan.risk_level ?? getRiskLevel(safetyScore);
+  const rawScanScore = scan.safety_score ?? (scan as any).global_score;
+  const safetyScore: number | null = isNotEvaluated
+    ? null
+    : typeof rawScanScore === "number" && Number.isFinite(rawScanScore)
+      ? rawScanScore
+      : totalProbes > 0
+        ? calculateSafetyScore(totalProbes, probesPassed, scanFindings)
+        : null;
+  const riskLevel: RiskLevel = isNotEvaluated
+    ? "not_evaluated"
+    : scan.risk_level ?? (safetyScore !== null ? getRiskLevel(safetyScore) : "not_evaluated");
 
-  const complianceRate =
-    totalProbes > 0 ? Math.round((probesPassed / totalProbes) * 100) : 100;
+  const complianceRate: number | null = isNotEvaluated
+    ? null
+    : totalProbes > 0
+      ? Math.round((probesPassed / totalProbes) * 100)
+      : null;
 
   const summary: SafetyScanSummary = {
     total_probes: totalProbes,
@@ -216,6 +247,9 @@ export function summarizeScan(
     high_count: high,
     medium_count: medium,
     low_count: low,
+    not_evaluated: isNotEvaluated,
+    simulated: Boolean(scan.simulated),
+    message: scan.message ?? null,
   };
 
   return {
@@ -227,6 +261,7 @@ export function summarizeScan(
       probes_failed: probesFailed,
       safety_score: safetyScore,
       risk_level: riskLevel,
+      simulated: Boolean(scan.simulated),
     },
     category_scores: categoryScores,
     findings: scanFindings,
@@ -249,23 +284,36 @@ export function adaptSafetyCategories(rawCategories: any[] = []): SafetyCategory
 
 export function adaptSafetyScan(s: any): SafetyScan {
   const id = String(s?.id ?? s?.scan_id ?? "");
+  const rawScore = s?.safety_score ?? s?.global_score;
+  const hasNumericScore = typeof rawScore === "number" && Number.isFinite(rawScore);
+  const missingBothScores = s?.safety_score == null && s?.global_score == null;
+  const isNotEvaluated =
+    s?.status === "not_evaluated" ||
+    s?.risk_level === "not_evaluated" ||
+    missingBothScores ||
+    !hasNumericScore;
+  const status = s?.status ?? (isNotEvaluated ? "not_evaluated" : "completed");
   const probesPassed = s?.probes_passed ?? s?.passed_count ?? 0;
   const probesFailed = s?.probes_failed ?? s?.failed_count ?? 0;
   const totalProbes = s?.total_probes ?? probesPassed + probesFailed;
-  const safetyScore = s?.safety_score ?? s?.global_score ?? 100;
-  const riskLevel = s?.risk_level ?? getRiskLevel(safetyScore);
+  const safetyScore: number | null = isNotEvaluated ? null : rawScore;
+  const riskLevel: RiskLevel = isNotEvaluated
+    ? "not_evaluated"
+    : s?.risk_level ?? getRiskLevel(safetyScore!);
 
   return {
     ...s,
     id,
     name: s?.name || `Audit ${id.slice(0, 8)}`,
     target_model: s?.target_model ?? "gpt-4o-mini",
-    status: s?.status ?? "completed",
+    status,
     safety_score: safetyScore,
     probes_passed: probesPassed,
     probes_failed: probesFailed,
     total_probes: totalProbes,
     risk_level: riskLevel,
+    simulated: Boolean(s?.simulated),
+    message: s?.message ?? null,
     categories_tested: s?.categories_tested ?? [],
     findings_count: s?.findings_count ?? s?.failed_count ?? probesFailed,
     created_at: s?.created_at ?? new Date().toISOString(),
@@ -382,17 +430,24 @@ export function formatRiskLevel(risk?: RiskLevel | string) {
         color: "text-red-400",
         stroke: "#ef4444",
       };
+    case "not_evaluated":
+      return {
+        label: "Not evaluated",
+        badge: "bg-zinc-900 text-zinc-200 border-zinc-600",
+        color: "text-zinc-300",
+        stroke: "#71717a",
+      };
     default:
       return {
-        label: "Low Risk",
-        badge: "bg-emerald-950/60 text-emerald-300 border-emerald-800/60",
-        color: "text-emerald-400",
-        stroke: "#10b981",
+        label: "Not Evaluated",
+        badge: "bg-zinc-900 text-zinc-200 border-zinc-600",
+        color: "text-zinc-300",
+        stroke: "#71717a",
       };
   }
 }
 
-export function formatComplianceStatus(status: ComplianceStatus) {
+export function formatComplianceStatus(status?: ComplianceStatus | string) {
   switch (status) {
     case "compliant":
       return {
@@ -412,11 +467,17 @@ export function formatComplianceStatus(status: ComplianceStatus) {
         badge: "bg-red-950/60 text-red-300 border-red-800/60",
         dot: "bg-red-400",
       };
+    case "not_evaluated":
+      return {
+        label: "Not evaluated",
+        badge: "bg-zinc-900 text-zinc-200 border-zinc-600",
+        dot: "bg-zinc-400",
+      };
     default:
       return {
-        label: "Compliant",
-        badge: "bg-emerald-950/60 text-emerald-300 border-emerald-800/60",
-        dot: "bg-emerald-400",
+        label: "Unknown",
+        badge: "bg-zinc-900 text-zinc-200 border-zinc-600",
+        dot: "bg-zinc-400",
       };
   }
 }

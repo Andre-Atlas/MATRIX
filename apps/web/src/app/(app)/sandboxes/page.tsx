@@ -1,3 +1,4 @@
+import { unstable_rethrow } from "next/navigation";
 import { SandboxesClient } from "@/components/sandboxes/sandboxes-client";
 import { apiGet } from "@/lib/api";
 import type { ListResponse, SandboxRun, SandboxTaskTranscript } from "@/lib/types";
@@ -17,6 +18,7 @@ export default async function SandboxesPage({
     const runsResp = await apiGet<ListResponse<SandboxRun> | SandboxRun[]>("/api/v1/sandboxes/runs");
     initialRuns = Array.isArray(runsResp) ? runsResp : runsResp?.items ?? [];
   } catch (err) {
+    unstable_rethrow(err);
     initialError =
       err instanceof Error ? err.message : "Could not load sandbox runs.";
   }
@@ -34,7 +36,8 @@ export default async function SandboxesPage({
         ListResponse<SandboxTaskTranscript> | SandboxTaskTranscript[]
       >(`/api/v1/sandboxes/runs/${encodeURIComponent(initialSelectedRunId)}/transcripts`);
       initialTranscripts = Array.isArray(trResp) ? trResp : trResp?.items ?? [];
-    } catch {
+    } catch (err) {
+      unstable_rethrow(err);
       // transcripts optional on initial load
     }
   }

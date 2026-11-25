@@ -1,8 +1,8 @@
-"""Inspect AI Sandboxes API (ADR-015).
+"""Inspect AI Sandboxes API (ADR-010, ADR-015, T7).
 
 Provides endpoints for creating, monitoring, inspecting transcripts, and cancelling
 Inspect AI agent sandbox runs with strict multi-tenant isolation, RBAC, anti-NaN
-validation, and hardened container execution policies.
+validation, and hardened fail-closed Docker container execution policies.
 """
 
 from __future__ import annotations
@@ -18,13 +18,15 @@ from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from matrix_server.api.artifacts import get_store
-from matrix_server.auth import Principal, Role, ensure_role, require
+from matrix_server.auth import Principal, Role, require
 from matrix_server.sandboxes.runner import (
-    FORBIDDEN_SOCKET_PATTERNS,
-    NETWORK_APPROVED_BY,
-    RESERVED_POLICY_KEYS,
+    SandboxPolicyError,
+    is_fake_backend_allowed,
+    is_test_env,
     run_sandbox_job,
     validate_sandbox_path,
+    validate_sandbox_policy,
+    validate_scorer_config,
 )
 from matrix_server.storage import jobs
 from matrix_server.storage.db import as_utc, get_db, utcnow
@@ -98,6 +100,7 @@ def _run_out(run: SandboxRun) -> dict[str, Any]:
         "scorer_config": run.scorer_config,
         "sandbox_policy": run.sandbox_policy,
         "status": run.status,
+        "simulated": bool(run.simulated),
         "pass_rate": run.pass_rate,
         "total_tasks": run.total_tasks,
         "passed_tasks": run.passed_tasks,
@@ -117,6 +120,7 @@ def _transcript_summary_out(t: SandboxTaskTranscript) -> dict[str, Any]:
         "sandbox_run_id": t.sandbox_run_id,
         "task_key": t.task_key,
         "status": t.status,
+        "simulated": bool(t.simulated),
         "score": t.score,
         "duration_ms": t.duration_ms,
         "input_tokens": t.input_tokens,
@@ -133,6 +137,7 @@ def _transcript_detail_out(t: SandboxTaskTranscript) -> dict[str, Any]:
         "sandbox_run_id": t.sandbox_run_id,
         "task_key": t.task_key,
         "status": t.status,
+        "simulated": bool(t.simulated),
         "score": t.score,
         "scorer_details": t.scorer_details,
         "steps": t.steps,
@@ -152,7 +157,7 @@ def _transcript_detail_out(t: SandboxTaskTranscript) -> dict[str, Any]:
 
 class CreateSandboxRunIn(BaseModel):
     name: str = Field(min_length=1, max_length=200)
-    runner_backend: Literal["local_sandbox", "docker"] = "local_sandbox"
+    runner_backend: Literal["docker", "fake"] = "docker"
     dataset_id: str | None = Field(default=None, max_length=32)
     dataset_commit_id: str | None = Field(default=None, max_length=32)
     solver_config: dict[str, Any] = Field(default_factory=dict)
@@ -183,33 +188,20 @@ def create_sandbox_run(
             detail=exc.errors(include_input=False, include_context=False, include_url=False),
         ) from exc
 
+    if body.runner_backend == "fake" and not is_fake_backend_allowed():
+        raise HTTPException(
+            status_code=422,
+            detail="runner_backend='fake' is only allowed when MATRIX_ENV is 'test' or 'dev'",
+        )
+
     policy = dict(body.sandbox_policy or {})
+    try:
+        validate_sandbox_policy(policy)
+        validate_scorer_config(body.scorer_config)
+    except SandboxPolicyError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    # Server-owned policy keys: the worker trusts them, so a client may never send them.
-    reserved = sorted(k for k in policy if k in RESERVED_POLICY_KEYS)
-    if reserved:
-        raise HTTPException(status_code=422, detail=f"sandbox_policy keys are server-owned: {', '.join(reserved)}")
-
-    # Security rule 1: network access is approved only by an ADMIN of the project (never an API
-    # key); the approval comes from the authenticated principal, never from the request body.
-    network_mode = policy.get("network_mode", "none")
-    if network_mode != "none":
-        ensure_role(principal, Role.ADMIN)
-        policy[NETWORK_APPROVED_BY] = principal.actor_id
-
-    # Security rule 2: Docker socket mounting strictly forbidden
-    mounts = policy.get("mounts", [])
-    if isinstance(mounts, list):
-        for m in mounts:
-            m_str = str(m)
-            if any(sock in m_str for sock in FORBIDDEN_SOCKET_PATTERNS):
-                raise HTTPException(
-                    status_code=400,
-                    detail="mounting /var/run/docker.sock is strictly forbidden",
-                )
-
-    # Security rule 3: Path traversal checks
-    # Check initial files in solver_config
+    # Path traversal checks on initial files and task keys
     initial_files = body.solver_config.get("initial_files", {})
     if isinstance(initial_files, dict):
         for fpath in initial_files:
@@ -218,7 +210,6 @@ def create_sandbox_run(
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    # Check tasks if specified
     tasks = body.solver_config.get("tasks", [])
     if isinstance(tasks, list):
         for t in tasks:
@@ -234,21 +225,6 @@ def create_sandbox_run(
                         validate_sandbox_path(fpath, "task initial_file")
                     except ValueError as exc:
                         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    # Check timeout & step bounds
-    timeout = policy.get("timeout_seconds")
-    if timeout is not None and (not isinstance(timeout, (int, float)) or not (1 <= timeout <= 3600)):
-        raise HTTPException(status_code=422, detail="timeout_seconds must be between 1 and 3600")
-
-    task_timeout = policy.get("task_timeout_seconds")
-    if task_timeout is not None and (
-        not isinstance(task_timeout, (int, float)) or not (1 <= task_timeout <= 600)
-    ):
-        raise HTTPException(status_code=422, detail="task_timeout_seconds must be between 1 and 600")
-
-    max_steps = policy.get("max_steps")
-    if max_steps is not None and (not isinstance(max_steps, int) or not (1 <= max_steps <= 100)):
-        raise HTTPException(status_code=422, detail="max_steps must be between 1 and 100")
 
     # Anti-IDOR: Check dataset ownership if provided
     if body.dataset_id:
@@ -271,6 +247,7 @@ def create_sandbox_run(
         scorer_config=body.scorer_config,
         sandbox_policy=policy,
         status="queued",
+        simulated=(body.runner_backend == "fake"),
     )
     db.add(run)
     db.flush()
@@ -285,7 +262,7 @@ def create_sandbox_run(
     db.commit()
     db.refresh(run)
 
-    if body.sync_exec:
+    if body.sync_exec and is_test_env():
         run_sandbox_job(
             request.app.state.session_factory,
             run.id,
@@ -440,7 +417,7 @@ def cancel_sandbox_run(
     if run is None:
         raise HTTPException(status_code=404, detail="sandbox run not found")
 
-    if run.status in ("completed", "failed", "cancelled"):
+    if run.status in ("completed", "failed", "cancelled", "sandbox_unavailable"):
         return _run_out(run)
 
     run.status = "cancelled"

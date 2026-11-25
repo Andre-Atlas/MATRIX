@@ -6,14 +6,23 @@ import json
 import math
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from matrix_server.auth import Principal, Role, require
 from matrix_server.benchmarks.catalog import VALID_SUITES, list_catalog, validate_tasks
-from matrix_server.benchmarks.runner import run_benchmark_job, validate_runner_url
+from matrix_server.benchmarks.runner import (
+    BenchmarkCredentialError,
+    EngineUnavailable,
+    get_benchmark_engine,
+    run_benchmark_job,
+    sanitize_runner_config,
+    validate_runner_config,
+)
+from matrix_server.egress import EgressError
+from matrix_server.sandboxes.runner import is_test_env
 from matrix_server.storage import jobs
 from matrix_server.storage.db import as_utc, get_db, utcnow
 from matrix_server.storage.models import (
@@ -31,7 +40,7 @@ MemberAuth = Annotated[Principal, Depends(require(Role.MEMBER))]
 
 router = APIRouter(prefix="/api/v1/benchmarks", tags=["benchmarks"])
 
-VALID_BACKENDS: set[str] = {"local_sim", "http", "vllm"}
+VALID_BACKENDS: set[str] = {"local_sim", "http", "vllm", "lm_eval", "vlmeval"}
 VALID_EVAL_MODES: set[str] = {"generate_until", "loglikelihood", "multimodal"}
 
 
@@ -98,6 +107,7 @@ def _task_result_out(tr: BenchmarkTaskResult) -> dict[str, Any]:
         "sample_count": tr.sample_count,
         "primary_metric": tr.primary_metric,
         "primary_score": tr.primary_score,
+        "simulated": bool(tr.simulated),
         "metrics": tr.metrics,
         "latency_ms_p50": tr.latency_ms_p50,
         "latency_ms_p95": tr.latency_ms_p95,
@@ -113,7 +123,7 @@ def _run_out(run: BenchmarkRun, task_results: list[BenchmarkTaskResult] | None =
         "suite": run.suite,
         "tasks": list(run.tasks),
         "runner_backend": run.runner_backend,
-        "runner_config": run.runner_config,
+        "runner_config": sanitize_runner_config(run.runner_config),
         "eval_mode": run.eval_mode,
         "num_fewshot": run.num_fewshot,
         "target_model": run.target_model,
@@ -121,6 +131,7 @@ def _run_out(run: BenchmarkRun, task_results: list[BenchmarkTaskResult] | None =
         "dataset_id": run.dataset_id,
         "dataset_commit_id": run.dataset_commit_id,
         "status": run.status,
+        "simulated": bool(run.simulated),
         "summary_metrics": run.summary_metrics,
         "job_id": run.job_id,
         "error": run.error,
@@ -152,6 +163,7 @@ def get_catalog(
 
 @router.post("/runs", status_code=status.HTTP_201_CREATED)
 def create_run(
+    request: Request,
     raw_body: Annotated[Any, Body()],
     db: DbSession,
     principal: MemberAuth,
@@ -184,18 +196,11 @@ def create_run(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    # Anti-SSRF validation for external runners
-    if body.runner_backend in ("http", "vllm"):
-        endpoint_url = body.runner_config.get("endpoint_url")
-        if not endpoint_url:
-            raise HTTPException(
-                status_code=422,
-                detail="runner_config.endpoint_url is required when runner_backend is 'http' or 'vllm'",
-            )
-        try:
-            validate_runner_url(endpoint_url)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    # Secret hygiene & URL syntax/IP pre-check (egress_client enforces allowlist/DNS/pinning at runtime)
+    try:
+        validate_runner_config(body.runner_config, backend=body.runner_backend)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     # Anti-IDOR validation on tenant resources
     if body.model_version_id is not None:
@@ -234,7 +239,7 @@ def create_run(
         suite=body.suite,
         tasks=body.tasks,
         runner_backend=body.runner_backend,
-        runner_config=body.runner_config,
+        runner_config=sanitize_runner_config(body.runner_config),
         eval_mode=body.eval_mode,
         num_fewshot=body.num_fewshot,
         target_model=body.target_model,
@@ -242,14 +247,19 @@ def create_run(
         dataset_id=body.dataset_id,
         dataset_commit_id=body.dataset_commit_id,
         status="queued",
+        simulated=get_benchmark_engine(body.runner_backend).simulated,
         summary_metrics={},
     )
     db.add(run)
     db.flush()
 
-    if is_sync:
+    if is_sync and is_test_env():
         db.commit()
-        run_benchmark_job(db, run.id)
+        try:
+            run_benchmark_job(request.app.state.session_factory, run.id)
+        except (EngineUnavailable, EgressError, BenchmarkCredentialError, RuntimeError, ValueError):
+            # run_benchmark_job already persisted failed status and sanitized error
+            pass
         db.expire_all()
         run = db.get(BenchmarkRun, run.id)  # type: ignore[assignment]
         task_results = db.scalars(

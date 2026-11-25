@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from .benchmarks import BenchmarksClient
     from .datasets import DatasetsClient
     from .mlops import MLOpsClient
+    from .registry import RegistryClient
     from .sandboxes import SandboxesClient
 
 DEFAULT_ENDPOINT = "http://localhost:8000"
@@ -74,6 +75,7 @@ class MatrixClient:
         self._threads: list[threading.Thread] = []
         self._lock = threading.Lock()
         self._mlops: MLOpsClient | None = None
+        self._registry: RegistryClient | None = None
         self._benchmarks: BenchmarksClient | None = None
         self._sandboxes: SandboxesClient | None = None
         self._datasets: DatasetsClient | None = None
@@ -193,12 +195,25 @@ class MatrixClient:
             body["metadata"] = metadata
         return self._request("POST", f"/api/v1/datasets/{_seg(dataset_id)}/items", json=body)
 
-    # -- training runs
+    # -- training runs & sweeps
     def start_run(self, *args: Any, **kwargs: Any):
         """Same as `matrix_sdk.start_run(...)`, bound to this client."""
         from .tracking import start_run
 
         return start_run(*args, client=self, **kwargs)
+
+    def sweep(self, config: Any, name: str, **kwargs: Any) -> str:
+        """Same as `matrix_sdk.sweep(...)`, bound to this client."""
+        from .sweeps import sweep
+
+        return sweep(config, name, client=self, **kwargs)
+
+    def agent(self, sweep_id: str, function: Any, count: int | None = None, agent_id: str | None = None,
+              **kwargs: Any) -> int:
+        """Same as `matrix_sdk.agent(...)`, bound to this client."""
+        from .sweeps import agent
+
+        return agent(sweep_id, function, count=count, agent_id=agent_id, client=self, **kwargs)
 
     # -- datasets (versioning, from main)
     @property
@@ -233,7 +248,29 @@ class MatrixClient:
                     self._sandboxes = SandboxesClient(self)
         return self._sandboxes
 
-    # -- mlops
+    # -- registry & lineage (canonical T6)
+    @property
+    def registry(self) -> RegistryClient:
+        if self._registry is None:
+            with self._lock:
+                if self._registry is None:
+                    from .registry import RegistryClient
+
+                    self._registry = RegistryClient(self)
+        return self._registry
+
+    def lineage(
+        self,
+        node: str,
+        *,
+        direction: str = "both",
+        depth: int = 3,
+        max_nodes: int | None = None,
+    ) -> dict[str, Any]:
+        """Same as `matrix_sdk.lineage(...)`, bound to this client."""
+        return self.registry.lineage(node, direction=direction, depth=depth, max_nodes=max_nodes)
+
+    # -- mlops (deprecated compatibility shim)
     @property
     def mlops(self) -> MLOpsClient:
         if self._mlops is None:
@@ -245,7 +282,9 @@ class MatrixClient:
         return self._mlops
 
     def register_model(self, name: str, **kwargs: Any) -> dict[str, Any]:
-        return self.mlops.register_model(name, **kwargs)
+        if "task_type" in kwargs and "model_type" not in kwargs:
+            kwargs["model_type"] = kwargs.pop("task_type")
+        return self.registry.register(name, **kwargs)
 
     @staticmethod
     def current_trace_id() -> str | None:

@@ -10,7 +10,7 @@ Upgrade:
   status completed->finished, cancelled/stopped->killed, queued->running, `dataset_id` ->
   `dataset_version_id`, `hardware_info` -> `env["hardware"]`, `finished_at` -> `ended_at`,
   `_last_heartbeat_at` -> `heartbeat_at`, tags -> `run_tags`), `classic_eval` becomes `run_reports`
-  named `classic_eval` (`mlops.compat.classic_eval_to_reports`) and `summary_metrics` +
+  named `classic_eval` (inlined `classic_eval_to_reports`) and `summary_metrics` +
   `total_steps` are kept as a `custom` report `mlops_summary` (the points themselves live in
   ClickHouse `training_metrics`, which Alembic does not reach: see t4-notes.md for the copy into
   `run_metrics`). Rows whose project no longer exists are dropped (orphans).
@@ -30,14 +30,15 @@ points written after the upgrade (they are in `run_metrics`, not `training_metri
 This revision targets PostgreSQL (like the whole chain; CI runs it there).
 """
 
-from collections.abc import Sequence
+import math
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
 import sqlalchemy as sa
 from alembic import op
 
-from matrix_server.mlops.compat import classic_eval_to_reports, reports_to_classic_eval, status_in, status_out
+from matrix_server.runs.reports import MAX_CURVE_POINTS, ReportError, validate_report
 from matrix_server.storage.db import new_id
 
 revision: str = "0008"
@@ -46,6 +47,137 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 SUMMARY_REPORT = "mlops_summary"
+CLASSIC_EVAL_REPORT = "classic_eval"
+_SCALARS = ("roc_auc", "pr_auc", "accuracy", "f1", "precision", "recall", "log_loss")
+STATUS_IN = {
+    "running": "running",
+    "queued": "running",
+    "completed": "finished",
+    "finished": "finished",
+    "failed": "failed",
+    "cancelled": "killed",
+    "stopped": "killed",
+    "killed": "killed",
+}
+STATUS_OUT = {"running": "running", "finished": "completed", "failed": "failed", "killed": "cancelled"}
+
+
+def status_in(value: str) -> str | None:
+    return STATUS_IN.get(value)
+
+
+def status_out(value: str) -> str:
+    return STATUS_OUT.get(value, value)
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+
+
+def _thin(values: list[Any], limit: int = MAX_CURVE_POINTS) -> list[Any]:
+    if len(values) <= limit:
+        return values
+    idx = sorted({round(i * (len(values) - 1) / (limit - 1)) for i in range(limit)})
+    return [values[i] for i in idx]
+
+
+def _classification(ce: dict[str, Any]) -> tuple[dict[str, Any] | None, set[str], dict[str, Any]]:
+    cm = ce.get("confusion_matrix")
+    if not isinstance(cm, Mapping) or set(cm) - {"labels", "matrix"}:
+        return None, set(), {}
+    labels = [str(label) for label in cm.get("labels") or []]
+    metrics = {k: float(ce[k]) for k in _SCALARS if _is_number(ce.get(k))}
+    data: dict[str, Any] = {
+        "labels": labels,
+        "metrics": metrics,
+        "per_class": [],
+        "confusion_matrix": cm.get("matrix"),
+        "roc": [],
+        "pr": [],
+    }
+    consumed = {"confusion_matrix", *metrics}
+    extra: dict[str, Any] = {}
+    curve = ce.get("roc_curve")
+    auc = ce.get("roc_auc")
+    if isinstance(curve, list) and curve and labels and _is_number(auc) and all(isinstance(p, Mapping) for p in curve):
+        pts = _thin(list(curve))
+        data["roc"] = [
+            {"label": labels[-1], "fpr": [p.get("fpr") for p in pts], "tpr": [p.get("tpr") for p in pts], "auc": auc}
+        ]
+        consumed.add("roc_curve")
+        if len(pts) != len(curve) or any(set(p) - {"fpr", "tpr"} for p in curve):
+            extra["roc_curve"] = curve
+    return data, consumed, extra
+
+
+def _importance(ce: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    items = ce.get("feature_importance")
+    if not isinstance(items, list) or not items or not all(isinstance(i, Mapping) for i in items):
+        return None, {}
+    data = {
+        "method": "model",
+        "features": [{"name": str(i.get("feature")), "importance": i.get("importance")} for i in items],
+    }
+    directions = {str(i.get("feature")): i["direction"] for i in items if i.get("direction") is not None}
+    extra = {"feature_importance_direction": directions} if directions else {}
+    if any(set(i) - {"feature", "importance", "direction"} for i in items):
+        extra = {"feature_importance": items}
+    return data, extra
+
+
+def classic_eval_to_reports(classic_eval: Mapping[str, Any] | None) -> list[tuple[str, str, Any]]:
+    if not classic_eval:
+        return []
+    ce = dict(classic_eval)
+    reports: list[tuple[str, str, Any]] = []
+    rest = dict(ce)
+    cls, consumed, extra_cls = _classification(ce)
+    if cls is not None:
+        try:
+            reports.append(("classification", CLASSIC_EVAL_REPORT, validate_report("classification", cls)))
+            for key in consumed:
+                rest.pop(key, None)
+            rest.update(extra_cls)
+        except ReportError:
+            pass
+    imp, extra_imp = _importance(ce)
+    if imp is not None:
+        try:
+            reports.append(("importance", CLASSIC_EVAL_REPORT, validate_report("importance", imp)))
+            rest.pop("feature_importance", None)
+            rest.update(extra_imp)
+        except ReportError:
+            pass
+    if rest:
+        reports.append(("custom", CLASSIC_EVAL_REPORT, validate_report("custom", rest)))
+    return reports
+
+
+def reports_to_classic_eval(reports: Iterable[tuple[str, Any]]) -> dict[str, Any] | None:
+    out: dict[str, Any] = {}
+    custom: dict[str, Any] = {}
+    seen = False
+    for kind, data in reports:
+        seen = True
+        if kind == "classification":
+            out.update(data.get("metrics") or {})
+            out["confusion_matrix"] = {"labels": data.get("labels"), "matrix": data.get("confusion_matrix")}
+            roc = data.get("roc") or []
+            if roc:
+                out["roc_curve"] = [{"fpr": f, "tpr": t} for f, t in zip(roc[0]["fpr"], roc[0]["tpr"], strict=False)]
+        elif kind == "importance":
+            out["feature_importance"] = [
+                {"feature": f["name"], "importance": f["importance"]} for f in data.get("features") or []
+            ]
+        elif kind == "custom" and isinstance(data, Mapping):
+            custom = dict(data)
+    directions = custom.pop("feature_importance_direction", None)
+    out.update(custom)
+    if isinstance(directions, Mapping):
+        for item in out.get("feature_importance") or []:
+            if item.get("feature") in directions:
+                item["direction"] = directions[item["feature"]]
+    return out if seen else None
 
 _runs = sa.table(
     "runs",

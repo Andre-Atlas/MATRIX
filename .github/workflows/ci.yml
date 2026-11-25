@@ -3,6 +3,7 @@ name: ci
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -37,9 +38,14 @@ jobs:
       - run: uv sync --frozen
       - run: uv run ruff check .
       - name: Wait for ClickHouse
-        run: for i in $(seq 1 30); do curl -sf http://localhost:8123/ping && break; sleep 2; done
-      # Skips fail the job, except the S3 backend ones (no S3 endpoint in CI) and the structural perf
-      # skip; xfail/xpass fail it too: see scripts/check_skips.py.
+        run: |
+          for i in $(seq 1 30); do curl -sf http://localhost:8123/ping && exit 0; sleep 2; done
+          echo "ClickHouse did not become ready" >&2
+          exit 1
+      - name: Pull sandbox image for Docker sandbox tests
+        run: docker pull python:3.12-slim
+      # Skips fail the job, except S3 backend skips (tested in optional server-s3 job), structural perf skip,
+      # and Docker fallback; xfail/xpass fail it too: see scripts/check_skips.py.
       - name: pytest (no unexpected skips)
         run: |
           set -o pipefail
@@ -49,9 +55,60 @@ jobs:
         env:
           MATRIX_DATABASE_URL: postgresql+psycopg://matrix:matrix@localhost:5432/matrix_test
         run: |
-          uv run python -c "from matrix_server.storage.db import Base, make_engine; Base.metadata.drop_all(make_engine('$MATRIX_DATABASE_URL'))"
+          uv run python - <<'PY'
+          import os
+          from sqlalchemy import text
+          from matrix_server.storage import models  # noqa: F401
+          from matrix_server.storage.db import Base, make_engine
+          eng = make_engine(os.environ["MATRIX_DATABASE_URL"])
+          Base.metadata.drop_all(eng)
+          with eng.begin() as conn:
+              conn.execute(text("DROP TABLE IF EXISTS alembic_version"))
+          PY
           uv run alembic upgrade head
           uv run alembic check
+
+  server-s3:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci-s3')
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: matrix
+          POSTGRES_PASSWORD: matrix
+          POSTGRES_DB: matrix_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U matrix" --health-interval 5s --health-timeout 5s --health-retries 10
+      rustfs:
+        image: rustfs/rustfs:latest
+        env:
+          RUSTFS_ACCESS_KEY: matrixminio
+          RUSTFS_SECRET_KEY: matrixminio-secret
+        ports: ["9000:9000"]
+    env:
+      MATRIX_TEST_DATABASE_URL: postgresql+psycopg://matrix:matrix@localhost:5432/matrix_test
+      MATRIX_TEST_S3_ENDPOINT: http://localhost:9000
+      MATRIX_TEST_S3_ACCESS_KEY: matrixminio
+      MATRIX_TEST_S3_SECRET_KEY: matrixminio-secret
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --frozen
+      - name: Wait for RustFS
+        run: |
+          for i in $(seq 1 30); do curl -s -o /dev/null http://localhost:9000 && exit 0; sleep 2; done
+          echo "RustFS did not become ready" >&2
+          exit 1
+      - name: Run artifact tests against RustFS
+        run: |
+          set -o pipefail
+          uv run pytest -q -rxXs tests/test_artifacts.py | tee "$RUNNER_TEMP/pytest-s3.out"
+          python3 ../scripts/check_skips.py "$RUNNER_TEMP/pytest-s3.out"
 
   sdk:
     runs-on: ubuntu-latest
@@ -83,7 +140,7 @@ jobs:
       - run: npm run build
 
   e2e:
-    needs: server
+    needs: [server, sdk, web]
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -103,28 +160,52 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
       - name: Wait for ClickHouse
-        run: for i in $(seq 1 30); do curl -sf http://localhost:8123/ping && break; sleep 2; done
-      - name: Apply migrations
-        working-directory: server
+        run: |
+          for i in $(seq 1 30); do curl -sf http://localhost:8123/ping && exit 0; sleep 2; done
+          echo "ClickHouse did not become ready" >&2
+          exit 1
+      - name: Sync server & SDK environments and apply migrations
         env:
           MATRIX_DATABASE_URL: postgresql+psycopg://matrix:matrix@localhost:5432/matrix
-        run: uv sync --frozen && uv run alembic upgrade head
-      - name: verify_mvp (6 criteria against real databases)
+        run: |
+          (cd server && uv sync --frozen && uv run alembic upgrade head)
+          (cd sdk/python && uv sync --frozen)
+      - name: verify_mvp (7 criteria against real databases)
         env:
           MATRIX_DATABASE_URL: postgresql+psycopg://matrix:matrix@localhost:5432/matrix
           MATRIX_CLICKHOUSE_URL: http://localhost:8123
           MATRIX_CLICKHOUSE_DATABASE: matrix_demo
         run: uv run --project server python scripts/verify_mvp.py
+      - name: Install Playwright Chromium & build web
+        working-directory: apps/web
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          npm run build
+      - name: Playwright reconciliation E2E (--trace off)
+        env:
+          E2E_DATABASE_URL: postgresql+psycopg://matrix:matrix@localhost:5432/matrix
+          E2E_SPAN_STORE: clickhouse
+          MATRIX_CLICKHOUSE_URL: http://localhost:8123
+          MATRIX_CLICKHOUSE_DATABASE: matrix_demo
+        run: uv run --project sdk/python python scripts/run_e2e_reconciliation.py
 
   deploy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Compose config with the example .env
+      - name: Compose config with the example .env (default and dev profile)
         run: |
           cp deploy/.env.example deploy/.env
           docker compose -f deploy/compose.yaml config --quiet
+          docker compose -f deploy/compose.yaml --profile dev config --quiet
+          rm -f deploy/.env
       - name: Compose file checks (ports, volumes, depends_on)
         run: python3 -m pip install pyyaml==6.0.3 && python3 scripts/check_compose.py
       - name: Build server image (no push)

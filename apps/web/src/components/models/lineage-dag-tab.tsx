@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Background,
   Controls,
@@ -73,11 +73,24 @@ const NODE_TYPES = {
 export interface LineageDagTabProps {
   lineage: LineageGraph;
   loading?: boolean;
+  error?: string | null;
+  onRetry?: () => void;
+  hideTruncatedBanner?: boolean;
 }
 
-export function LineageDagTab({ lineage, loading = false }: LineageDagTabProps) {
+export function LineageDagTab({
+  lineage,
+  loading = false,
+  error = null,
+  onRetry,
+  hideTruncatedBanner = false,
+}: LineageDagTabProps) {
   const [viewMode, setViewMode] = useState<"graph" | "tree">("graph");
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+
+  useEffect(() => {
+    setSelectedNodeId(null);
+  }, [lineage]);
 
   const positionedNodes = useMemo(
     () => layoutLineageNodes(lineage.nodes ?? [], lineage.edges ?? []),
@@ -117,6 +130,7 @@ export function LineageDagTab({ lineage, loading = false }: LineageDagTabProps) 
         source: e.source,
         target: e.target,
         label: e.relation,
+        ariaLabel: `${e.relation}: edge from ${e.source} to ${e.target}`,
         animated: hasSelection && inPath,
         markerEnd: {
           type: MarkerType.ArrowClosed,
@@ -165,6 +179,28 @@ export function LineageDagTab({ lineage, loading = false }: LineageDagTabProps) 
     );
   }
 
+  if (error) {
+    return (
+      <div
+        role="alert"
+        className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-red-800/70 bg-red-950/50 px-4 py-3 text-xs text-red-200"
+      >
+        <div>
+          <span className="font-semibold text-red-100">Lineage error:</span> {error}
+        </div>
+        {onRetry && (
+          <button
+            type="button"
+            onClick={onRetry}
+            className="inline-flex h-7 items-center rounded border border-red-700/70 bg-red-900/40 px-2.5 text-xs font-medium text-red-100 hover:bg-red-900/60"
+          >
+            Retry
+          </button>
+        )}
+      </div>
+    );
+  }
+
   if (!lineage.nodes || lineage.nodes.length === 0) {
     return (
       <div className="rounded-md border border-dashed border-zinc-800 px-6 py-10 text-center">
@@ -179,6 +215,17 @@ export function LineageDagTab({ lineage, loading = false }: LineageDagTabProps) 
 
   return (
     <div className="space-y-3">
+      {lineage.truncated && !hideTruncatedBanner && (
+        <div
+          role="alert"
+          className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-600/80 bg-amber-950/50 px-3.5 py-2.5 text-xs text-amber-200"
+        >
+          <span>
+            <strong>Graph truncated:</strong> This lineage view reached the 500-node safety limit.
+            Open the full Lineage Explorer to narrow direction or depth.
+          </span>
+        </div>
+      )}
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-400">
           <span>

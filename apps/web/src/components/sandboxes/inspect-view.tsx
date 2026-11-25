@@ -38,6 +38,11 @@ export function InspectView({
 
   const timelineContainerRef = useRef<HTMLDivElement>(null);
   const stepButtonRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  const tabRefs = useRef<Record<StepTabId, HTMLButtonElement | null>>({
+    stdout_stderr: null,
+    files_diff: null,
+    scorer_verdict: null,
+  });
 
   // Reset selected step when transcript changes
   useEffect(() => {
@@ -53,20 +58,21 @@ export function InspectView({
   const handleTimelineKeyDown = (e: React.KeyboardEvent) => {
     if (steps.length === 0) return;
 
+    const focusedIdx = stepButtonRefs.current.indexOf(
+      document.activeElement as HTMLButtonElement | null,
+    );
+    const currentIdx = focusedIdx >= 0 ? focusedIdx : selectedStepIndex;
+
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      setSelectedStepIndex((prev) => {
-        const next = Math.min(steps.length - 1, prev + 1);
-        stepButtonRefs.current[next]?.focus();
-        return next;
-      });
+      const next = Math.min(steps.length - 1, currentIdx + 1);
+      setSelectedStepIndex(next);
+      stepButtonRefs.current[next]?.focus();
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
-      setSelectedStepIndex((prev) => {
-        const next = Math.max(0, prev - 1);
-        stepButtonRefs.current[next]?.focus();
-        return next;
-      });
+      const next = Math.max(0, currentIdx - 1);
+      setSelectedStepIndex(next);
+      stepButtonRefs.current[next]?.focus();
     }
   };
 
@@ -78,10 +84,12 @@ export function InspectView({
       e.preventDefault();
       const nextTab = tabIds[(idx + 1) % tabIds.length];
       setActiveTab(nextTab);
+      tabRefs.current[nextTab]?.focus();
     } else if (e.key === "ArrowLeft") {
       e.preventDefault();
       const prevTab = tabIds[(idx - 1 + tabIds.length) % tabIds.length];
       setActiveTab(prevTab);
+      tabRefs.current[prevTab]?.focus();
     }
   };
 
@@ -201,10 +209,12 @@ export function InspectView({
         <button
           type="button"
           onClick={onClose}
-          aria-label="Close Inspection View"
-          className="rounded border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-xs font-medium text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
+          className="inline-flex items-center gap-1 rounded border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-xs font-medium text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
         >
-          ✕ Close Inspect
+          <svg aria-hidden="true" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.8" className="h-3 w-3">
+            <path d="M2 2l8 8M10 2l-8 8" />
+          </svg>
+          Close Inspection View
         </button>
       </div>
 
@@ -216,6 +226,7 @@ export function InspectView({
             <button
               key={t.id || t.task_key || idx}
               type="button"
+              aria-pressed={selectedTaskIndex === idx}
               onClick={() => setSelectedTaskIndex(idx)}
               className={`rounded px-2.5 py-1 font-mono text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 ${
                 selectedTaskIndex === idx
@@ -282,22 +293,9 @@ export function InspectView({
                 const hasExitCode = typeof st.exit_code === "number";
 
                 return (
-                  <button
+                  <div
                     key={st.step || index}
-                    ref={(el) => {
-                      stepButtonRefs.current[index] = el;
-                    }}
-                    type="button"
-                    onClick={() => setSelectedStepIndex(index)}
-                    aria-selected={isSelected}
-                    aria-label={`Step ${st.step}: ${style.label}, ${
-                      hasExitCode
-                        ? exitCodePassed
-                          ? "exit code 0 success"
-                          : `exit code ${st.exit_code} failure`
-                        : ""
-                    }`}
-                    className={`w-full rounded-md border p-2.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 ${
+                    className={`relative w-full rounded-md border p-2.5 text-left transition-colors ${
                       isSelected
                         ? "border-emerald-500/70 bg-zinc-800/90 shadow ring-1 ring-emerald-400/40"
                         : "border-zinc-800 bg-zinc-900/60 hover:border-zinc-700 hover:bg-zinc-800/60"
@@ -308,11 +306,24 @@ export function InspectView({
                         <span className="font-mono text-xs font-bold text-zinc-300">
                           #{String(st.step).padStart(2, "0")}
                         </span>
-                        <span
-                          className={`inline-flex items-center rounded border px-1.5 py-0.5 text-[11px] font-semibold ${style.badge}`}
+                        <button
+                          ref={(el) => {
+                            stepButtonRefs.current[index] = el;
+                          }}
+                          type="button"
+                          onClick={() => setSelectedStepIndex(index)}
+                          aria-pressed={isSelected}
+                          aria-label={`Step ${st.step}: ${style.label}${
+                            hasExitCode
+                              ? exitCodePassed
+                                ? ", exit code 0 success"
+                                : `, exit code ${st.exit_code} failure`
+                              : ""
+                          }`}
+                          className={`inline-flex items-center rounded border px-1.5 py-0.5 text-[11px] font-semibold focus-visible:outline-none after:absolute after:inset-0 after:rounded-md focus-visible:after:ring-2 focus-visible:after:ring-emerald-400 ${style.badge}`}
                         >
                           {style.label}
-                        </span>
+                        </button>
                       </div>
 
                       <div className="flex items-center gap-1.5">
@@ -355,7 +366,7 @@ export function InspectView({
                               : JSON.stringify(st.tool_args).slice(0, 60)}
                       </div>
                     )}
-                  </button>
+                  </div>
                 );
               })}
             </div>
@@ -431,7 +442,10 @@ export function InspectView({
                     <div className="text-[10px] font-semibold uppercase tracking-wider text-zinc-400 mb-1">
                       Invocation Command & Arguments
                     </div>
-                    <pre className="max-h-36 overflow-x-auto rounded border border-zinc-800 bg-zinc-950 p-3 font-mono text-xs text-zinc-200">
+                    <pre
+                      tabIndex={0}
+                      className="max-h-36 overflow-x-auto rounded border border-zinc-800 bg-zinc-950 p-3 font-mono text-xs text-zinc-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
+                    >
                       {typeof activeStep.tool_args.cmd === "string"
                         ? `$ ${activeStep.tool_args.cmd}`
                         : typeof activeStep.tool_args.code === "string"
@@ -448,6 +462,9 @@ export function InspectView({
                   className="flex border-b border-zinc-800"
                 >
                   <button
+                    ref={(el) => {
+                      tabRefs.current.stdout_stderr = el;
+                    }}
                     id="tab-stdout-stderr"
                     type="button"
                     role="tab"
@@ -469,6 +486,9 @@ export function InspectView({
                   </button>
 
                   <button
+                    ref={(el) => {
+                      tabRefs.current.files_diff = el;
+                    }}
                     id="tab-files-diff"
                     type="button"
                     role="tab"
@@ -492,6 +512,9 @@ export function InspectView({
                   </button>
 
                   <button
+                    ref={(el) => {
+                      tabRefs.current.scorer_verdict = el;
+                    }}
                     id="tab-scorer-verdict"
                     type="button"
                     role="tab"
@@ -560,7 +583,8 @@ export function InspectView({
                             stdout
                           </div>
                           <pre
-                            className={`max-h-80 overflow-auto rounded border border-zinc-800 bg-zinc-950 p-3 font-mono text-xs text-zinc-200 ${
+                            tabIndex={0}
+                            className={`max-h-80 overflow-auto rounded border border-zinc-800 bg-zinc-950 p-3 font-mono text-xs text-zinc-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 ${
                               wrapLines ? "whitespace-pre-wrap break-all" : "whitespace-pre"
                             }`}
                           >
@@ -576,7 +600,8 @@ export function InspectView({
                             [stderr]
                           </div>
                           <pre
-                            className={`max-h-80 overflow-auto rounded border border-red-800/50 bg-red-950/20 p-3 font-mono text-xs text-red-200 ${
+                            tabIndex={0}
+                            className={`max-h-80 overflow-auto rounded border border-red-800/50 bg-red-950/20 p-3 font-mono text-xs text-red-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 ${
                               wrapLines ? "whitespace-pre-wrap break-all" : "whitespace-pre"
                             }`}
                           >
@@ -611,7 +636,12 @@ export function InspectView({
                     )}
 
                     {diffRows ? (
-                      <div className="max-h-80 overflow-auto rounded border border-zinc-800 bg-zinc-950 p-2 font-mono text-xs">
+                      <div
+                        tabIndex={0}
+                        role="region"
+                        aria-label="Modified files diff"
+                        className="max-h-80 overflow-auto rounded border border-zinc-800 bg-zinc-950 p-2 font-mono text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
+                      >
                         {diffRows.type === "hunks" ? (
                           diffRows.hunks.map((hunk, hIdx) => (
                             <div key={hIdx} className="mb-3 last:mb-0">

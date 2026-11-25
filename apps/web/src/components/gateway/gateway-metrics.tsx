@@ -30,14 +30,14 @@ export function GatewayMetrics({ stats }: GatewayMetricsProps) {
           <span className="text-2xl font-bold tracking-tight text-zinc-100">
             {stats.total_requests.toLocaleString("en-US")}
           </span>
-          <span className="text-xs text-zinc-500 font-mono">24h</span>
+          <span className="text-xs text-zinc-400 font-mono">24h</span>
         </div>
         <div className="mt-3 flex items-center justify-between text-xs text-zinc-400">
           <span className="flex items-center gap-1.5">
             <span className="h-2 w-2 rounded-full bg-emerald-500" />
             Direct: {(stats.requests_by_status?.DIRECT ?? Math.max(0, stats.total_requests - cacheHits)).toLocaleString("en-US")}
           </span>
-          <span className="text-zinc-500">
+          <span className="text-zinc-400">
             Fallbacks: {stats.fallback_events_24h ?? 0}
           </span>
         </div>
@@ -66,6 +66,7 @@ export function GatewayMetrics({ stats }: GatewayMetricsProps) {
               className="h-full rounded-full bg-emerald-500 transition-all duration-500"
               style={{ width: `${Math.min(100, Math.max(0, stats.cache_hit_rate * 100))}%` }}
               role="progressbar"
+              aria-label="Semantic cache hit rate"
               aria-valuenow={Number(hitRatePct)}
               aria-valuemin={0}
               aria-valuemax={100}
@@ -90,7 +91,7 @@ export function GatewayMetrics({ stats }: GatewayMetricsProps) {
           <span className="text-2xl font-bold tracking-tight text-emerald-400">
             {formatUSD(savedCost)}
           </span>
-          <span className="text-xs text-zinc-500 font-mono">poupado</span>
+          <span className="text-xs text-zinc-400 font-mono">poupado</span>
         </div>
         <div className="mt-3 flex items-center justify-between text-xs text-zinc-400">
           <span>Gasto Real:</span>
@@ -108,14 +109,14 @@ export function GatewayMetrics({ stats }: GatewayMetricsProps) {
         </div>
         <div className="mt-3 flex items-baseline gap-3">
           <div>
-            <span className="text-xs uppercase text-zinc-500 font-semibold mr-1">p50</span>
+            <span className="text-xs uppercase text-zinc-400 font-semibold mr-1">p50</span>
             <span className="text-2xl font-bold tracking-tight text-sky-400">
               {formatLatencyMs(p50Ms)}
             </span>
           </div>
           <div className="text-zinc-600">/</div>
           <div>
-            <span className="text-xs uppercase text-zinc-500 font-semibold mr-1">p99</span>
+            <span className="text-xs uppercase text-zinc-400 font-semibold mr-1">p99</span>
             <span className="text-xl font-bold tracking-tight text-amber-400">
               {formatLatencyMs(p99Ms)}
             </span>

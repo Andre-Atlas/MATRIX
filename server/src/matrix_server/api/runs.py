@@ -355,6 +355,37 @@ StepBound = Annotated[int | None, Query(ge=0, le=service.MAX_STEP)]
 # --------------------------------------------------------------------------- runs
 
 
+_HEX_32 = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _validate_dataset_version_ref(db: Session, project_id: str, ref: str) -> str | None:
+    """Validate `runs.dataset_version_id` when it references a dataset commit or dataset.
+
+    Returns the lineage node kind (`dataset_commit` or `dataset`) if the reference resolves to a
+    project entity, or `None` for legacy opaque external refs (e.g. G1 tests without datasets).
+    Blocks cross-project references and unknown 32-hex IDs or unknown refs when the project has
+    datasets/commits (422).
+    """
+    from matrix_server.storage.models import Dataset, DatasetCommit
+
+    if db.scalar(select(DatasetCommit.id).where(DatasetCommit.id == ref, DatasetCommit.project_id == project_id)):
+        return "dataset_commit"
+    if db.scalar(select(Dataset.id).where(Dataset.id == ref, Dataset.project_id == project_id)):
+        return "dataset"
+    # Always block cross-project references.
+    if db.scalar(select(DatasetCommit.id).where(DatasetCommit.id == ref)) is not None:
+        raise HTTPException(status_code=422, detail="dataset commit not found")
+    if db.scalar(select(Dataset.id).where(Dataset.id == ref)) is not None:
+        raise HTTPException(status_code=422, detail="dataset not found")
+    # If the ID looks like a MATRIX UUID or the project already uses dataset commits, require it to exist.
+    has_commits = db.scalar(
+        select(DatasetCommit.id).where(DatasetCommit.project_id == project_id).limit(1)
+    )
+    if _HEX_32.match(ref) or has_commits is not None:
+        raise HTTPException(status_code=422, detail="dataset commit not found")
+    return None
+
+
 @router.post("/runs", response_model=RunOut, status_code=201)
 def create_run(
     request: Request, principal: Member, db: DbSession, payload: Annotated[Any, Body()] = None
@@ -369,6 +400,9 @@ def create_run(
         select(Run.id).where(Run.id == body.parent_run_id, Run.project_id == project_id)
     ) is None:
         raise HTTPException(status_code=422, detail="parent run not found")
+    dataset_node_kind: str | None = None
+    if body.dataset_version_id is not None:
+        dataset_node_kind = _validate_dataset_version_ref(db, project_id, body.dataset_version_id)
     run = service.new_run(
         db,
         project_id,
@@ -383,6 +417,20 @@ def create_run(
         parent_run_id=body.parent_run_id,
         created_by=principal.user_id,
     )
+    if dataset_node_kind is not None and body.dataset_version_id is not None:
+        from matrix_server.storage.models import ArtifactLineage
+
+        db.add(
+            ArtifactLineage(
+                project_id=project_id,
+                source_type=dataset_node_kind,
+                source_id=body.dataset_version_id,
+                target_type="run",
+                target_id=run.id,
+                relation="trained_on",
+                metadata_={},
+            )
+        )
     db.commit()
     return _run_out(run)
 

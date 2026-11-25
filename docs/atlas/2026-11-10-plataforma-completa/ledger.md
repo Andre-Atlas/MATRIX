@@ -75,3 +75,18 @@ Formato: `T<n> · [tag] · C<n> → modelo/esforço (papel)`.
 - Estado: T1–T4 feitas e verificadas (servidor 1359 passed / 88 skipped / 0 falhas; SDK 112; web 494; migrações 0001–0008 ok). T5, T7 e T8 foram cortadas pelo limite de uso antes de gravar qualquer arquivo (nenhum fragmento, nenhuma nota); T6 e T9–T13 não iniciadas.
 - Entrega: `docs/atlas/2026-11-17-reconciliacao/HANDOFF.md` e `tasks/T5…T13` (autocontidas); ATLAS instalado para claude-code e antigravity (`AGENTS.md`, `.agents/`).
 - Ruling: nenhuma mudança de código de produto nesta entrega; sem PR e sem tocar no `main` (Gate 2 segue com o usuário) — custo: T5–T13 ficam para o Antigravity.
+
+## Retomada Antigravity — T9 (`[design]`) (2026-11-20)
+
+- Ruling: apps/web keeps dark-only theme (#09090b / zinc-950) across T9 screens — matches `globals.css` design system and passes WCAG 2.2 AA contrast on all 13 views (`e2e/t9-a11y-shots.cjs`) — adding a full light palette later costs only CSS variable theming in `globals.css`.
+
+## Retomada Antigravity — T11, T12, T13 (2026-11-24)
+
+- Dispatch (Antigravity: haiku→flash, sonnet/opus→pro; esforço sem equivalente, ignorado — registrado uma vez): T11 · [arch] · C3 → pro (revisão `architect` + `code-reviewer`, pro); T12 · [audit] · C5 → pro (4 auditores paralelos + `audit-lead`); correções T12 · [core]/[arch]/[design] · C4 → pro (5 workers de escopo disjunto).
+- Ruling: `sync_exec` em benchmarks passa a valer só em ambiente de teste (gate `is_test_env()`), então E2E e `verify_mvp` rodam com worker real — custo: E2E ~2s mais lento.
+- Ruling: `HttpBenchmarkEngine` passa a `simulated=True` até existir scorer real de dataset — custo: UI mostra selo "Simulado" também em backends http/vllm.
+- Ruling: `api_key_env` de benchmarks restrito ao prefixo `MATRIX_BENCH_API_KEY_` ou à allowlist `MATRIX_BENCHMARK_ALLOWED_ENV_VARS` — custo: operador precisa nomear as variáveis.
+- Ruling: `migrations/env.py` passa a `disable_existing_loggers=False` (testes Alembic desabilitavam loggers e quebravam `caplog`).
+- Ruling: 3 testes do SDK que dependem de `libomp.dylib` (xgboost/lightgbm) ficam como falha de ambiente macOS, não de código.
+- Cota dos subagentes esgotou durante as correções; Workers 1/3/4/5 foram concluídos pelo orquestrador (testes quebrados corrigidos, verificação completa refeita).
+- Auditoria T12: 5 CRITICAL + 17 HIGH confirmados e corrigidos; 23 MEDIUM + 4 LOW adiados (docs/atlas/2026-11-17-reconciliacao/audit-final.md).

@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { SimulatedBadge } from "@/components/ui";
 import type {
   GatewayLogEntry,
   GatewayProviderStatus,
@@ -17,6 +18,7 @@ export interface GatewayDashboardProps {
   providers: GatewayProviderStatus[];
   rules: GatewayRoutingRule[];
   logs: GatewayLogEntry[];
+  isSimulated?: boolean;
 }
 
 export function GatewayDashboard({
@@ -24,19 +26,38 @@ export function GatewayDashboard({
   providers,
   rules,
   logs,
+  isSimulated = false,
 }: GatewayDashboardProps) {
   const [activeTab, setActiveTab] = useState<"all" | "providers" | "rules" | "logs">("all");
+  const showSimulatedBanner =
+    isSimulated ||
+    logs.some((l) => l.simulated === true || l.provider.toLowerCase() === "mock") ||
+    providers.some((p) => p.provider?.toLowerCase() === "mock");
 
   return (
     <div className="space-y-6">
+      {showSimulatedBanner && (
+        <div
+          role="status"
+          className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-700/60 bg-amber-950/30 px-3.5 py-2.5 text-xs text-amber-200"
+        >
+          <SimulatedBadge reason="mock gateway" />
+          <span>
+            AI Gateway telemetry, provider circuit breakers, and routing rules are displaying simulated/mock data.
+          </span>
+        </div>
+      )}
+
       {/* KPI Metrics */}
       <GatewayMetrics stats={stats} />
 
       {/* Navigation Filter Tabs */}
       <div className="flex items-center justify-between border-b border-zinc-800 pb-2">
-        <div className="flex items-center gap-1">
+        <div role="tablist" aria-label="Gateway views" className="flex items-center gap-1">
           <button
             type="button"
+            role="tab"
+            aria-selected={activeTab === "all"}
             onClick={() => setActiveTab("all")}
             className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
               activeTab === "all"
@@ -44,10 +65,12 @@ export function GatewayDashboard({
                 : "text-zinc-400 hover:text-zinc-200"
             }`}
           >
-            Visão Completa
+            All Views
           </button>
           <button
             type="button"
+            role="tab"
+            aria-selected={activeTab === "providers"}
             onClick={() => setActiveTab("providers")}
             className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
               activeTab === "providers"
@@ -55,10 +78,12 @@ export function GatewayDashboard({
                 : "text-zinc-400 hover:text-zinc-200"
             }`}
           >
-            Provedores & Circuit Breakers ({providers.length})
+            Providers &amp; Circuit Breakers ({providers.length})
           </button>
           <button
             type="button"
+            role="tab"
+            aria-selected={activeTab === "rules"}
             onClick={() => setActiveTab("rules")}
             className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
               activeTab === "rules"
@@ -66,10 +91,12 @@ export function GatewayDashboard({
                 : "text-zinc-400 hover:text-zinc-200"
             }`}
           >
-            Cadeias de Fallback ({rules.length})
+            Fallback Rules ({rules.length})
           </button>
           <button
             type="button"
+            role="tab"
+            aria-selected={activeTab === "logs"}
             onClick={() => setActiveTab("logs")}
             className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
               activeTab === "logs"
@@ -77,12 +104,12 @@ export function GatewayDashboard({
                 : "text-zinc-400 hover:text-zinc-200"
             }`}
           >
-            Logs Recentes ({logs.length})
+            Recent Logs ({logs.length})
           </button>
         </div>
 
-        <div className="hidden sm:flex items-center gap-2 text-xs text-zinc-500 font-mono">
-          <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
+        <div className="hidden sm:flex items-center gap-2 text-xs text-zinc-400 font-mono">
+          <span aria-hidden="true" className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse motion-reduce:animate-none" />
           AI Gateway v2.4 (Active Proxy)
         </div>
       </div>

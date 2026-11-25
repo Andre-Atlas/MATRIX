@@ -1,10 +1,13 @@
 """Gateway Prompt Cache with Exact and Semantic hashing and cost tracking (MATRIX Gateway Layer 2).
 
+Note: Prompt cache storage is in-memory per worker process (by design in T8; Redis/shared cache
+is deferred). Every cache key and telemetry counter is strictly isolated by `project_id`.
+
 Features:
-- Deterministic SHA-256 hash key of (model, messages, temperature)
-- Semantic prompt normalization key for robust matching
+- Deterministic SHA-256 hash key of (project_id, model, messages, temperature)
+- Semantic prompt normalization key for robust matching (scoped to project_id)
 - Per-entry TTL and expiration pruning
-- Real-time metrics: hits, misses, tokens saved, USD cost saved
+- Per-project and global metrics: hits, misses, tokens saved, USD cost saved
 - Integration with MATRIX pricing engine
 """
 
@@ -46,8 +49,9 @@ def compute_cache_key(
     messages: list[dict[str, Any]] | list[Any],
     temperature: float,
     semantic: bool = False,
+    project_id: str = "",
 ) -> str:
-    """Computes a SHA-256 hash key from (model, messages, temperature)."""
+    """Computes a SHA-256 hash key from (project_id, model, messages, temperature)."""
     norm_model = model.strip().lower()
     canonical_msgs = _canonicalize_messages(messages)
 
@@ -63,6 +67,7 @@ def compute_cache_key(
         rounded_temp = round(float(temperature), 4)
 
     payload = {
+        "project_id": project_id,
         "model": norm_model,
         "messages": processed_msgs,
         "temperature": rounded_temp,
@@ -75,6 +80,7 @@ def compute_cache_key(
 class CacheEntry:
     key: str
     semantic_key: str
+    project_id: str
     response: dict[str, Any]
     model: str
     prompt_tokens: int
@@ -86,6 +92,14 @@ class CacheEntry:
 
 
 @dataclass
+class _ProjectCacheCounters:
+    hits: int = 0
+    misses: int = 0
+    tokens_saved: int = 0
+    cost_saved_usd: float = 0.0
+
+
+@dataclass
 class GatewayCache:
     default_ttl_seconds: int = 3600
     max_entries: int = 10_000
@@ -93,6 +107,7 @@ class GatewayCache:
 
     _entries: dict[str, CacheEntry] = field(default_factory=dict)
     _semantic_index: dict[str, str] = field(default_factory=dict)  # semantic_key -> primary_key
+    _project_stats: dict[str, _ProjectCacheCounters] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     _hits: int = 0
@@ -126,28 +141,36 @@ class GatewayCache:
         model: str,
         messages: list[dict[str, Any]] | list[Any],
         temperature: float = 0.7,
+        project_id: str = "",
     ) -> dict[str, Any] | None:
-        """Looks up a cached response by exact SHA-256 hash or semantic prompt hash."""
+        """Looks up a cached response by exact SHA-256 hash or semantic prompt hash (scoped by project_id)."""
         now = time.monotonic()
-        exact_key = compute_cache_key(model, messages, temperature, semantic=False)
+        exact_key = compute_cache_key(model, messages, temperature, semantic=False, project_id=project_id)
 
         with self._lock:
+            proj_counters = self._project_stats.setdefault(project_id, _ProjectCacheCounters())
+
             # 1. Try exact match
             entry = self._entries.get(exact_key)
 
             # 2. If no exact match and semantic caching enabled, try semantic key
             if entry is None and self.enable_semantic_cache:
-                sem_key = compute_cache_key(model, messages, temperature, semantic=True)
+                sem_key = compute_cache_key(model, messages, temperature, semantic=True, project_id=project_id)
                 mapped_key = self._semantic_index.get(sem_key)
                 if mapped_key:
-                    entry = self._entries.get(mapped_key)
+                    candidate = self._entries.get(mapped_key)
+                    if candidate is not None and candidate.project_id == project_id:
+                        entry = candidate
 
-            if entry is not None:
+            if entry is not None and entry.project_id == project_id:
                 if entry.expires_at > now:
                     # Cache Hit!
                     self._hits += 1
                     self._tokens_saved += entry.total_tokens
                     self._cost_saved_usd += entry.cost_usd
+                    proj_counters.hits += 1
+                    proj_counters.tokens_saved += entry.total_tokens
+                    proj_counters.cost_saved_usd += entry.cost_usd
                     return copy.deepcopy(entry.response)
                 else:
                     # Expired, evict
@@ -155,6 +178,7 @@ class GatewayCache:
 
             # Cache Miss
             self._misses += 1
+            proj_counters.misses += 1
             return None
 
     def set(
@@ -166,8 +190,9 @@ class GatewayCache:
         prompt_tokens: int | None = None,
         completion_tokens: int | None = None,
         ttl_seconds: int | None = None,
+        project_id: str = "",
     ) -> str:
-        """Stores a completion response in the cache and computes saved cost metrics."""
+        """Stores a completion response in the cache scoped by project_id."""
         now = time.monotonic()
         ttl = ttl_seconds if ttl_seconds is not None else self.default_ttl_seconds
         expires_at = now + ttl
@@ -188,8 +213,8 @@ class GatewayCache:
 
         cost_usd = compute_cost(model, input_tokens=p_tokens, output_tokens=c_tokens)
 
-        exact_key = compute_cache_key(model, messages, temperature, semantic=False)
-        sem_key = compute_cache_key(model, messages, temperature, semantic=True)
+        exact_key = compute_cache_key(model, messages, temperature, semantic=False, project_id=project_id)
+        sem_key = compute_cache_key(model, messages, temperature, semantic=True, project_id=project_id)
 
         with self._lock:
             if len(self._entries) >= self.max_entries:
@@ -198,6 +223,7 @@ class GatewayCache:
             entry = CacheEntry(
                 key=exact_key,
                 semantic_key=sem_key,
+                project_id=project_id,
                 response=copy.deepcopy(response),
                 model=model,
                 prompt_tokens=p_tokens,
@@ -244,10 +270,25 @@ class GatewayCache:
             self._misses = 0
             self._tokens_saved = 0
             self._cost_saved_usd = 0.0
+            self._project_stats.clear()
 
-    def stats(self) -> dict[str, Any]:
-        """Returns cache telemetry summary."""
+    def stats(self, project_id: str | None = None) -> dict[str, Any]:
+        """Returns cache telemetry summary (per-project if project_id is provided)."""
         with self._lock:
+            if project_id is not None:
+                c = self._project_stats.get(project_id, _ProjectCacheCounters())
+                total = c.hits + c.misses
+                rate = round(c.hits / total, 4) if total > 0 else 0.0
+                entries_count = sum(1 for e in self._entries.values() if e.project_id == project_id)
+                return {
+                    "hits": c.hits,
+                    "misses": c.misses,
+                    "total_requests": total,
+                    "hit_rate": rate,
+                    "tokens_saved": c.tokens_saved,
+                    "cost_saved_usd": round(c.cost_saved_usd, 6),
+                    "cached_entries": entries_count,
+                }
             total = self._hits + self._misses
             rate = round(self._hits / total, 4) if total > 0 else 0.0
             return {

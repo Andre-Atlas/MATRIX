@@ -279,6 +279,10 @@ export function adaptLineageGraph(raw: Partial<LineageGraph> | null | undefined)
   return {
     run_id: g.run_id,
     model_id: g.model_id,
+    root: g.root,
+    direction: g.direction,
+    depth: g.depth,
+    truncated: g.truncated,
     nodes,
     edges,
   };

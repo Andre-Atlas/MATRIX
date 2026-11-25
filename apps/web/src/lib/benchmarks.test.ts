@@ -88,4 +88,38 @@ describe("benchmarks helpers", () => {
     expect(pointsString).toBeTruthy();
     expect(points[0].score).toBe(0.684);
   });
+
+  it("reads canonical backend summary_metrics.tasks without counting metadata keys", () => {
+    const lmRun = {
+      ...MOCK_BENCHMARK_RUNS[0],
+      id: "canon-lm",
+      task_results: undefined,
+      summary_metrics: {
+        mean_primary_score: 0.77,
+        total_tasks: 2,
+        total_samples: 200,
+        tasks: { mmlu_pro: 0.72, gsm8k: 0.82 },
+      },
+    };
+    const vlmRun = {
+      ...MOCK_BENCHMARK_RUNS[2],
+      id: "canon-vlm",
+      suite: "vlmevalkit" as const,
+      task_results: undefined,
+      summary_metrics: {
+        mean_primary_score: 0.65,
+        total_tasks: 2,
+        total_samples: 200,
+        tasks: { mmmu_pro: 0.6, docvqa: 0.7 },
+      },
+    };
+
+    expect(getTaskResultFromRun(lmRun, "gsm8k")?.primary_score).toBe(0.82);
+    expect(getTaskResultFromRun(lmRun, "mmlu_pro")?.primary_score).toBe(0.72);
+    expect(getTaskResultFromRun(lmRun, "total_tasks")).toBeNull();
+
+    const kpis = computeBenchmarkKpis([lmRun, vlmRun]);
+    expect(kpis.avgMmluPro).toBeCloseTo(0.72, 4);
+    expect(kpis.avgMultimodal).toBeCloseTo(0.65, 4);
+  });
 });

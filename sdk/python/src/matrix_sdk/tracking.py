@@ -231,6 +231,7 @@ class Run:
         self.data = data
         self.id: str = data["id"]
         self.name: str = data.get("name", "")
+        self.config: dict[str, Any] = dict(data.get("params") or {})
         self._owns_client = owns_client
         self.flush_timeout = flush_timeout
         self._max_queue = max_queue
@@ -254,6 +255,11 @@ class Run:
         self._finish_lock = threading.Lock()
         self._warned: dict[str, int] = {}
         self._monitor: Any = None
+        self._sweep_id: str | None = data.get("sweep_id")
+        self._sweep_metric_key: str | None = data.get("sweep_metric_key")
+        self._last_sweep_metric: tuple[int, float] | None = None
+        self._sweep_metric_dirty = False
+        self._pruned = False
 
         self._sender = threading.Thread(target=self._send_loop, daemon=True, name=f"matrix-run-{self.id}")
         self._sender.start()
@@ -271,7 +277,7 @@ class Run:
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         if exc is None:
-            self.finish("finished")
+            self.finish("killed" if self._pruned else "finished")
         elif isinstance(exc, KeyboardInterrupt):
             self.finish("killed", error="KeyboardInterrupt")
         else:
@@ -283,6 +289,32 @@ class Run:
     def step(self) -> int:
         """Next automatic step."""
         return self._step
+
+    def should_stop(self) -> bool:
+        """Consult sweep pruning for the latest logged target metric. Returns True when pruned."""
+        if not self._sweep_id:
+            return False
+        if self._pruned:
+            return True
+        with self._cv:
+            if not self._sweep_metric_dirty or self._last_sweep_metric is None:
+                return False
+            step, value = self._last_sweep_metric
+            self._sweep_metric_dirty = False
+        try:
+            resp = self._http.post(
+                f"/api/v1/sweeps/{_seg(self._sweep_id)}/runs/{_seg(self.id)}/report",
+                json={"step": step, "value": value},
+                timeout=10.0,
+            )
+            if resp.status_code == 200:
+                action = (resp.json() or {}).get("action")
+                if action == "stop":
+                    self._pruned = True
+                    return True
+        except Exception as exc:  # noqa: BLE001 - never crash training on transient network errors
+            logger.warning("run %s: sweep report failed: %s", self.id, exc)
+        return self._pruned
 
     def log(self, metrics: Mapping[str, Any], step: int | None = None) -> None:
         """Logs several metrics at one step. `step=None` uses (and advances) the run's step counter.
@@ -303,6 +335,11 @@ class Run:
                 step = self._step
                 self._step += 1
             self._enqueue([{"key": k, "step": step, "value": v, "ts": ts} for k, v in points])
+            if self._sweep_id and self._sweep_metric_key:
+                for k, v in points:
+                    if k == self._sweep_metric_key and isinstance(v, float) and math.isfinite(v):
+                        self._last_sweep_metric = (step, v)
+                        self._sweep_metric_dirty = True
 
     def log_metric(self, key: str, value: Any, step: int | None = None) -> None:
         self.log({key: value}, step=step)
@@ -653,6 +690,46 @@ def _resolve_client(client: MatrixClient | None) -> tuple[MatrixClient, bool]:
     return client_mod.MatrixClient(key, endpoint), True
 
 
+@dataclasses.dataclass
+class _SweepTrialContext:
+    client: MatrixClient
+    sweep_id: str
+    run_data: dict[str, Any]
+    params: dict[str, Any]
+    metric_key: str
+    claimed: bool = False
+    run: Run | None = None
+
+
+_sweep_trial_ctx = threading.local()
+
+
+def _fetch_sweep_metric_key(http_client: MatrixClient, sweep_id: str) -> str | None:
+    try:
+        resp = http_client._http.get(f"/api/v1/sweeps/{_seg(sweep_id)}")
+    except httpx.HTTPError as exc:
+        logger.warning("could not fetch sweep %s config: %s", sweep_id, exc)
+        return None
+    if resp.status_code == 200:
+        try:
+            detail = resp.json() or {}
+        except ValueError:
+            return None
+        if not isinstance(detail, Mapping):
+            return None
+        sweep_obj = detail.get("sweep") if isinstance(detail.get("sweep"), Mapping) else detail
+        cfg = sweep_obj.get("config") if isinstance(sweep_obj, Mapping) else None
+        metric = cfg.get("metric") if isinstance(cfg, Mapping) else None
+        key = metric.get("key") if isinstance(metric, Mapping) else None
+        if isinstance(key, str) and key.strip():
+            return key.strip()
+        return None
+    if resp.status_code in (400, 401, 403, 404, 422):
+        raise MatrixError(f"invalid sweep {sweep_id!r}: HTTP {resp.status_code} {resp.text[:200]}")
+    logger.warning("could not fetch sweep %s config: HTTP %s", sweep_id, resp.status_code)
+    return None
+
+
 def start_run(
     name: str | None = None,
     group: str | None = None,
@@ -665,49 +742,87 @@ def start_run(
     dataset_version: str | None = None,
     *,
     sweep_id: str | None = None,
+    sweep_metric_key: str | None = None,
     parent_run_id: str | None = None,
     client: MatrixClient | None = None,
     flush_timeout: float = 30.0,
     system_backends: list[Any] | None = None,
     **run_options: Any,
 ) -> Run:
-    """Creates the run (`POST /api/v1/runs`, synchronous) and starts its sender, heartbeat and telemetry."""
+    """Creates the run (`POST /api/v1/runs`, synchronous) and starts its sender, heartbeat and telemetry.
+
+    When called inside `matrix_sdk.agent(...)`, binds to the server-allocated sweep run with its assigned
+    `run.config` and pruning hook (`run.should_stop()`).
+    """
+    global _current
+    trial: _SweepTrialContext | None = getattr(_sweep_trial_ctx, "trial", None)
+    if trial is not None and not trial.claimed:
+        trial.claimed = True
+        run_data = {**trial.run_data, "sweep_id": trial.sweep_id, "params": dict(trial.params)}
+        run = Run(trial.client, run_data, owns_client=False, flush_timeout=flush_timeout, **run_options)
+        run.config = dict(trial.params)
+        run._sweep_id = trial.sweep_id
+        run._sweep_metric_key = sweep_metric_key or trial.metric_key
+        if system_metrics:
+            from .system import SystemMonitor
+
+            run._monitor = SystemMonitor(run._log_system, interval=system_interval, backends=system_backends)
+            run._monitor.start()
+        trial.run = run
+        with _current_lock:
+            _current = run
+        return run
+
     http_client, owns = _resolve_client(client)
-    body: dict[str, Any] = {"tags": [str(t) for t in tags]}
-    if name is not None:
-        body["name"] = name
-    if group is not None:
-        body["group"] = group
-    params = jsonable(_config_dict(config))
-    if params:
-        body["params"] = params
-    if capture_git:
-        git = _capture_git_safe()
-        if git is not None:
-            body["git"] = git
-    if capture_env:
-        body["env"] = capture_env_safe()
-    if dataset_version is not None:
-        body["dataset_version_id"] = dataset_version
-    if sweep_id is not None:
-        body["sweep_id"] = sweep_id
-    if parent_run_id is not None:
-        body["parent_run_id"] = parent_run_id
+    resolved_sweep_metric_key = sweep_metric_key
     try:
-        resp = http_client._http.post("/api/v1/runs", json=body)
-        resp.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        raise MatrixError(f"could not create run: HTTP {exc.response.status_code} {exc.response.text[:200]}") \
-            from None
-    except httpx.HTTPError as exc:
-        raise MatrixError(f"could not create run: {exc}") from None
+        body: dict[str, Any] = {"tags": [str(t) for t in tags]}
+        if name is not None:
+            body["name"] = name
+        if group is not None:
+            body["group"] = group
+        params = jsonable(_config_dict(config))
+        if params:
+            body["params"] = params
+        if capture_git:
+            git = _capture_git_safe()
+            if git is not None:
+                body["git"] = git
+        if capture_env:
+            body["env"] = capture_env_safe()
+        if dataset_version is not None:
+            body["dataset_version_id"] = dataset_version
+        if sweep_id is not None:
+            if not isinstance(sweep_id, str) or not sweep_id.strip():
+                raise ValueError("sweep_id must be a non-empty string")
+            body["sweep_id"] = sweep_id
+            if resolved_sweep_metric_key is None:
+                resolved_sweep_metric_key = _fetch_sweep_metric_key(http_client, sweep_id)
+        if parent_run_id is not None:
+            body["parent_run_id"] = parent_run_id
+        try:
+            resp = http_client._http.post("/api/v1/runs", json=body)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise MatrixError(f"could not create run: HTTP {exc.response.status_code} {exc.response.text[:200]}") \
+                from None
+        except httpx.HTTPError as exc:
+            raise MatrixError(f"could not create run: {exc}") from None
+    except Exception:
+        if owns:
+            http_client._http.close()
+        raise
     run = Run(http_client, resp.json(), owns_client=owns, flush_timeout=flush_timeout, **run_options)
+    if sweep_id is not None:
+        if run._sweep_id is None:
+            run._sweep_id = sweep_id
+        if resolved_sweep_metric_key is not None:
+            run._sweep_metric_key = resolved_sweep_metric_key
     if system_metrics:
         from .system import SystemMonitor
 
         run._monitor = SystemMonitor(run._log_system, interval=system_interval, backends=system_backends)
         run._monitor.start()
-    global _current
     with _current_lock:
         _current = run
     return run

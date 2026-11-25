@@ -55,6 +55,8 @@ export function RegisterModelModal({ open, run, onClose }: RegisterModelModalPro
 
   const firstInputRef = useRef<HTMLInputElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
 
   useEffect(() => {
     if (!open) return;
@@ -73,7 +75,7 @@ export function RegisterModelModal({ open, run, onClose }: RegisterModelModalPro
 
     let cancelled = false;
     setLoadingModels(true);
-    proxy<ListResponse<RegisteredModel>>("GET", "/api/v1/mlops/models")
+    proxy<ListResponse<RegisteredModel>>("GET", "mlops/models")
       .then((res) => {
         if (cancelled) return;
         const items = Array.isArray(res?.items) ? res.items : [];
@@ -92,18 +94,19 @@ export function RegisterModelModal({ open, run, onClose }: RegisterModelModalPro
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
-        onClose();
+        onCloseRef.current();
       }
     };
     window.addEventListener("keydown", onKeyDown);
-    setTimeout(() => firstInputRef.current?.focus(), 0);
+    const focusTimer = window.setTimeout(() => firstInputRef.current?.focus(), 0);
 
     return () => {
       cancelled = true;
+      window.clearTimeout(focusTimer);
       window.removeEventListener("keydown", onKeyDown);
       previousFocusRef.current?.focus();
     };
-  }, [open, run, onClose]);
+  }, [open, run]);
 
   if (!open) return null;
 
@@ -130,7 +133,7 @@ export function RegisterModelModal({ open, run, onClose }: RegisterModelModalPro
           base_model: run?.base_model ?? null,
           tags: run?.tags ?? [],
         };
-        const createdModel = await proxy<RegisteredModel>("POST", "/api/v1/mlops/models", createReq);
+        const createdModel = await proxy<RegisteredModel>("POST", "mlops/models", createReq);
         targetModelId = createdModel.id;
         targetModelName = createdModel.name;
       } else if (!targetModelId) {
@@ -148,7 +151,7 @@ export function RegisterModelModal({ open, run, onClose }: RegisterModelModalPro
       };
       const ver = await proxy<ModelVersion>(
         "POST",
-        `/api/v1/mlops/models/${encodeURIComponent(targetModelId)}/versions`,
+        `mlops/models/${encodeURIComponent(targetModelId)}/versions`,
         versionReq,
       );
 

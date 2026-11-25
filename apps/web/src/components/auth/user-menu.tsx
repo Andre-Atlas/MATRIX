@@ -9,6 +9,7 @@ export function UserMenu({ email, name }: { email: string; name: string }) {
   const [busy, setBusy] = useState(false);
   const [warning, setWarning] = useState<string | null>(null);
   const root = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -16,7 +17,10 @@ export function UserMenu({ email, name }: { email: string; name: string }) {
       if (root.current && !root.current.contains(e.target as Node)) setOpen(false);
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
+      if (e.key === "Escape") {
+        setOpen(false);
+        triggerRef.current?.focus();
+      }
     };
     document.addEventListener("mousedown", onDown);
     document.addEventListener("keydown", onKey);
@@ -43,19 +47,27 @@ export function UserMenu({ email, name }: { email: string; name: string }) {
   return (
     <div ref={root} className="relative mt-auto border-t border-zinc-800 pt-2">
       <button
+        ref={triggerRef}
         type="button"
         aria-haspopup="true"
         aria-expanded={open}
-        aria-label={`User menu for ${email}`}
+        aria-label={`User menu: ${name && name !== email ? `${name} ${email}` : email}`}
         onClick={() => setOpen((o) => !o)}
         className="flex w-full items-center gap-2 rounded px-1.5 py-1.5 text-left hover:bg-zinc-800/60"
       >
-        <span aria-hidden className="flex h-6 w-6 shrink-0 items-center justify-center rounded bg-zinc-800 text-[11px] font-medium uppercase text-zinc-200">
-          {(name || email).slice(0, 1)}
+        <span aria-hidden="true" className="flex h-6 w-6 shrink-0 items-center justify-center rounded bg-zinc-800 text-zinc-200">
+          <svg viewBox="0 0 16 16" fill="currentColor" className="h-3.5 w-3.5">
+            <path d="M8 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm-5 6a5 5 0 0 1 10 0H3Z" />
+          </svg>
         </span>
         <span className="min-w-0">
           <span className="block truncate text-zinc-200">{name || email}</span>
-          <span className="block truncate text-[11px] text-zinc-500">{email}</span>
+          {name && name !== email && (
+            <>
+              {" "}
+              <span className="block truncate text-[11px] text-zinc-400">{email}</span>
+            </>
+          )}
         </span>
       </button>
       {warning && (
