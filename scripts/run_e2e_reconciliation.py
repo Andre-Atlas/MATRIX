@@ -77,7 +77,8 @@ def _stop(proc: subprocess.Popen | None) -> None:
 
 
 def _dump_logs(api_log: Path, web_log: Path) -> None:
-    for label, path in (("matrix-api", api_log), ("next-web", web_log)):
+    worker_log = api_log.parent / "worker.log"
+    for label, path in (("matrix-api", api_log), ("matrix-worker", worker_log), ("next-web", web_log)):
         if path.exists():
             tail = path.read_text(encoding="utf-8", errors="replace")[-2000:]
             print(f"\n--- {label} log tail ({path}) ---\n{tail}", file=sys.stderr)
@@ -113,11 +114,14 @@ def main() -> int:
     }
 
     procs: list[subprocess.Popen] = []
+    worker_log = tmp / "worker.log"
     api_log = tmp / "api.log"
     web_log = tmp / "web.log"
     keep_tmp = False
     try:
         procs.append(_start(["uv", "run", "--project", "server", "matrix-api"], ROOT, api_env, api_log))
+        # Benchmarks only run synchronously in test environments: a real worker executes them here.
+        procs.append(_start(["uv", "run", "--project", "server", "matrix-worker"], ROOT, api_env, worker_log))
         procs.append(
             _start(["npx", "next", "start", "-H", "127.0.0.1", "-p", str(web_port)], WEB_DIR, web_env, web_log)
         )
@@ -132,7 +136,7 @@ def main() -> int:
 
         if not _poll(lambda: _up(f"{api_url}/health", procs[0], api_log)):
             raise RuntimeError(f"matrix-api did not become ready:\n{api_log.read_text()[-1500:]}")
-        if not _poll(lambda: _up(f"{web_origin}/login", procs[1], web_log)):
+        if not _poll(lambda: _up(f"{web_origin}/login", procs[2], web_log)):
             raise RuntimeError(f"next server did not become ready:\n{web_log.read_text()[-1500:]}")
 
         email = f"e2e-{RUN_SUFFIX}-{secrets.token_hex(4)}@matrix.local"
@@ -211,10 +215,12 @@ def main() -> int:
                 target_model=model_name,
                 runner_backend="local_sim",
                 model_version_id=mv_id,
-                sync_exec=True,
             )
             if bench_resp.get("simulated") is not True:
                 raise RuntimeError("expected simulated=true on local_sim benchmark")
+            bench_done = client.benchmarks.wait(bench_resp["id"], poll_interval=0.5, timeout=60)
+            if bench_done.get("status") != "completed":
+                raise RuntimeError(f"benchmark did not complete: {bench_done.get('status')} {bench_done.get('error')}")
         finally:
             client.shutdown()
 

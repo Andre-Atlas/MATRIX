@@ -438,7 +438,6 @@ def main() -> int:
                     "tasks": ["gsm8k"],
                     "runner_backend": "local_sim",
                     "target_model": model["name"],
-                    "sync_exec": True,
                 },
             )
             c.expect(bench.get("simulated") is True, "benchmark local_sim marcado explicitamente como simulated=true")
