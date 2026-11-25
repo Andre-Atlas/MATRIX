@@ -209,3 +209,57 @@ def test_sandbox_network_is_rejected_until_egress_proxy_exists(env):
         resp = client.post("/api/v1/sandboxes/runs", json={"name": "n", "sandbox_policy": policy}, headers=principal)
         assert resp.status_code == 422, resp.text
         assert "egress proxy" in resp.json()["detail"]
+
+
+def test_request_db_session_commits_before_http_response_start(env):
+    """Regression: FastAPI post-yield `get_db` cleanup runs after response bytes go on the wire.
+    Verify `CommitBeforeResponseMiddleware` commits BEFORE `http.response.start` so immediate
+    back-to-back keep-alive requests on a separate DB session never read stale pre-commit state.
+    """
+    import asyncio
+
+    from sqlalchemy import select
+
+    from matrix_server.sweeps.models import Sweep
+
+    app = env["app"]
+    member_headers = [(k.lower().encode(), v.encode()) for k, v in env["roles"]["member"].items()]
+    body = (
+        b'{"name":"pre-header-commit","config":{"method":"random",'
+        b'"metric":{"key":"loss","goal":"minimize"},'
+        b'"parameters":{"lr":{"type":"float","min":0.001,"max":0.01}}}}'
+    )
+    member_headers.extend([(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())])
+
+    visible_at_response_start: list[bool] = []
+    sent_body = False
+
+    async def receive():
+        nonlocal sent_body
+        if not sent_body:
+            sent_body = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            assert message["status"] == 201
+            with app.state.session_factory() as other_session:
+                found = other_session.scalar(select(Sweep).where(Sweep.name == "pre-header-commit"))
+                visible_at_response_start.append(found is not None)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/api/v1/sweeps",
+        "raw_path": b"/api/v1/sweeps",
+        "query_string": b"",
+        "headers": member_headers,
+        "client": ("127.0.0.1", 50000),
+        "server": ("127.0.0.1", 8000),
+    }
+    asyncio.run(app(scope, receive, send))
+    assert visible_at_response_start == [True]

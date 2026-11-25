@@ -71,6 +71,7 @@ def post_user(request: Request, db: DbSession, payload: Annotated[Any, Body()] =
     except users.PasswordHasherBusy:
         raise hasher_busy() from None
     audit.record(db, action="user.create", target=user.id, detail=request_detail(request))
+    db.commit()
     return user_out(user)
 
 
@@ -96,6 +97,7 @@ def post_project(request: Request, body: ProjectCreate, db: DbSession) -> Projec
         db, action="project.create", project_id=project.id, target=project.id,
         detail={"name": project.name, "owner": owner_id, **request_detail(request)},
     )
+    db.commit()
     return ProjectCreated(project=ProjectRef(id=project.id, name=project.name), api_key=api_key)
 
 
@@ -105,6 +107,7 @@ def post_key(project_id: str, db: DbSession) -> ApiKeyCreated:
         raise HTTPException(status_code=404, detail="project not found")
     api_key = create_api_key(db, project_id)
     audit.record(db, action="key.create", project_id=project_id, detail={"prefix": api_key.split("_")[1]})
+    db.commit()
     return ApiKeyCreated(api_key=api_key)
 
 
