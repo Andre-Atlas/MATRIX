@@ -15,6 +15,7 @@ Um módulo único, `matrix_server.egress`, é o **único** caminho para requisi�
 6. **Modo padrão `allowlist`**: o host precisa estar na lista do projeto (`egress_hosts`, gerida por `admin`; curinga só como `*.dominio`). `MATRIX_EGRESS_MODE=public` libera hosts públicos sem lista. `MATRIX_EGRESS_ALLOW_PRIVATE=1` só existe para desenvolvimento e testes.
 7. Cada requisição de saída gera registro em `audit_log` (projeto, host, finalidade, status), sem corpo.
 Chamadas a provedores de LLM usam URLs configuradas pelo **operador** por variável de ambiente e não passam por esta política (ver ADR-011).
+Servidores de modelo locais (Ollama etc.) listados pelo operador em `MATRIX_LOCAL_MODEL_ENDPOINTS` são a única exceção ao bloqueio de IP privado, só para os fins `model`/`embedding` e só por `local_model_client` (ver ADR-016).
 
 ## Consequências
 - Webhooks, scanner, gateway (para URLs de usuário) e runners reutilizam o módulo e herdam as proteções.
