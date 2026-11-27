@@ -835,3 +835,24 @@ def test_artifact_store_failures_mark_unverified_and_fail_task(env, tmp_path, mo
     with app.state.session_factory() as db:
         db_run = db.get(SandboxRun, run_id)
         assert db_run is not None and db_run.passed_tasks == 0 and db_run.pass_rate == 0.0
+
+
+def test_settle_failed_sandbox_keeps_sandbox_unavailable(env):
+    from types import SimpleNamespace
+
+    from matrix_server.workers.handlers import settle_failed_sandbox
+
+    factory = env["app"].state.session_factory
+    with factory() as s:
+        unavailable = SandboxRun(project_id=env["project_a"], name="u", status="sandbox_unavailable", error="no docker")
+        running = SandboxRun(project_id=env["project_a"], name="r", status="running")
+        s.add_all([unavailable, running])
+        s.commit()
+        ids = (unavailable.id, running.id)
+    for rid in ids:
+        job = SimpleNamespace(payload={"sandbox_run_id": rid}, project_id=env["project_a"], error="boom")
+        settle_failed_sandbox(factory, job)
+    with factory() as s:
+        assert s.get(SandboxRun, ids[0]).status == "sandbox_unavailable"
+        assert s.get(SandboxRun, ids[0]).error == "no docker"
+        assert s.get(SandboxRun, ids[1]).status == "failed"

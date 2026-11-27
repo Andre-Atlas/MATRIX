@@ -202,7 +202,8 @@ def settle_failed_sandbox(session_factory: sessionmaker[Session], job: Job) -> N
                 SandboxRun.id == sandbox_run_id, SandboxRun.project_id == job.project_id
             )
         ).first()
-        if run is None or run.status in ("completed", "failed", "cancelled"):
+        # `sandbox_unavailable` is already a terminal, more specific status: keep it.
+        if run is None or run.status in ("completed", "failed", "cancelled", "sandbox_unavailable"):
             return
         run.status = "failed"
         if job.error == jobs.LEASE_EXPIRED_ERROR:

@@ -241,10 +241,28 @@ def deliver_webhook_job(
     # Release the worker transaction/connection before external HTTP I/O or side sessions.
     session.close()
 
+    # Terminal status for deliveries whose webhook was deleted or deactivated after queuing:
+    # "cancelled" (never attempted; `attempts` stays as is) so they do not sit in "queued" forever.
     if wh_row is None:
+        _update_delivery_state(
+            factory,
+            deliv_id,
+            status="cancelled",
+            attempts=attempts,
+            last_status_code=None,
+            last_error="webhook_deleted",
+        )
         return
     url, secret_encrypted, wh_active = wh_row
     if not wh_active:
+        _update_delivery_state(
+            factory,
+            deliv_id,
+            status="cancelled",
+            attempts=attempts,
+            last_status_code=None,
+            last_error="webhook_inactive",
+        )
         return
 
     attempt_num = max(attempts + 1, job_attempts)

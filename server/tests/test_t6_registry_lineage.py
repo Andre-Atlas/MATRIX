@@ -1080,3 +1080,184 @@ def test_webhook_worker_releases_db_connection_before_http_post(env):
     with factory() as db:
         job = db.scalars(select(Job).where(Job.kind == "webhooks.deliver").order_by(Job.created_at.desc())).first()
         assert job is not None and job.status == "done"
+
+
+# ---------------------------------------------------------------------------
+# 8. L8: webhook terminal states, max_attempts, decryption failure, URL validation; merge/revert caps
+# ---------------------------------------------------------------------------
+
+
+def _webhook_with_queued_delivery(env, name: str, url: str = "http://hooks.example.com/l8"):
+    client: TestClient = env["client"]
+    mid = _create_model(client, env["member_a"], name)["id"]
+    _create_version(client, env["member_a"], mid)
+    created = client.post(
+        f"/api/v1/models/{mid}/webhooks", headers=env["admin_a"], json={"url": url, "events": ["stage.changed"]}
+    )
+    assert created.status_code == 201, created.text
+    wh_id = created.json()["id"]
+    assert (
+        client.post(
+            f"/api/v1/models/{mid}/versions/1/stage", headers=env["admin_a"], json={"stage": "staging"}
+        ).status_code
+        == 200
+    )
+    return mid, wh_id
+
+
+def _deliveries(env, wh_id: str):
+    from matrix_server.mlops.registry_models import WebhookDelivery
+
+    with env["factory"]() as db:
+        return list(db.scalars(select(WebhookDelivery).where(WebhookDelivery.webhook_id == wh_id)))
+
+
+def test_inactive_webhook_delivery_is_cancelled_not_queued_forever(env):
+    _mid, wh_id = _webhook_with_queued_delivery(env, "l8-inactive")
+    with env["factory"]() as db, db.begin():
+        db.get(ModelWebhook, wh_id).active = False
+    worker_runner.load_handler_modules()
+    webhook_handlers.set_secret_key(SECRET_KEY)
+    try:
+        assert worker_runner.run_once(env["factory"], "l8-worker") is True
+    finally:
+        webhook_handlers.set_secret_key(None)
+    (d,) = _deliveries(env, wh_id)
+    assert d.status == "cancelled" and d.last_error == "webhook_inactive" and d.attempts == 0
+
+
+def test_deleted_webhook_delivery_is_cancelled(env):
+    mid, wh_id = _webhook_with_queued_delivery(env, "l8-deleted")
+    # Simulate the webhook vanishing while the job is queued (SQLite does not cascade without FK pragma).
+    with env["factory"]() as db, db.begin():
+        db.connection().exec_driver_sql("PRAGMA foreign_keys=OFF")
+        db.execute(sa.delete(ModelWebhook).where(ModelWebhook.id == wh_id))
+    worker_runner.load_handler_modules()
+    webhook_handlers.set_secret_key(SECRET_KEY)
+    try:
+        assert worker_runner.run_once(env["factory"], "l8-worker") is True
+    finally:
+        webhook_handlers.set_secret_key(None)
+    (d,) = _deliveries(env, wh_id)
+    assert d.status == "cancelled" and d.last_error == "webhook_deleted"
+
+
+def test_webhook_decryption_failure_marks_failed_without_leaking(env):
+    _mid, wh_id = _webhook_with_queued_delivery(env, "l8-decrypt")
+    worker_runner.load_handler_modules()
+    webhook_handlers.set_secret_key("a-different-master-key-than-the-one-that-encrypted")
+    try:
+        assert worker_runner.run_once(env["factory"], "l8-worker") is True
+    finally:
+        webhook_handlers.set_secret_key(None)
+    (d,) = _deliveries(env, wh_id)
+    assert d.status == "failed"
+    assert d.last_error == "crypto:WebhookDeliveryError"
+    assert d.last_status_code is None
+
+
+def test_webhook_max_attempts_final_failure_is_terminal(env):
+    from matrix_server.mlops import webhooks as wh_mod
+
+    mid, wh_id = _webhook_with_queued_delivery(env, "l8-max-attempts")
+    client: TestClient = env["client"]
+    assert (
+        client.post(
+            f"/api/v1/projects/{env['pid_a']}/egress-hosts", headers=env["admin_a"], json={"host": "hooks.example.com"}
+        ).status_code
+        == 201
+    )
+
+    class _FailHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self.send_response(500)
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            pass
+
+    srv, port, _th = _start_receiver(_FailHandler)
+    try:
+        egress.set_resolver_for_tests(lambda host, _p: [PUBLIC_IP])
+        egress.set_dialer_for_tests(lambda ip, _p: ("127.0.0.1", port))
+        with env["factory"]() as db:
+            job = db.scalars(select(Job).where(Job.kind == wh_mod.WEBHOOK_DELIVER_JOB)).first()
+            assert job.max_attempts == wh_mod.WEBHOOK_MAX_ATTEMPTS
+
+        def attempt(n: int) -> str:
+            with env["factory"]() as db:
+                job = db.scalars(select(Job).where(Job.kind == wh_mod.WEBHOOK_DELIVER_JOB)).first()
+                job.attempts = n
+                db.expunge(job)
+                with pytest.raises(wh_mod.WebhookDeliveryError):
+                    wh_mod.deliver_webhook_job(db, job, secret_key=SECRET_KEY, session_factory=env["factory"])
+            return _deliveries(env, wh_id)[0].status
+
+        assert attempt(1) == "queued"  # retry still pending
+        assert attempt(wh_mod.WEBHOOK_MAX_ATTEMPTS) == "failed"  # last attempt is terminal
+    finally:
+        egress.set_resolver_for_tests(None)
+        egress.set_dialer_for_tests(None)
+        srv.shutdown()
+        srv.server_close()
+    (d,) = _deliveries(env, wh_id)
+    assert d.last_error == "http:500" and d.last_status_code == 500
+
+
+def test_webhook_url_validation_rejects_bad_urls(env):
+    client: TestClient = env["client"]
+    mid = _create_model(client, env["member_a"], "l8-url")["id"]
+    for bad in (
+        "ftp://hooks.example.com/x",
+        "http:///nohost",
+        "http://user:pass@hooks.example.com/x",
+        "http://hooks.example.com/" + "a" * 2000,
+        "   ",
+    ):
+        resp = client.post(
+            f"/api/v1/models/{mid}/webhooks", headers=env["admin_a"], json={"url": bad, "events": ["stage.changed"]}
+        )
+        assert resp.status_code in (400, 422), (bad[:40], resp.status_code)
+    resp = client.post(
+        f"/api/v1/models/{mid}/webhooks", headers=env["admin_a"], json={"url": "http://hooks.example.com/ok", "events": ["nope"]}
+    )
+    assert resp.status_code in (400, 422)
+
+
+def test_dataset_merge_and_revert_respect_item_cap(env):
+    client: TestClient = env["client"]
+    m = env["member_a"]
+    ds = client.post("/api/v1/datasets", headers=m, json={"name": "l8-cap"}).json()["id"]
+
+    def commit(branch, keys):
+        r = client.post(
+            f"/api/v1/datasets/{ds}/commits",
+            headers=m,
+            json={"branch": branch, "message": f"c {keys}", "changes": {"upsert": [{"item_key": k, "input": {"k": k}} for k in keys]}},
+        )
+        assert r.status_code == 201, r.text
+        return r.json()["id"]
+
+    base = commit("main", ["a1", "a2"])
+    assert client.post(f"/api/v1/datasets/{ds}/branches", headers=m, json={"name": "feat", "from_branch": "main"}).status_code == 201
+    commit("feat", ["f1", "f2", "f3"])  # feat: 5 items (cap)
+    commit("main", ["m1"])  # main: 3 items; diverged from feat
+    merged = client.post(
+        f"/api/v1/datasets/{ds}/merge", headers=m, json={"source_branch": "feat", "target_branch": "main"}
+    )
+    assert merged.status_code == 422, merged.text  # union = 6 items > cap 5
+
+    # Revert: lower the cap below the target commit's size.
+    app = env["app"]
+    original = app.state.settings
+    app.state.settings = original.model_copy(update={"max_dataset_commit_items": 1})
+    try:
+        reverted = client.post(
+            f"/api/v1/datasets/{ds}/revert", headers=m, json={"branch": "main", "target_commit_id": base}
+        )
+    finally:
+        app.state.settings = original
+    assert reverted.status_code == 422, reverted.text
+    ok = client.post(f"/api/v1/datasets/{ds}/revert", headers=m, json={"branch": "main", "target_commit_id": base})
+    assert ok.status_code == 201, ok.text
