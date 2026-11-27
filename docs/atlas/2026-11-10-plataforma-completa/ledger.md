@@ -97,3 +97,14 @@ Formato: `T<n> · [tag] · C<n> → modelo/esforço (papel)`.
 - Pedido do usuário: pendências da auditoria + motores reais + validação de infra + recursos adiados, com a restrição **tudo local, sem gasto com deploy ou sistemas**, prioritária sobre as demais desde que a qualidade não caia demais, mantendo o propósito de unificar os frameworks.
 - Gate 1 aprovado: `docs/atlas/2026-11-27-ciclo-local/plan.md` (L1–L12).
 - Ruling: Ollama local como servidor de modelo único (qwen2.5:0.5b, all-minilm, moondream, CPU) para gateway, lm-eval, VLMEvalKit, Inspect AI, embeddings e safety; exceção de egress só para `MATRIX_LOCAL_MODEL_ENDPOINTS` fixados pelo operador — custo: números de benchmark em CPU/0,5B só provam o motor, não comparam modelos.
+
+## Ciclo 3 — pausa a pedido do usuário (2026-11-27)
+
+- Agentes interrompidos e trabalho salvo (`wip` rotulados), branch `ccr-9443eae6-fk5867` no remoto.
+- **L1 concluída**: egress `local_model_client` (fins `model`/`embedding`, só hosts de `MATRIX_LOCAL_MODEL_ENDPOINTS`), ADR-016, serviço `ollama` (perfil `llm`), `make llm-up`/`llm-pull`; 380 testes focados verdes. Pendente: revisão de segurança da exceção de egress; `make llm-*` não executados de fato.
+- **L8 quase concluída**: posse por projeto de `sweep_id`/`dataset_commit_id`, webhooks inativos cancelados, `sandbox_unavailable` preservado, paginação de `sweep_detail` + importância via job, paginação de modelos, `diff_commits`/`find_lca` em SQL limitado, teto agregado em `_fetch_hop_edges`. Faltou só a verificação final por módulo (banco `matrix_test_b`) e o item de cobertura MEDIUM #21.
+- **L7 em andamento** (`wip`): `/data-sets` por manifesto, SDK `matrix_sdk.data_sets`, fragmento `l7_data_sets.py`; faltou a verificação ampla.
+- **L2 iniciada** (`wip`): só `net.async_client_kwargs`; provedor ollama, SSE, chaves virtuais e fragmento ainda por fazer.
+- **L3 iniciada** (`wip`): só o extra `engines` (lm-eval 0.4.13) no `pyproject`/`uv.lock`; motor por fazer.
+- Não iniciadas: L4, L5, L6, L9, L10, L11, L12.
+- Retomada: religar Postgres/ClickHouse/Docker (HANDOFF §5; `rm -f /var/run/docker.pid` se o PID estiver reaproveitado), Ollama de dev `matrix-ollama-dev` com os 3 modelos no volume `matrix-ollama` (neste ambiente com a CA do proxy montada); um banco por agente (`matrix_test_a..d`) — compartilhar `matrix_test` corrompe as suítes paralelas. `test_anthropic_provider_complete_translation_and_errors` falha neste container por `ANTHROPIC_BASE_URL` exportado (corrigir na L2).
