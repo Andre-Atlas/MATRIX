@@ -1302,3 +1302,22 @@ def test_model_list_and_detail_are_paginated_and_card_is_excerpted(env):
     assert client.get(f"/api/v1/mlops/models/{ids[0]}/versions/9", headers=v).status_code == 404
     assert client.get(f"/api/v1/mlops/models/{ids[0]}/versions/3", headers=env["admin_b"]).status_code == 404
     assert client.get("/api/v1/mlops/models", headers=v, params={"limit": 0}).status_code == 422
+
+
+def test_fetch_hop_edges_respects_aggregate_row_limit(env):
+    from matrix_server.mlops.lineage import _fetch_hop_edges
+
+    client: TestClient = env["client"]
+    m = env["member_a"]
+    parent = client.post("/api/v1/runs", headers=m, json={}).json()["id"]
+    for _ in range(6):
+        assert client.post("/api/v1/runs", headers=m, json={"parent_run_id": parent}).status_code == 201
+    mid = _create_model(client, m, "l8-hop")["id"]
+    for _ in range(6):
+        _create_version(client, m, mid, run_id=parent)
+
+    with env["factory"]() as db:
+        everything = _fetch_hop_edges(db, env["pid_a"], [("run", parent)], "down", row_limit=500)
+        assert len(everything) >= 12  # 6 forks + 6 registered versions: several subqueries contribute
+        capped = _fetch_hop_edges(db, env["pid_a"], [("run", parent)], "down", row_limit=4)
+        assert len(capped) == 4  # aggregate cap, not 4 per subquery

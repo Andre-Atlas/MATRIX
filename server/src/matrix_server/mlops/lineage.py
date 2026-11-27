@@ -176,6 +176,11 @@ def _make_edge(
     }
 
 
+def _budget(edges: list[dict[str, Any]], row_limit: int) -> int:
+    """Rows a subquery may still return so one hop never fetches past the aggregate `row_limit`."""
+    return max(row_limit - len(edges), 1)
+
+
 def _fetch_hop_edges(
     db: Session,
     project_id: str,
@@ -204,7 +209,7 @@ def _fetch_hop_edges(
                         ArtifactLineage.source_type.in_(etypes),
                         ArtifactLineage.source_id.in_(batch),
                     )
-                    .limit(row_limit)
+                    .limit(_budget(edges, row_limit))
                 ).all()
                 for e in rows:
                     edges.append(
@@ -226,7 +231,7 @@ def _fetch_hop_edges(
                         ArtifactLineage.target_type.in_(etypes),
                         ArtifactLineage.target_id.in_(batch),
                     )
-                    .limit(row_limit)
+                    .limit(_budget(edges, row_limit))
                 ).all()
                 for e in rows:
                     edges.append(
@@ -273,21 +278,21 @@ def _fetch_hop_edges(
                 for child in db.scalars(
                     select(Run)
                     .where(Run.project_id == project_id, Run.parent_run_id.in_(batch))
-                    .limit(row_limit)
+                    .limit(_budget(edges, row_limit))
                 ).all():
                     if child.parent_run_id:
                         edges.append(_make_edge("run", child.parent_run_id, "run", child.id, "forked_from"))
                 for art in db.scalars(
                     select(MArtifact)
                     .where(MArtifact.project_id == project_id, MArtifact.run_id.in_(batch))
-                    .limit(row_limit)
+                    .limit(_budget(edges, row_limit))
                 ).all():
                     if art.run_id:
                         edges.append(_make_edge("run", art.run_id, "artifact", art.id, "produced"))
                 for mv in db.scalars(
                     select(ModelVersion)
                     .where(ModelVersion.project_id == project_id, ModelVersion.run_id.in_(batch))
-                    .limit(row_limit)
+                    .limit(_budget(edges, row_limit))
                 ).all():
                     if mv.run_id:
                         edges.append(_make_edge("run", mv.run_id, "model_version", mv.id, "registered_as"))
@@ -321,7 +326,7 @@ def _fetch_hop_edges(
                         BenchmarkRun.project_id == project_id,
                         BenchmarkRun.model_version_id.in_(batch),
                     )
-                    .limit(row_limit)
+                    .limit(_budget(edges, row_limit))
                 ).all():
                     if br.model_version_id:
                         edges.append(
@@ -340,7 +345,7 @@ def _fetch_hop_edges(
                 for mv in db.scalars(
                     select(ModelVersion)
                     .where(ModelVersion.project_id == project_id, ModelVersion.artifact_id.in_(batch))
-                    .limit(row_limit)
+                    .limit(_budget(edges, row_limit))
                 ).all():
                     if mv.artifact_id:
                         edges.append(_make_edge("artifact", mv.artifact_id, "model_version", mv.id, "packaged_as"))
@@ -351,7 +356,7 @@ def _fetch_hop_edges(
                 for r in db.scalars(
                     select(Run)
                     .where(Run.project_id == project_id, Run.dataset_version_id.in_(batch))
-                    .limit(row_limit)
+                    .limit(_budget(edges, row_limit))
                 ).all():
                     if r.dataset_version_id:
                         edges.append(_make_edge(ds_kind, r.dataset_version_id, "run", r.id, "trained_on"))
@@ -363,7 +368,7 @@ def _fetch_hop_edges(
                     br_stmt = select(BenchmarkRun).where(
                         BenchmarkRun.project_id == project_id, BenchmarkRun.dataset_commit_id.in_(batch)
                     )
-                for br in db.scalars(br_stmt.limit(row_limit)).all():
+                for br in db.scalars(br_stmt.limit(_budget(edges, row_limit))).all():
                     src_id = br.dataset_id if ds_kind == "dataset" else br.dataset_commit_id
                     if src_id:
                         edges.append(_make_edge(ds_kind, src_id, "benchmark", br.id, "evaluated_by"))
@@ -371,7 +376,7 @@ def _fetch_hop_edges(
     if "sweep" in by_kind and go_up:
         for batch in _chunks(by_kind["sweep"]):
             for r in db.scalars(
-                select(Run).where(Run.project_id == project_id, Run.sweep_id.in_(batch)).limit(row_limit)
+                select(Run).where(Run.project_id == project_id, Run.sweep_id.in_(batch)).limit(_budget(edges, row_limit))
             ).all():
                 if r.sweep_id:
                     edges.append(_make_edge("run", r.id, "sweep", r.sweep_id, "member_of"))
@@ -384,7 +389,7 @@ def _fetch_hop_edges(
                     ModelVersion.project_id == project_id,
                     ModelVersion.eval_experiment_id.in_(batch),
                 )
-                .limit(row_limit)
+                .limit(_budget(edges, row_limit))
             ).all():
                 if mv.eval_experiment_id:
                     edges.append(
@@ -399,7 +404,7 @@ def _fetch_hop_edges(
                     ModelVersion.project_id == project_id,
                     ModelVersion.safety_scan_id.in_(batch),
                 )
-                .limit(row_limit)
+                .limit(_budget(edges, row_limit))
             ).all():
                 if mv.safety_scan_id:
                     edges.append(
@@ -422,7 +427,8 @@ def _fetch_hop_edges(
                 elif br.dataset_id:
                     edges.append(_make_edge("dataset", br.dataset_id, "benchmark", br.id, "evaluated_by"))
 
-    return edges
+    # The cap is aggregate across all subqueries of this hop, not per subquery.
+    return edges[:row_limit]
 
 
 def _enrich_nodes(
