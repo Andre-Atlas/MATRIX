@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Valida deploy/compose.yaml sem Docker: depends_on e volumes consistentes, portas só em 127.0.0.1,
-web sem MATRIX_API_KEY e com MATRIX_WEB_ORIGIN obrigatória. Requer PyYAML. Saída 1 se algo falhar."""
+web sem MATRIX_API_KEY e com MATRIX_WEB_ORIGIN obrigatória, ollama só no perfil llm com tag fixa. Requer PyYAML. Saída 1 se algo falhar."""
 
 from __future__ import annotations
 
@@ -95,6 +95,29 @@ def check(doc: dict) -> list[str]:
             dep_names = deps if isinstance(deps, list) else deps.keys()
             if "rustfs" in dep_names:
                 errors.append(f"{svc_name}: não deve depender de rustfs (perfil dev apenas)")
+    for key in ("MATRIX_LOCAL_MODEL_ENDPOINTS", "MATRIX_LOCAL_LLM_URL"):
+        for svc_name, env_map in (("api", api), ("worker", worker)):
+            if key not in env_map:
+                errors.append(f"{svc_name}: falta {key}")
+    if "ollama" in services:
+        ollama = services["ollama"] or {}
+        if ollama.get("profiles") != ["llm"]:
+            errors.append("ollama deve restringir-se a profiles: ['llm']")
+        image = str(ollama.get("image", ""))
+        repo, _, tag = image.rpartition(":")
+        if not repo.endswith("ollama/ollama") or not re.fullmatch(r"\d+\.\d+\.\d+", tag):
+            errors.append(f"ollama: imagem precisa de tag fixa (ollama/ollama:X.Y.Z), não '{image}'")
+        if not any(str(v).startswith("ollama-data:") for v in ollama.get("volumes") or []):
+            errors.append("ollama: modelos devem ficar no volume nomeado ollama-data")
+        if "healthcheck" not in ollama:
+            errors.append("ollama: falta healthcheck")
+        for k, v in _env_map(ollama.get("environment")).items():
+            if not re.fullmatch(r"\$\{[A-Z0-9_]+(?::-[^}]*|:\?[^}]+)?\}", v):
+                errors.append(f"ollama: variável {k} deve vir do ambiente")
+        for svc_name, svc in services.items():
+            deps = svc.get("depends_on") or []
+            if "ollama" in (deps if isinstance(deps, list) else deps.keys()):
+                errors.append(f"{svc_name}: não deve depender de ollama (perfil llm opcional)")
     return errors
 
 

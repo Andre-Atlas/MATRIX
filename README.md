@@ -83,6 +83,25 @@ make dev-web   # web em :3000
 Artefatos de runs ficam no volume `artifacts-data` (`MATRIX_ARTIFACT_BACKEND=local`). O compose não
 tem serviço S3: nenhuma imagem S3 foi validada.
 
+### Modelos locais
+
+Os motores reais (benchmarks, sandboxes, vetores, safety) usam um servidor de modelo **local**, sem
+custo e sem GPU: o Ollama do perfil `llm` do compose ([ADR-016](docs/adr/016-tudo-local-ollama.md)).
+
+```bash
+cp deploy/.env.example deploy/.env   # se ainda não existir (o compose exige as senhas)
+make llm-up     # sobe só o serviço ollama (porta 127.0.0.1:11434, volume ollama-data)
+make llm-pull   # baixa qwen2.5:0.5b (chat), all-minilm (embeddings) e moondream (visão), ~2,2 GB
+```
+
+A API e o worker chegam ao Ollama só pelos endpoints que o operador lista em
+`MATRIX_LOCAL_MODEL_ENDPOINTS` (no compose, `http://ollama:11434`). Esses hosts podem ser privados ou
+loopback, mas só para chamadas de modelo e embedding; webhooks e outras URLs de usuário continuam
+bloqueados para eles. Fora do compose (ex. `make dev-api` com o Ollama em `127.0.0.1`), use
+`MATRIX_LOCAL_MODEL_ENDPOINTS=http://127.0.0.1:11434`. Para usar llama.cpp ou vLLM, liste a URL do
+servidor e aponte `MATRIX_LOCAL_LLM_URL` para ela. Sem servidor configurado, os motores respondem
+"indisponível" em vez de resultado falso.
+
 ### Variáveis de ambiente
 
 Servidor (`matrix-api`, `matrix-worker`, `matrix-admin`); as marcadas com *ciclo 2* pertencem ao
@@ -116,6 +135,9 @@ G0/G1 em andamento.
 | `MATRIX_EGRESS_MODE` | `allowlist` | Chamadas de saída: só hosts cadastrados (`allowlist`) ou qualquer host público (`public`) (*ciclo 2*) |
 | `MATRIX_EGRESS_ALLOW_PRIVATE` | `false` | Só dev/teste: permite redes privadas e loopback (*ciclo 2*) |
 | `MATRIX_EGRESS_ALLOWED_PORTS`, `MATRIX_EGRESS_MAX_REQUEST_BYTES`, `MATRIX_EGRESS_CONNECT_TIMEOUT` | `80,443`, `1000000`, `5.0` | Limites das chamadas de saída (*ciclo 2*) |
+| `MATRIX_LOCAL_MODEL_ENDPOINTS` | vazio (nada liberado) | URLs base, separadas por vírgula, dos servidores de modelo locais confiáveis (`http://ollama:11434,http://127.0.0.1:11434`). Só elas podem ser IP privado/loopback, só para fins `model`/`embedding`; esquema, host e porta precisam bater; redirect para fora da lista é bloqueado ([ADR-016](docs/adr/016-tudo-local-ollama.md)) |
+| `MATRIX_LOCAL_LLM_URL` | `http://127.0.0.1:11434` | Servidor que os motores usam; ignorado se não estiver em `MATRIX_LOCAL_MODEL_ENDPOINTS` |
+| `MATRIX_LOCAL_CHAT_MODEL`, `MATRIX_LOCAL_EMBED_MODEL`, `MATRIX_LOCAL_VISION_MODEL` | `qwen2.5:0.5b`, `all-minilm`, `moondream` | Modelos locais padrão de chat, embedding e visão |
 | `MATRIX_JUDGE_PROVIDER` | vazio (`fake`) | Juiz de experimentos e avaliações online. Vazio/`fake`: juiz heurístico offline, **só para teste/demo** (o worker avisa no log e os scores saem marcados `heuristic`). `openai` ou `anthropic`: juiz por LLM |
 | `MATRIX_JUDGE_MODEL` | — | Modelo do juiz; obrigatório com provider diferente de `fake` |
 | `MATRIX_EMBEDDING_MODEL` | `text-embedding-3-small` | Embedder quando o juiz é `openai` |

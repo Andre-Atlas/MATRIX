@@ -56,6 +56,25 @@ services:
     volumes:
       - rustfs-data:/data
 
+  # Local model server (ADR-016): `make llm-up` / `docker compose --profile llm up -d ollama`, then
+  # `make llm-pull`. api/worker reach it only through MATRIX_LOCAL_MODEL_ENDPOINTS (egress exception
+  # for model/embedding). Nothing depends on it: without the profile the engines report unavailable.
+  ollama:
+    profiles: ["llm"]
+    image: ollama/ollama:0.12.6
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:11434:11434"
+    environment:
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-5m}
+    volumes:
+      - ollama-data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
   api:
     build: ../server
     restart: unless-stopped
@@ -82,6 +101,12 @@ services:
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
+      # Local model server (ADR-016): operator-trusted endpoints (model/embedding only) and defaults.
+      MATRIX_LOCAL_MODEL_ENDPOINTS: ${MATRIX_LOCAL_MODEL_ENDPOINTS:-http://ollama:11434}
+      MATRIX_LOCAL_LLM_URL: ${MATRIX_LOCAL_LLM_URL:-http://ollama:11434}
+      MATRIX_LOCAL_CHAT_MODEL: ${MATRIX_LOCAL_CHAT_MODEL:-qwen2.5:0.5b}
+      MATRIX_LOCAL_EMBED_MODEL: ${MATRIX_LOCAL_EMBED_MODEL:-all-minilm}
+      MATRIX_LOCAL_VISION_MODEL: ${MATRIX_LOCAL_VISION_MODEL:-moondream}
     volumes:
       - artifacts-data:/app/artifacts
     ports:
@@ -133,5 +158,6 @@ services:
 volumes:
   artifacts-data:
   clickhouse-data:
+  ollama-data:
   postgres-data:
   rustfs-data:
