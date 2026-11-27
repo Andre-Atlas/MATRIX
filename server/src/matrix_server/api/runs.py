@@ -38,6 +38,7 @@ from matrix_server.runs.store import (
 )
 from matrix_server.storage import jobs
 from matrix_server.storage.db import as_utc, get_db, utcnow
+from matrix_server.sweeps.models import Sweep
 
 log = logging.getLogger(__name__)
 
@@ -359,15 +360,21 @@ _HEX_32 = re.compile(r"^[0-9a-f]{32}$")
 
 
 def _validate_dataset_version_ref(db: Session, project_id: str, ref: str) -> str | None:
-    """Validate `runs.dataset_version_id` when it references a dataset commit or dataset.
+    """Validate `runs.dataset_version_id` when it references a data-set version, dataset commit or dataset.
 
     Returns the lineage node kind (`dataset_commit` or `dataset`) if the reference resolves to a
     project entity, or `None` for legacy opaque external refs (e.g. G1 tests without datasets).
     Blocks cross-project references and unknown 32-hex IDs or unknown refs when the project has
     datasets/commits (422).
     """
+    from matrix_server.data_sets.service import classify_version_ref
     from matrix_server.storage.models import Dataset, DatasetCommit
 
+    data_set_ref = classify_version_ref(db, project_id, ref)  # file data-set versions (G3 section 2)
+    if data_set_ref == "own":
+        return "data_set_version"
+    if data_set_ref == "foreign":
+        raise HTTPException(status_code=422, detail="data-set version not found")
     if db.scalar(select(DatasetCommit.id).where(DatasetCommit.id == ref, DatasetCommit.project_id == project_id)):
         return "dataset_commit"
     if db.scalar(select(Dataset.id).where(Dataset.id == ref, Dataset.project_id == project_id)):
@@ -400,6 +407,10 @@ def create_run(
         select(Run.id).where(Run.id == body.parent_run_id, Run.project_id == project_id)
     ) is None:
         raise HTTPException(status_code=422, detail="parent run not found")
+    if body.sweep_id is not None and db.scalar(
+        select(Sweep.id).where(Sweep.id == body.sweep_id, Sweep.project_id == project_id)
+    ) is None:
+        raise HTTPException(status_code=404, detail="sweep not found")
     dataset_node_kind: str | None = None
     if body.dataset_version_id is not None:
         dataset_node_kind = _validate_dataset_version_ref(db, project_id, body.dataset_version_id)

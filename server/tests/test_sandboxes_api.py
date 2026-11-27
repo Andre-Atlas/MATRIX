@@ -595,6 +595,28 @@ def test_multi_tenant_isolation(env):
     assert run_a_id not in [r["id"] for r in list_b.json()["items"]]
 
 
+def test_dataset_commit_ownership_is_enforced(env):
+    from matrix_server.storage.models import Dataset, DatasetCommit
+
+    client: TestClient = env["client"]
+    factory = env["app"].state.session_factory
+    with factory() as s:
+        ds_a = Dataset(project_id=env["project_a"], name="da")
+        ds_b = Dataset(project_id=env["project_b"], name="db")
+        s.add_all([ds_a, ds_b])
+        s.flush()
+        ca = DatasetCommit(project_id=env["project_a"], dataset_id=ds_a.id, tree_hash="h", message="m")
+        cb = DatasetCommit(project_id=env["project_b"], dataset_id=ds_b.id, tree_hash="h", message="m")
+        s.add_all([ca, cb])
+        s.commit()
+        ca_id, cb_id = ca.id, cb.id
+    post = lambda body: client.post("/api/v1/sandboxes/runs", headers=env["member_a"], json={"name": "r", **body})  # noqa: E731
+    foreign = post({"dataset_commit_id": cb_id})
+    assert foreign.status_code == 404 and "commit" in foreign.json()["detail"]
+    assert post({"dataset_commit_id": "0" * 32}).status_code == 404
+    assert post({"dataset_commit_id": ca_id}).status_code == 201
+
+
 # ---------------------------------------------------------------------------
 # 5. Live Docker Containment Tests (skip with exact reason if no daemon)
 # ---------------------------------------------------------------------------

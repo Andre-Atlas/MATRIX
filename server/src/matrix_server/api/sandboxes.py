@@ -32,6 +32,7 @@ from matrix_server.storage import jobs
 from matrix_server.storage.db import as_utc, get_db, utcnow
 from matrix_server.storage.models import (
     Dataset,
+    DatasetCommit,
     SandboxRun,
     SandboxTaskTranscript,
 )
@@ -236,6 +237,15 @@ def create_sandbox_run(
         )
         if ds is None:
             raise HTTPException(status_code=404, detail="dataset not found")
+    if body.dataset_commit_id:
+        commit_query = select(DatasetCommit.id).where(
+            DatasetCommit.id == body.dataset_commit_id,
+            DatasetCommit.project_id == principal.project_id,
+        )
+        if body.dataset_id:
+            commit_query = commit_query.where(DatasetCommit.dataset_id == body.dataset_id)
+        if db.scalar(commit_query) is None:
+            raise HTTPException(status_code=404, detail="dataset commit not found")
 
     run = SandboxRun(
         project_id=principal.project_id,

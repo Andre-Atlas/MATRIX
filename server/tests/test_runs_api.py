@@ -95,6 +95,23 @@ def new_run(client, proj, **body):
     return resp.json()
 
 
+def make_sweep(client, proj, name="sw") -> str:
+    resp = client.post(
+        "/api/v1/sweeps",
+        json={
+            "name": name,
+            "config": {
+                "method": "random",
+                "metric": {"key": "loss", "goal": "minimize"},
+                "parameters": {"lr": {"type": "float", "min": 1e-4, "max": 1e-2}},
+            },
+        },
+        headers=proj.key,
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"]
+
+
 def log(client, proj, run_id, points):
     resp = client.post(f"/api/v1/runs/{run_id}/metrics", json={"points": points}, headers=proj.key)
     assert resp.status_code == 202, resp.text
@@ -152,6 +169,7 @@ def test_requires_auth_and_roles(client, two):
 
 def test_create_get_and_generated_names(client, two):
     one, _ = two
+    sw1 = make_sweep(client, one)
     run = new_run(
         client,
         one,
@@ -160,7 +178,7 @@ def test_create_get_and_generated_names(client, two):
         params={"lr": 0.001, "layers": [64, 64]},
         git={"commit": "abc123", "branch": "main", "dirty": False, "remote": "git@x:y.git"},
         env={"python": "3.12.1", "platform": "linux", "hostname": "box", "packages": ["torch==2.5.0"]},
-        sweep_id="sw1",
+        sweep_id=sw1,
         dataset_version_id="dv1",
     )
     assert run["status"] == "running" and run["ended_at"] is None and run["error"] is None
@@ -199,9 +217,21 @@ def test_create_validation(client, two):
     assert resp.status_code == 422
 
 
+def test_create_run_rejects_foreign_or_unknown_sweep(client, two):
+    one, other = two
+    foreign = make_sweep(client, other)
+    for sid in (foreign, "0" * 32):
+        resp = client.post("/api/v1/runs", json={"sweep_id": sid}, headers=one.key)
+        assert resp.status_code == 404, resp.text
+        assert "sweep" in resp.json()["detail"]
+    own = make_sweep(client, one)
+    assert client.post("/api/v1/runs", json={"sweep_id": own}, headers=one.key).status_code == 201
+
+
 def test_list_filters_search_and_summary(client, two):
     one, two_ = two
-    a = new_run(client, one, name="alpha", group="g1", tags=["base"], sweep_id="s1")
+    s1 = make_sweep(client, one)
+    a = new_run(client, one, name="alpha", group="g1", tags=["base"], sweep_id=s1)
     b = new_run(client, one, name="beta", group="g2", tags=["Tuned_x"])
     c = new_run(client, one, name="gamma", group="g1")
     new_run(client, two_, name="alpha", group="g1", tags=["base"])
@@ -225,7 +255,7 @@ def test_list_filters_search_and_summary(client, two):
     assert names(tag="base") == ["alpha"]
     assert names(tag="bas") == []
     assert names(name="beta") == ["beta"]
-    assert names(sweep_id="s1") == ["alpha"]
+    assert names(sweep_id=s1) == ["alpha"]
     assert names(q="ALP") == ["alpha"]
     assert names(q="g2") == ["beta"]
     assert names(q="tuned_") == ["beta"]  # matches the tag; `_` is literal
