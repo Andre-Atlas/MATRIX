@@ -22,6 +22,10 @@ dependencies = [
   "cryptography>=50.0.2",
 ]
 
+[project.optional-dependencies]
+# Real benchmark engines (ADR-016, L3). Heavy; the engines answer EngineUnavailable without them.
+engines = ["lm-eval[api,ifeval]==0.4.13"]
+
 [project.scripts]
 matrix-api = "matrix_server.cli:run_api"
 matrix-worker = "matrix_server.cli:run_worker"
