@@ -1127,7 +1127,7 @@ def test_inactive_webhook_delivery_is_cancelled_not_queued_forever(env):
 
 
 def test_deleted_webhook_delivery_is_cancelled(env):
-    mid, wh_id = _webhook_with_queued_delivery(env, "l8-deleted")
+    _mid, wh_id = _webhook_with_queued_delivery(env, "l8-deleted")
     # Simulate the webhook vanishing while the job is queued (SQLite does not cascade without FK pragma).
     with env["factory"]() as db, db.begin():
         db.connection().exec_driver_sql("PRAGMA foreign_keys=OFF")
@@ -1159,7 +1159,7 @@ def test_webhook_decryption_failure_marks_failed_without_leaking(env):
 def test_webhook_max_attempts_final_failure_is_terminal(env):
     from matrix_server.mlops import webhooks as wh_mod
 
-    mid, wh_id = _webhook_with_queued_delivery(env, "l8-max-attempts")
+    _mid, wh_id = _webhook_with_queued_delivery(env, "l8-max-attempts")
     client: TestClient = env["client"]
     assert (
         client.post(

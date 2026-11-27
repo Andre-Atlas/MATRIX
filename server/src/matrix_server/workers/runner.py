@@ -41,6 +41,7 @@ HANDLER_MODULES: list[str] = [
     "matrix_server.workers.artifact_handlers",
     "matrix_server.workers.run_handlers",
     "matrix_server.workers.webhook_handlers",
+    "matrix_server.workers.sweep_handlers",
 ]
 
 

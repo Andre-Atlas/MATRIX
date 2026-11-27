@@ -598,3 +598,72 @@ def test_t5_sweeps_migration_fragment_matches_models_and_copies_data(backend: st
         if backend == "postgres":
             Base.metadata.drop_all(eng)
         eng.dispose()
+
+
+def test_sweep_detail_paginates_and_importance_is_off_the_get_path(env: dict[str, Any], monkeypatch) -> None:
+    from matrix_server.sweeps import service as sweep_service
+    from matrix_server.workers import run_handlers
+    from matrix_server.workers import runner as worker_runner
+
+    client: TestClient = env["client"]
+    member, viewer = env["member_a"], env["viewer_a"]
+    factory = env["app"].state.session_factory
+    calls: list[int] = []
+
+    def fake_importance(parameters, completed, *, seed=None):
+        calls.append(len(completed))
+        return [{"param": "lr", "importance": 1.0}], None
+
+    monkeypatch.setattr(sweep_service, "compute_importance", fake_importance)
+    run_handlers.set_metric_store(env["app"].state.metric_store)
+    worker_runner.load_handler_modules()
+    sid = client.post(
+        "/api/v1/sweeps",
+        headers=member,
+        json={
+            "name": "many",
+            "config": {
+                "method": "random",
+                "metric": {"key": "val/loss", "goal": "minimize"},
+                "parameters": {"lr": {"type": "float", "min": 1e-4, "max": 1e-2}},
+            },
+        },
+    ).json()["id"]
+    for i in range(12):
+        nxt = client.post(f"/api/v1/sweeps/{sid}/next", headers=member, json={}).json()
+        rid = nxt["run"]["id"]
+        assert client.post(f"/api/v1/sweeps/{sid}/runs/{rid}/report", headers=member, json={"step": 1, "value": 1.0 + i}).status_code == 200
+        assert client.patch(f"/api/v1/runs/{rid}", headers=member, json={"status": "finished"}).status_code == 200
+
+    # Pagination: default keeps the g2 shape; limit/offset page through, with totals.
+    full = client.get(f"/api/v1/sweeps/{sid}", headers=viewer).json()
+    assert len(full["runs"]) == 12 and full["runs_total"] == 12 and full["runs_next_offset"] is None
+    p1 = client.get(f"/api/v1/sweeps/{sid}", headers=viewer, params={"limit": 5}).json()
+    p2 = client.get(f"/api/v1/sweeps/{sid}", headers=viewer, params={"limit": 5, "offset": 5}).json()
+    p3 = client.get(f"/api/v1/sweeps/{sid}", headers=viewer, params={"limit": 5, "offset": 10}).json()
+    assert [len(p["runs"]) for p in (p1, p2, p3)] == [5, 5, 2]
+    assert (p1["runs_next_offset"], p2["runs_next_offset"], p3["runs_next_offset"]) == (5, 10, None)
+    assert [r["run_id"] for p in (p1, p2, p3) for r in p["runs"]] == [r["run_id"] for r in full["runs"]]
+    assert p1["sweep"]["run_count"] == 12
+    assert client.get(f"/api/v1/sweeps/{sid}", headers=viewer, params={"limit": 100000}).status_code == 422
+
+    # GET never fits the model: importance is pending/stale until the worker job ran.
+    assert calls == []
+    assert full["importance"] is None and full["importance_stale"] is True
+
+    while worker_runner.run_once(factory, "imp-worker"):
+        pass
+    assert calls == [12]  # one deduped job for 12 finished runs
+    done = client.get(f"/api/v1/sweeps/{sid}", headers=viewer).json()
+    assert done["importance"] == [{"param": "lr", "importance": 1.0}]
+    assert done["importance_stale"] is False and done["importance_computed_at"].endswith("Z")
+    assert calls == [12]  # still not recomputed by GET
+
+    # A new finished run invalidates the cache (stale) until the next refresh.
+    nxt = client.post(f"/api/v1/sweeps/{sid}/next", headers=member, json={}).json()
+    client.patch(f"/api/v1/runs/{nxt['run']['id']}", headers=member, json={"status": "finished"})
+    assert client.get(f"/api/v1/sweeps/{sid}", headers=viewer).json()["importance_stale"] is True
+    while worker_runner.run_once(factory, "imp-worker"):
+        pass
+    assert client.get(f"/api/v1/sweeps/{sid}", headers=viewer).json()["importance_stale"] is False
+    run_handlers.set_metric_store(None)

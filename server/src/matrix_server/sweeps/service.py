@@ -509,29 +509,62 @@ def report_metric(
     return ReportResult(action="continue", reason=None)
 
 
-def sweep_detail(db: Session, store: MetricStore, sweep: Sweep) -> dict[str, Any]:
-    """Return {sweep, runs, importance, importance_note} per G2 contract."""
+DETAIL_DEFAULT_LIMIT = 500
+DETAIL_MAX_LIMIT = 1000
+IMPORTANCE_JOB_KIND = "sweeps.importance"
+# Importance is fit on at most this many finished runs (most recent first) so one job stays bounded.
+IMPORTANCE_MAX_RUNS = 2000
+
+
+def _finished_run_count(db: Session, sweep: Sweep) -> int:
+    return int(
+        db.scalar(
+            select(func.count(Run.id)).where(
+                Run.project_id == sweep.project_id, Run.sweep_id == sweep.id, Run.status == "finished"
+            )
+        )
+        or 0
+    )
+
+
+def sweep_detail(
+    db: Session,
+    store: MetricStore,
+    sweep: Sweep,
+    *,
+    limit: int = DETAIL_DEFAULT_LIMIT,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Return {sweep, runs, importance, importance_note, ...} per G2 contract.
+
+    `runs` is a page (`limit` <= DETAIL_MAX_LIMIT, `offset`); `runs_total` and `runs_next_offset`
+    describe the rest. Importance is never computed here: it is read from `sweep.importance_cache`,
+    which the `sweeps.importance` worker job refreshes when runs finish (`importance_stale` tells the
+    cache is older than the finished-run count; `importance_computed_at` tells when it was fit).
+    """
+    limit = max(1, min(int(limit), DETAIL_MAX_LIMIT))
+    offset = max(0, int(offset))
+    total = int(db.scalar(select(func.count(Run.id)).where(Run.project_id == sweep.project_id, Run.sweep_id == sweep.id)) or 0)
     runs = list(
         db.scalars(
             select(Run)
             .where(Run.project_id == sweep.project_id, Run.sweep_id == sweep.id)
             .order_by(Run.started_at.asc(), Run.id.asc())
+            .limit(limit)
+            .offset(offset)
         )
     )
     sr_by_run = {
         sr.run_id: sr
-        for sr in db.scalars(select(SweepRun).where(SweepRun.sweep_id == sweep.id))
+        for sr in db.scalars(select(SweepRun).where(SweepRun.sweep_id == sweep.id, SweepRun.run_id.in_([r.id for r in runs])))
     }
 
-    run_ids = [r.id for r in runs]
     # Fetch metric summaries and last steps for runs missing cached SweepRun values
     need_metrics = [r.id for r in runs if r.id not in sr_by_run or sr_by_run[r.id].last_value is None]
     summaries = store.summaries(sweep.project_id, need_metrics) if need_metrics else {}
     last_steps = store.last_steps(sweep.project_id, need_metrics) if need_metrics else {}
 
     runs_out: list[dict[str, Any]] = []
-    completed_for_imp: list[tuple[dict[str, Any], float]] = []
-
     for r in runs:
         sr = sr_by_run.get(r.id)
         last_val = sr.last_value if sr is not None else None
@@ -559,30 +592,87 @@ def sweep_detail(db: Session, store: MetricStore, sweep: Sweep) -> dict[str, Any
                 "step": step,
             }
         )
-        if r.status == "finished" and best_val is not None and math.isfinite(best_val):
-            completed_for_imp.append((dict(r.params or {}), best_val))
 
-    completed_count = len(completed_for_imp)
     cache = sweep.importance_cache if isinstance(sweep.importance_cache, dict) else None
-    if cache is not None and cache.get("count") == completed_count and cache.get("importance") is not None:
+    if cache is not None and cache.get("importance") is not None:
         importance = cache["importance"]
         importance_note = cache.get("note")
     else:
-        importance, importance_note = compute_importance(
-            sweep.config.get("parameters", {}),
-            completed_for_imp,
-            seed=sweep.seed,
-        )
-        if importance is not None:
-            sweep.importance_cache = {"count": completed_count, "importance": importance, "note": importance_note}
-            db.flush()
-
+        importance = None
+        importance_note = (cache or {}).get("note") or "importance not computed yet"
+    finished = _finished_run_count(db, sweep)
+    stale = (cache or {}).get("finished_runs") != finished
+    next_offset = offset + len(runs_out)
     return {
-        "sweep": render_sweep(sweep, len(run_ids)),
+        "sweep": render_sweep(sweep, total),
         "runs": runs_out,
+        "runs_total": total,
+        "runs_next_offset": next_offset if next_offset < total else None,
         "importance": importance,
         "importance_note": importance_note,
+        "importance_computed_at": (cache or {}).get("computed_at"),
+        "importance_stale": stale,
     }
+
+
+def refresh_importance(db: Session, store: MetricStore, sweep: Sweep) -> bool:
+    """Fit hyperparameter importance (Random Forest) and cache it on the sweep. Worker-side only.
+
+    Returns True when the cache was written. Idempotent: it is skipped when the finished-run count
+    did not change since the last fit.
+    """
+    finished = _finished_run_count(db, sweep)
+    cache = sweep.importance_cache if isinstance(sweep.importance_cache, dict) else None
+    if cache is not None and cache.get("finished_runs") == finished:
+        return False
+    runs = list(
+        db.scalars(
+            select(Run)
+            .where(Run.project_id == sweep.project_id, Run.sweep_id == sweep.id, Run.status == "finished")
+            .order_by(Run.started_at.desc(), Run.id.desc())
+            .limit(IMPORTANCE_MAX_RUNS)
+        )
+    )
+    sr_by_run = {
+        sr.run_id: sr
+        for sr in db.scalars(select(SweepRun).where(SweepRun.sweep_id == sweep.id, SweepRun.run_id.in_([r.id for r in runs])))
+    }
+    need = [r.id for r in runs if r.id not in sr_by_run or sr_by_run[r.id].best_value is None]
+    summaries = store.summaries(sweep.project_id, need) if need else {}
+    completed: list[tuple[dict[str, Any], float]] = []
+    for r in runs:
+        sr = sr_by_run.get(r.id)
+        best = sr.best_value if sr is not None else None
+        if best is None:
+            raw = summaries.get(r.id, {}).get(sweep.metric_key)
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                best = float(raw)
+        if best is not None and math.isfinite(best):
+            completed.append((dict(r.params or {}), float(best)))
+    importance, note = compute_importance(sweep.config.get("parameters", {}), completed, seed=sweep.seed)
+    sweep.importance_cache = {
+        "count": len(completed),
+        "finished_runs": finished,
+        "importance": importance,
+        "note": note,
+        "computed_at": utcnow().isoformat().replace("+00:00", "Z"),
+    }
+    db.flush()
+    return True
+
+
+def enqueue_importance_refresh(db: Session, project_id: str, sweep_id: str) -> bool:
+    """Queue a `sweeps.importance` job for the sweep unless one is already waiting (caller commits)."""
+    from matrix_server.storage import jobs
+    from matrix_server.storage.models import Job
+
+    pending = db.scalars(
+        select(Job).where(Job.project_id == project_id, Job.kind == IMPORTANCE_JOB_KIND, Job.status == "queued")
+    )
+    if any((j.payload or {}).get("sweep_id") == sweep_id for j in pending):
+        return False
+    jobs.enqueue(db, project_id, IMPORTANCE_JOB_KIND, {"sweep_id": sweep_id})
+    return True
 
 
 def patch_sweep_status(db: Session, sweep: Sweep, new_status: str) -> Sweep:
@@ -596,6 +686,8 @@ def patch_sweep_status(db: Session, sweep: Sweep, new_status: str) -> Sweep:
     elif new_status == "running":
         sweep.stopped_at = None
     db.flush()
+    if new_status == "stopped":
+        enqueue_importance_refresh(db, sweep.project_id, sweep.id)
     return sweep
 
 

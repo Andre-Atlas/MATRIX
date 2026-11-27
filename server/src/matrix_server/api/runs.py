@@ -558,6 +558,10 @@ def patch_run(
         if run.ended_at is None:
             run.ended_at = utcnow()
         run.status = body.status
+        if body.status == "finished" and run.sweep_id is not None:
+            from matrix_server.sweeps import service as sweep_service
+
+            sweep_service.enqueue_importance_refresh(db, principal.project_id, run.sweep_id)
     if "error" in body.model_fields_set:
         run.error = body.error
     db.commit()

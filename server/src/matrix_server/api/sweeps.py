@@ -118,9 +118,11 @@ def get_sweep(
     request: Request,
     db: DbSession,
     principal: ViewerAuth,
+    limit: Annotated[int, Query(ge=1, le=sweep_service.DETAIL_MAX_LIMIT)] = sweep_service.DETAIL_DEFAULT_LIMIT,
+    offset: Annotated[int, Query(ge=0)] = 0,
 ) -> dict[str, Any]:
     sweep = _get_sweep_or_404(db, principal.project_id, sweep_id)
-    return sweep_service.sweep_detail(db, _store(request), sweep)
+    return sweep_service.sweep_detail(db, _store(request), sweep, limit=limit, offset=offset)
 
 
 @router.post("/{sweep_id}/next")

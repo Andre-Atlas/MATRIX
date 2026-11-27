@@ -610,7 +610,7 @@ def test_dataset_commit_ownership_is_enforced(env):
         s.add_all([ca, cb])
         s.commit()
         ca_id, cb_id = ca.id, cb.id
-    post = lambda body: client.post("/api/v1/sandboxes/runs", headers=env["member_a"], json={"name": "r", **body})  # noqa: E731
+    post = lambda body: client.post("/api/v1/sandboxes/runs", headers=env["member_a"], json={"name": "r", **body})
     foreign = post({"dataset_commit_id": cb_id})
     assert foreign.status_code == 404 and "commit" in foreign.json()["detail"]
     assert post({"dataset_commit_id": "0" * 32}).status_code == 404
