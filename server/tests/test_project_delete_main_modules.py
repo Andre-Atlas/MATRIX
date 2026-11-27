@@ -31,6 +31,10 @@ MAIN_TABLES = {
     "dataset_branches",
     "dataset_commits",
     "dataset_commit_items",
+    "data_sets",
+    "data_set_versions",
+    "data_set_files",
+    "data_set_tags",
     "mlops_artifact_lineage",
     "model_artifacts",
     "artifacts",
@@ -84,6 +88,10 @@ def _populate(client: TestClient, h: dict[str, str]) -> None:
             headers={**h, "x-filename": "w", "content-type": "application/octet-stream", "x-sha256": sha, "x-owner-kind": "run", "x-owner-id": run["id"]},
         )
     )
+    _ok(client.post("/api/v1/data-sets", json={"name": "files"}, headers=h))
+    ver = _ok(client.post("/api/v1/data-sets/files/versions", json={"files": [{"path": "w.bin", "artifact_id": art["id"]}]}, headers=h))
+    _ok(client.put("/api/v1/data-sets/files/tags/gold", json={"version": 1}, headers=h))
+    _ok(client.post("/api/v1/runs", json={"name": "trained", "dataset_version_id": ver["id"]}, headers=h))
     model = _ok(client.post("/api/v1/mlops/models", json={"name": "m"}, headers=h))
     _ok(client.post(f"/api/v1/mlops/models/{model['id']}/versions", json={"run_id": run["id"], "artifact_id": art["id"]}, headers=h))
     _ok(client.post(f"/api/v1/mlops/models/{model['id']}/aliases", json={"alias": "candidate", "version": 1}, headers=h))

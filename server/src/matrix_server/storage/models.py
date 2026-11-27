@@ -880,6 +880,7 @@ class SandboxTaskTranscript(Base):
 # --- Model modules registered here (one import per module, appended by each task) ------------
 # Keeps Base.metadata complete for Alembic and create_all without every task editing this file.
 import matrix_server.artifacts.models
+import matrix_server.data_sets.models
 import matrix_server.egress.models
 import matrix_server.gateway.models
 import matrix_server.mlops.registry_models

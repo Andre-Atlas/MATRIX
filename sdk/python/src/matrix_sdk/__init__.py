@@ -1,5 +1,7 @@
+from . import data_sets
 from .benchmarks import BenchmarksClient
 from .client import MatrixClient, MatrixError, init
+from .data_sets import DataSetsClient
 from .datasets import DatasetsClient
 from .mlops import MatrixTrainerCallback, MLOpsClient, SweepExhausted, TrainingRun
 from .prompts import Prompt
@@ -30,6 +32,7 @@ __version__ = "0.1.0"
 
 __all__ = [
     "BenchmarksClient",
+    "DataSetsClient",
     "DatasetsClient",
     "MLOpsClient",
     "MatrixClient",
@@ -46,6 +49,7 @@ __all__ = [
     "agent",
     "current_run",
     "current_trace_id",
+    "data_sets",
     "finish",
     "init",
     "lineage",

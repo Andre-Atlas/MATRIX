@@ -220,6 +220,7 @@ def test_every_route_is_authenticated_except_the_public_ones(tmp_path):
     assert unguarded == []
     main_prefixes = (
         "benchmarks",
+        "data-sets",
         "datasets",
         "gateway",
         "lineage",
@@ -259,6 +260,7 @@ def test_member_cannot_reach_admin_routes(env):
     assert {
         ("GET", "/api/v1/models/{model_id}/webhooks"),
         ("GET", "/api/v1/mlops/models/{model_id}/webhooks"),
+        ("DELETE", "/api/v1/data-sets/{name}"),
     } <= set(admin_routes)
     for method, path in admin_routes:
         kwargs = {"json": {}} if method in MUTATING else {}
@@ -288,6 +290,7 @@ def test_key_never_reaches_admin_routes(env):
         ("POST", "/api/v1/projects/{project_id}/keys"),
         ("GET", "/api/v1/models/{model_id}/webhooks"),
         ("GET", "/api/v1/mlops/models/{model_id}/webhooks"),
+        ("DELETE", "/api/v1/data-sets/{name}"),
     } <= set(admin_routes)
     for method, path in admin_routes:
         kwargs = {"json": {}} if method in MUTATING else {}

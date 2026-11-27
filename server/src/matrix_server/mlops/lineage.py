@@ -14,6 +14,8 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from matrix_server.artifacts.models import Artifact as BlobArtifact
+from matrix_server.data_sets.models import DataSet as FileDataSet
+from matrix_server.data_sets.models import DataSetVersion
 from matrix_server.runs.models import Run
 from matrix_server.storage.models import (
     ArtifactLineage,
@@ -32,6 +34,7 @@ VALID_NODE_KINDS = frozenset(
     {
         "data_version",
         "dataset_commit",
+        "data_set_version",
         "dataset",
         "run",
         "model_version",
@@ -106,6 +109,13 @@ def node_exists_in_project(db: Session, project_id: str, kind: str, entity_id: s
         if db.scalar(
             select(DatasetCommit.id).where(
                 DatasetCommit.project_id == project_id, DatasetCommit.id == entity_id
+            )
+        ):
+            return True
+    elif kind == "data_set_version":
+        if db.scalar(
+            select(DataSetVersion.id).where(
+                DataSetVersion.project_id == project_id, DataSetVersion.id == entity_id
             )
         ):
             return True
@@ -265,9 +275,26 @@ def _fetch_hop_edges(
                             )
                         ).all()
                     )
+                file_version_ids = (
+                    set(
+                        db.scalars(
+                            select(DataSetVersion.id).where(
+                                DataSetVersion.project_id == project_id,
+                                DataSetVersion.id.in_(list(ds_refs - commit_ids)),
+                            )
+                        ).all()
+                    )
+                    if ds_refs - commit_ids
+                    else set()
+                )
                 for r in runs:
                     if r.dataset_version_id:
-                        src_kind = "dataset_commit" if r.dataset_version_id in commit_ids else "dataset"
+                        if r.dataset_version_id in commit_ids:
+                            src_kind = "dataset_commit"
+                        elif r.dataset_version_id in file_version_ids:
+                            src_kind = "data_set_version"
+                        else:
+                            src_kind = "dataset"
                         edges.append(_make_edge(src_kind, r.dataset_version_id, "run", r.id, "trained_on"))
                     if r.parent_run_id:
                         edges.append(_make_edge("run", r.parent_run_id, "run", r.id, "forked_from"))
@@ -350,7 +377,7 @@ def _fetch_hop_edges(
                     if mv.artifact_id:
                         edges.append(_make_edge("artifact", mv.artifact_id, "model_version", mv.id, "packaged_as"))
 
-    for ds_kind in ("dataset", "dataset_commit", "data_version"):
+    for ds_kind in ("dataset", "dataset_commit", "data_version", "data_set_version"):
         if ds_kind in by_kind and go_down:
             for batch in _chunks(by_kind[ds_kind]):
                 for r in db.scalars(
@@ -360,6 +387,8 @@ def _fetch_hop_edges(
                 ).all():
                     if r.dataset_version_id:
                         edges.append(_make_edge(ds_kind, r.dataset_version_id, "run", r.id, "trained_on"))
+                if ds_kind == "data_set_version":
+                    continue  # benchmarks do not evaluate on file data-sets
                 if ds_kind == "dataset":
                     br_stmt = select(BenchmarkRun).where(
                         BenchmarkRun.project_id == project_id, BenchmarkRun.dataset_id.in_(batch)
@@ -458,6 +487,22 @@ def _enrich_nodes(
             ):
                 commits_by_id[c.id] = c
 
+    file_versions_by_id: dict[str, DataSetVersion] = {}
+    file_sets_by_id: dict[str, FileDataSet] = {}
+    if "data_set_version" in ids_by_kind:
+        for batch in _chunks(ids_by_kind["data_set_version"]):
+            for dv in db.scalars(
+                select(DataSetVersion).where(
+                    DataSetVersion.project_id == project_id, DataSetVersion.id.in_(batch)
+                )
+            ):
+                file_versions_by_id[dv.id] = dv
+        for batch in _chunks({dv.data_set_id for dv in file_versions_by_id.values()}):
+            for fds in db.scalars(
+                select(FileDataSet).where(FileDataSet.project_id == project_id, FileDataSet.id.in_(batch))
+            ):
+                file_sets_by_id[fds.id] = fds
+
     runs_by_id: dict[str, Run] = {}
     if "run" in ids_by_kind:
         for batch in _chunks(ids_by_kind["run"]):
@@ -545,6 +590,18 @@ def _enrich_nodes(
             c = commits_by_id[nid]
             label = f"commit:{c.id[:8]}"
             meta = {"dataset_id": c.dataset_id, "message": c.message, "item_count": c.item_count}
+        elif ntype == "data_set_version" and nid in file_versions_by_id:
+            dv = file_versions_by_id[nid]
+            fds = file_sets_by_id.get(dv.data_set_id)
+            label = f"{fds.name if fds else dv.data_set_id} v{dv.version}"
+            meta = {
+                "data_set_id": dv.data_set_id,
+                "data_set": fds.name if fds else None,
+                "version": dv.version,
+                "file_count": dv.file_count,
+                "total_bytes": dv.total_bytes,
+                "manifest_sha256": dv.manifest_sha256,
+            }
         elif ntype == "run" and nid in runs_by_id:
             r = runs_by_id[nid]
             label = r.name

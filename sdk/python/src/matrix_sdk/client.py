@@ -22,6 +22,7 @@ from .prompts import Prompt
 
 if TYPE_CHECKING:
     from .benchmarks import BenchmarksClient
+    from .data_sets import DataSetsClient
     from .datasets import DatasetsClient
     from .mlops import MLOpsClient
     from .registry import RegistryClient
@@ -79,6 +80,7 @@ class MatrixClient:
         self._benchmarks: BenchmarksClient | None = None
         self._sandboxes: SandboxesClient | None = None
         self._datasets: DatasetsClient | None = None
+        self._data_sets: DataSetsClient | None = None
 
     # -- lifecycle
     def shutdown(self) -> None:
@@ -225,6 +227,17 @@ class MatrixClient:
 
                     self._datasets = DatasetsClient(self)
         return self._datasets
+
+    # -- file data-sets (G3 section 2)
+    @property
+    def data_sets(self) -> DataSetsClient:
+        if self._data_sets is None:
+            with self._lock:
+                if self._data_sets is None:
+                    from .data_sets import DataSetsClient
+
+                    self._data_sets = DataSetsClient(self)
+        return self._data_sets
 
     # -- benchmarks
     @property

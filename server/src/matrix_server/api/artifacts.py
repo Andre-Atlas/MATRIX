@@ -57,6 +57,7 @@ from matrix_server.artifacts.service import (
     store_stream,
 )
 from matrix_server.auth import Principal, Role, require
+from matrix_server.data_sets import service as data_set_service
 from matrix_server.storage.db import as_utc, get_db, utcnow
 
 DbSession = Annotated[Session, Depends(get_db)]
@@ -470,6 +471,11 @@ def delete_artifact(artifact_id: str, request: Request, principal: Member, db: D
     artifact = _load(db, principal, artifact_id)
     pid, sha, pending = artifact.project_id, artifact.sha256, artifact.status == "pending"
     lock_blob(db, pid, sha)
+    lock_quota(db, pid)  # data-set versions are created under this lock (data_sets.service)
+    if db.scalar(
+        select(Artifact.id).where(Artifact.project_id == pid, Artifact.sha256 == sha, Artifact.id != artifact.id).limit(1)
+    ) is None and data_set_service.blob_in_use(db, pid, sha):
+        raise HTTPException(status_code=409, detail="artifact content is part of a data-set version")
     audit.record(
         db,
         action="artifact.delete",
