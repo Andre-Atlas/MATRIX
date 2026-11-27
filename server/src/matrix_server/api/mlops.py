@@ -542,58 +542,145 @@ def create_model(
     return _model_out(model)
 
 
+MODEL_CARD_EXCERPT_CHARS = 280
+MODELS_DEFAULT_LIMIT = 200
+VERSIONS_DEFAULT_LIMIT = 50
+VERSIONS_MAX_LIMIT = 200
+
+
+def _excerpt(text: str | None) -> tuple[str | None, bool]:
+    if text is None or len(text) <= MODEL_CARD_EXCERPT_CHARS:
+        return text, False
+    return text[:MODEL_CARD_EXCERPT_CHARS], True
+
+
 @router.get("/models")
-def list_models(db: DbSession, principal: ViewerAuth) -> dict[str, Any]:
+def list_models(
+    db: DbSession,
+    principal: ViewerAuth,
+    limit: Annotated[int, Query(ge=1, le=MAX_PAGE)] = MODELS_DEFAULT_LIMIT,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict[str, Any]:
+    """Models page (`limit`/`offset`, newest update first) with a per-model summary.
+
+    Only version numbers, stages and the latest metrics are read (never full model cards); the
+    latest card comes back as a short excerpt (`latest_model_card_excerpt`), the full card is in
+    `GET /models/{id}` or `GET /models/{id}/versions/{version}`.
+    """
     models = list(
         db.scalars(
             select(RegisteredModel)
             .where(RegisteredModel.project_id == principal.project_id)
-            .order_by(RegisteredModel.updated_at.desc())
+            .order_by(RegisteredModel.updated_at.desc(), RegisteredModel.id.desc())
+            .limit(limit + 1)
+            .offset(offset)
         )
     )
-    versions = list(
-        db.scalars(
-            select(ModelVersion)
-            .where(ModelVersion.project_id == principal.project_id)
-            .order_by(ModelVersion.version.desc())
+    next_offset = offset + limit if len(models) > limit else None
+    models = models[:limit]
+    model_ids = [m.id for m in models]
+
+    version_rows = (
+        db.execute(
+            select(ModelVersion.model_id, ModelVersion.version, ModelVersion.stage).where(
+                ModelVersion.project_id == principal.project_id, ModelVersion.model_id.in_(model_ids)
+            )
+        ).all()
+        if model_ids
+        else []
+    )
+    versions_by_model: dict[str, list[tuple[int, str]]] = {}
+    for model_id, version, stage in version_rows:
+        versions_by_model.setdefault(model_id, []).append((version, stage))
+
+    latest_by_model: dict[str, int] = {mid: max(v for v, _ in vs) for mid, vs in versions_by_model.items()}
+    # `version IN (...)` can also match another model's number; the (model, version) key filters it.
+    latest_rows = (
+        db.execute(
+            select(
+                ModelVersion.model_id,
+                ModelVersion.version,
+                ModelVersion.metrics_snapshot,
+                func.substr(ModelVersion.model_card, 1, MODEL_CARD_EXCERPT_CHARS + 1),
+            ).where(
+                ModelVersion.project_id == principal.project_id,
+                ModelVersion.model_id.in_(list(latest_by_model)),
+                ModelVersion.version.in_(sorted(set(latest_by_model.values()))),
+            )
+        ).all()
+        if latest_by_model
+        else []
+    )
+    latest_by_key = {(r[0], r[1]): (r[2], r[3]) for r in latest_rows}
+    latest_info: dict[str, tuple[dict[str, Any], str | None]] = {}
+    for mid, ver in latest_by_model.items():
+        metrics, card = latest_by_key.get((mid, ver), ({}, None))
+        latest_info[mid] = (dict(metrics or {}), card)
+
+    aliases = (
+        list(
+            db.scalars(
+                select(ModelAlias).where(
+                    ModelAlias.project_id == principal.project_id, ModelAlias.model_id.in_(model_ids)
+                )
+            )
         )
+        if model_ids
+        else []
     )
-    aliases = list(
-        db.scalars(select(ModelAlias).where(ModelAlias.project_id == principal.project_id))
-    )
-
-    versions_by_model: dict[str, list[ModelVersion]] = {}
-    for mv in versions:
-        versions_by_model.setdefault(mv.model_id, []).append(mv)
-
     aliases_by_model: dict[str, dict[str, int]] = {}
     for al in aliases:
         aliases_by_model.setdefault(al.model_id, {})[al.alias] = al.version
 
     items: list[dict[str, Any]] = []
     for m in models:
-        mvs = versions_by_model.get(m.id, [])
-        latest = mvs[0] if mvs else None
+        mvs = sorted(versions_by_model.get(m.id, []), reverse=True)
         stages: dict[str, list[int]] = {}
-        for mv in mvs:
-            stages.setdefault(mv.stage, []).append(mv.version)
+        for ver, stage in mvs:
+            stages.setdefault(stage, []).append(ver)
+        metrics, card = latest_info.get(m.id, ({}, None))
+        card_excerpt, truncated = _excerpt(card)
         item = _model_out(m)
-        item["latest_version"] = latest.version if latest else None
+        item["latest_version"] = mvs[0][0] if mvs else None
         item["aliases"] = dict(sorted(aliases_by_model.get(m.id, {}).items()))
         item["stages"] = stages
-        item["latest_metrics"] = dict(latest.metrics_snapshot or {}) if latest else {}
+        item["latest_metrics"] = metrics
+        item["latest_model_card_excerpt"] = card_excerpt
+        item["latest_model_card_truncated"] = truncated
         items.append(item)
-    return {"items": items}
+    return {"items": items, "next_offset": next_offset}
 
 
 @router.get("/models/{model_id}")
-def get_model(model_id: str, db: DbSession, principal: ViewerAuth) -> dict[str, Any]:
+def get_model(
+    model_id: str,
+    db: DbSession,
+    principal: ViewerAuth,
+    versions_limit: Annotated[int, Query(ge=1, le=VERSIONS_MAX_LIMIT)] = VERSIONS_DEFAULT_LIMIT,
+    versions_offset: Annotated[int, Query(ge=0)] = 0,
+    model_card: Annotated[Literal["full", "excerpt"], Query()] = "full",
+) -> dict[str, Any]:
+    """Model detail with a page of versions (newest first, `versions_limit`/`versions_offset`).
+
+    `model_card=excerpt` trims each version's card to a short excerpt; `GET
+    /models/{id}/versions/{version}` always returns the full card.
+    """
     model = _get_model_or_404(db, principal.project_id, model_id)
+    total = int(
+        db.scalar(
+            select(func.count(ModelVersion.id)).where(
+                ModelVersion.project_id == principal.project_id, ModelVersion.model_id == model.id
+            )
+        )
+        or 0
+    )
     versions = list(
         db.scalars(
             select(ModelVersion)
             .where(ModelVersion.project_id == principal.project_id, ModelVersion.model_id == model.id)
             .order_by(ModelVersion.version.desc())
+            .limit(versions_limit)
+            .offset(versions_offset)
         )
     )
     aliases = list(
@@ -602,9 +689,23 @@ def get_model(model_id: str, db: DbSession, principal: ViewerAuth) -> dict[str, 
         )
     )
     out = _model_out(model)
-    out["versions"] = [_version_out(v) for v in versions]
+    version_items = [_version_out(v) for v in versions]
+    if model_card == "excerpt":
+        for item in version_items:
+            item["model_card"], item["model_card_truncated"] = _excerpt(item["model_card"])
+    out["versions"] = version_items
+    out["versions_total"] = total
+    next_versions = versions_offset + len(versions)
+    out["versions_next_offset"] = next_versions if next_versions < total else None
     out["aliases"] = {a.alias: a.version for a in sorted(aliases, key=lambda x: x.alias)}
     return out
+
+
+@router.get("/models/{model_id}/versions/{version}")
+def get_model_version(model_id: str, version: int, db: DbSession, principal: ViewerAuth) -> dict[str, Any]:
+    """One version with its full model card."""
+    model = _get_model_or_404(db, principal.project_id, model_id)
+    return _version_out(_get_model_version_or_404(db, principal.project_id, model.id, version))
 
 
 @router.delete("/models/{model_id}")

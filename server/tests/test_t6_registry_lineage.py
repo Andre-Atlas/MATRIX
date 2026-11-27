@@ -1261,3 +1261,44 @@ def test_dataset_merge_and_revert_respect_item_cap(env):
     assert reverted.status_code == 422, reverted.text
     ok = client.post(f"/api/v1/datasets/{ds}/revert", headers=m, json={"branch": "main", "target_commit_id": base})
     assert ok.status_code == 201, ok.text
+
+
+def test_model_list_and_detail_are_paginated_and_card_is_excerpted(env):
+    client: TestClient = env["client"]
+    m, v = env["member_a"], env["viewer_a"]
+    big_card = "# Card\n" + "x" * 5000
+    ids = [_create_model(client, m, f"l8-page-{i}")["id"] for i in range(3)]
+    for n in range(1, 4):
+        _create_version(client, m, ids[0], model_card=big_card if n == 3 else "short", metrics_snapshot={"acc": n})
+    _create_version(client, m, ids[1], model_card="ok")
+
+    listing = client.get("/api/v1/mlops/models", headers=v).json()
+    assert len(listing["items"]) == 3 and listing["next_offset"] is None
+    by_id = {i["id"]: i for i in listing["items"]}
+    first = by_id[ids[0]]
+    assert first["latest_version"] == 3 and first["latest_metrics"] == {"acc": 3}
+    assert first["stages"] == {"none": [3, 2, 1]}
+    assert first["latest_model_card_truncated"] is True
+    assert len(first["latest_model_card_excerpt"]) == 280  # never the 5 kB card
+    assert by_id[ids[1]]["latest_model_card_excerpt"] == "ok" and by_id[ids[1]]["latest_model_card_truncated"] is False
+    assert by_id[ids[2]]["latest_version"] is None and by_id[ids[2]]["latest_model_card_excerpt"] is None
+    assert "model_card" not in first and "versions" not in first
+
+    p1 = client.get("/api/v1/mlops/models", headers=v, params={"limit": 2}).json()
+    p2 = client.get("/api/v1/mlops/models", headers=v, params={"limit": 2, "offset": 2}).json()
+    assert (len(p1["items"]), p1["next_offset"], len(p2["items"]), p2["next_offset"]) == (2, 2, 1, None)
+    assert {i["id"] for i in p1["items"] + p2["items"]} == set(ids)
+
+    detail = client.get(f"/api/v1/mlops/models/{ids[0]}", headers=v, params={"versions_limit": 2}).json()
+    assert [x["version"] for x in detail["versions"]] == [3, 2]
+    assert detail["versions_total"] == 3 and detail["versions_next_offset"] == 2
+    assert len(detail["versions"][0]["model_card"]) == len(big_card)
+    rest = client.get(f"/api/v1/mlops/models/{ids[0]}", headers=v, params={"versions_limit": 2, "versions_offset": 2}).json()
+    assert [x["version"] for x in rest["versions"]] == [1] and rest["versions_next_offset"] is None
+    short = client.get(f"/api/v1/mlops/models/{ids[0]}", headers=v, params={"model_card": "excerpt"}).json()
+    assert short["versions"][0]["model_card_truncated"] is True and len(short["versions"][0]["model_card"]) == 280
+    one = client.get(f"/api/v1/mlops/models/{ids[0]}/versions/3", headers=v).json()
+    assert one["model_card"] == big_card
+    assert client.get(f"/api/v1/mlops/models/{ids[0]}/versions/9", headers=v).status_code == 404
+    assert client.get(f"/api/v1/mlops/models/{ids[0]}/versions/3", headers=env["admin_b"]).status_code == 404
+    assert client.get("/api/v1/mlops/models", headers=v, params={"limit": 0}).status_code == 422
