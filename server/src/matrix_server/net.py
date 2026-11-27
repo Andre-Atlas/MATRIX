@@ -46,10 +46,11 @@ def _no_proxy_pattern(entry: str) -> str | None:
 
 
 def proxy_mounts(
-    environ: Mapping[str, str] | None = None, *, verify: Any = True
-) -> dict[str, httpx.BaseTransport | None] | None:
+    environ: Mapping[str, str] | None = None, *, verify: Any = True, transport_cls: type = httpx.HTTPTransport
+) -> dict[str, Any] | None:
     """httpx `mounts` equivalent to the environment's proxy settings. None means "no proxy at all"
-    (NO_PROXY=*). Hosts in NO_PROXY map to None, i.e. the client's own direct transport."""
+    (NO_PROXY=*). Hosts in NO_PROXY map to None, i.e. the client's own direct transport.
+    `transport_cls` is `httpx.AsyncHTTPTransport` for an `httpx.AsyncClient`."""
     environ = os.environ if environ is None else environ
     no_proxy = _get(environ, "no_proxy")
     if no_proxy == "*":
@@ -61,7 +62,7 @@ def proxy_mounts(
         if proxy:
             if "://" not in proxy:
                 proxy = f"http://{proxy}"
-            mounts[f"{scheme}://"] = httpx.HTTPTransport(proxy=proxy, verify=verify)
+            mounts[f"{scheme}://"] = transport_cls(proxy=proxy, verify=verify)
     if not mounts:
         return None
     for entry in no_proxy.split(","):
@@ -83,3 +84,16 @@ def client_kwargs(transport: httpx.BaseTransport | None = None) -> dict[str, Any
     # trust_env=False also stops httpx reading SSL_CERT_FILE/SSL_CERT_DIR: build that context here.
     verify: ssl.SSLContext = httpx.create_ssl_context(trust_env=True)
     return {"trust_env": False, "verify": verify, "mounts": proxy_mounts(verify=verify)}
+
+
+def async_client_kwargs(transport: httpx.AsyncBaseTransport | None = None) -> dict[str, Any]:
+    """`client_kwargs` for `httpx.AsyncClient`: the environment's proxy read explicitly (sanitised
+    NO_PROXY, never httpx's own `trust_env` parsing), or a custom `transport` (tests) as is."""
+    if transport is not None:
+        return {"transport": transport, "trust_env": False}
+    verify: ssl.SSLContext = httpx.create_ssl_context(trust_env=True)
+    return {
+        "trust_env": False,
+        "verify": verify,
+        "mounts": proxy_mounts(verify=verify, transport_cls=httpx.AsyncHTTPTransport),
+    }
