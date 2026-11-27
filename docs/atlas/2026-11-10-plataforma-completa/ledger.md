@@ -90,3 +90,10 @@ Formato: `T<n> · [tag] · C<n> → modelo/esforço (papel)`.
 - Ruling: 3 testes do SDK que dependem de `libomp.dylib` (xgboost/lightgbm) ficam como falha de ambiente macOS, não de código.
 - Cota dos subagentes esgotou durante as correções; Workers 1/3/4/5 foram concluídos pelo orquestrador (testes quebrados corrigidos, verificação completa refeita).
 - Auditoria T12: 5 CRITICAL + 17 HIGH confirmados e corrigidos; 23 MEDIUM + 4 LOW adiados (docs/atlas/2026-11-17-reconciliacao/audit-final.md).
+
+## Ciclo 3 — tudo local (2026-11-27)
+
+- Estado de partida: `main` `82643fe` (PR #1 e #2 mesclados, T1–T13 do Antigravity); `ff98b61` (commit da sessão antes dos cabeçalhos HTTP), que ficou só em `feat/reconciliacao-t5-t13`, foi trazido por cherry-pick.
+- Pedido do usuário: pendências da auditoria + motores reais + validação de infra + recursos adiados, com a restrição **tudo local, sem gasto com deploy ou sistemas**, prioritária sobre as demais desde que a qualidade não caia demais, mantendo o propósito de unificar os frameworks.
+- Gate 1 aprovado: `docs/atlas/2026-11-27-ciclo-local/plan.md` (L1–L12).
+- Ruling: Ollama local como servidor de modelo único (qwen2.5:0.5b, all-minilm, moondream, CPU) para gateway, lm-eval, VLMEvalKit, Inspect AI, embeddings e safety; exceção de egress só para `MATRIX_LOCAL_MODEL_ENDPOINTS` fixados pelo operador — custo: números de benchmark em CPU/0,5B só provam o motor, não comparam modelos.
