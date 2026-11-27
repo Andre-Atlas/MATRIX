@@ -574,3 +574,92 @@ def test_rbac_and_multitenant_isolation(client_env):
         headers=viewer_auth,
     )
     assert post_rev.status_code == 403
+
+
+def test_diff_commits_is_sql_paginated_with_exact_stats(session):
+    ds = Dataset(project_id="p1", name="big_diff")
+    session.add(ds)
+    session.flush()
+    base_items = [{"item_key": f"k{i:03d}", "input": {"v": i}} for i in range(30)]
+    c1 = commit_changes(session, "p1", ds.id, "main", "base", changes={"upsert": base_items})
+    changes = {
+        "upsert": [{"item_key": f"k{i:03d}", "input": {"v": i + 1000}} for i in range(10)]  # 10 modified
+        + [{"item_key": f"n{i:03d}", "input": {"v": i}} for i in range(15)],  # 15 added
+        "delete": [f"k{i:03d}" for i in range(20, 30)],  # 10 removed
+    }
+    c2 = commit_changes(session, "p1", ds.id, "main", "next", changes=changes)
+
+    full = diff_commits(session, "p1", ds.id, c1.id, c2.id)
+    assert full["stats"] == {"added": 15, "removed": 10, "modified": 10}
+    assert full["truncated"] is False and full["next_cursor"] is None
+    assert full["added"] == [f"n{i:03d}" for i in range(15)]
+
+    seen: dict[str, list[str]] = {"added": [], "removed": [], "modified": []}
+    cursor, pages = None, 0
+    while True:
+        page = diff_commits(session, "p1", ds.id, c1.id, c2.id, limit=8, after=cursor)
+        pages += 1
+        assert page["stats"] == full["stats"]  # exact totals on every page
+        assert sum(len(page[k]) for k in seen) <= 8
+        for k in seen:
+            seen[k] += page[k]
+        cursor = page["next_cursor"]
+        if cursor is None:
+            break
+    assert pages == 5  # 35 keys / 8
+    assert {k: sorted(v) for k, v in seen.items()} == {k: full[k] for k in seen}
+
+    from_empty = diff_commits(session, "p1", ds.id, None, c1.id)
+    assert from_empty["stats"] == {"added": 30, "removed": 0, "modified": 0}
+
+
+def test_find_lca_reads_only_ancestors_not_the_whole_dataset(session):
+    from sqlalchemy import event
+
+    from matrix_server.storage.models import DatasetCommit
+
+    ds = Dataset(project_id="p1", name="lca_ds")
+    session.add(ds)
+    session.flush()
+
+    def mk(cid, p1=None, p2=None):
+        session.add(
+            DatasetCommit(
+                id=cid, project_id="p1", dataset_id=ds.id, parent_commit_id=p1, second_parent_commit_id=p2,
+                tree_hash="h", message="m",
+            )
+        )
+
+    mk("root")
+    mk("base", "root")
+    mk("a1", "base")
+    mk("b1", "base")
+    mk("a2", "a1")
+    mk("m", "a1", "b1")  # merge: a1 and b1 both ancestors
+    mk("x", "m")
+    mk("y", "b1")
+    for i in range(300):  # unrelated history that must not be read
+        mk(f"z{i:03d}", f"z{i - 1:03d}" if i else None)
+    session.flush()
+
+    assert find_lca(session, ds.id, "a2", "b1") == "base"
+    assert find_lca(session, ds.id, "x", "y") == "b1"  # lowest, not base/root
+    assert find_lca(session, ds.id, "a2", "z010") is None
+    assert find_lca(session, ds.id, "x", "x") == "x"
+
+    fetched: list[int] = []
+
+    def count_rows(conn, cursor, statement, params, context, executemany):
+        fetched.append(1)
+
+    event.listen(session.get_bind(), "before_cursor_execute", count_rows)
+    try:
+        find_lca(session, ds.id, "x", "y")
+    finally:
+        event.remove(session.get_bind(), "before_cursor_execute", count_rows)
+    assert 0 < len(fetched) <= 12  # batched per BFS level, not per commit, and not O(all commits)
+
+    from matrix_server.datasets.versioning import LcaLimitError
+
+    with pytest.raises(LcaLimitError):
+        find_lca(session, ds.id, "z299", "z298", max_ancestors=50)

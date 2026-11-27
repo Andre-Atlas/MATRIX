@@ -8,7 +8,7 @@ import re
 import secrets
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
 from matrix_server.storage.models import (
@@ -415,6 +415,9 @@ def commit_changes(
 
 # --- Diff Operations ------------------------------------------------------
 
+DIFF_DEFAULT_LIMIT = 1000
+DIFF_MAX_LIMIT = 10_000
+
 
 def diff_commits(
     session: Session,
@@ -422,8 +425,16 @@ def diff_commits(
     dataset_id: str,
     base_commit_id: str | None,
     head_commit_id: str,
+    *,
+    limit: int = DIFF_DEFAULT_LIMIT,
+    after: str | None = None,
 ) -> dict[str, Any]:
-    """Compare items between base_commit_id and head_commit_id."""
+    """Compare items between base_commit_id and head_commit_id, computed in SQL.
+
+    Exact counts are in `stats`; the key lists hold at most `limit` keys (<= DIFF_MAX_LIMIT) in
+    ascending `item_key` order across the three lists, starting after `after`. When more keys remain,
+    `truncated` is true and `next_cursor` is the `after` for the next page.
+    """
     ds = session.scalars(
         select(Dataset).where(Dataset.id == dataset_id, Dataset.project_id == project_id)
     ).first()
@@ -440,11 +451,6 @@ def diff_commits(
     if head_commit is None:
         raise CommitNotFoundError(f"Head commit '{head_commit_id}' not found")
 
-    head_items = session.scalars(
-        select(DatasetCommitItem).where(DatasetCommitItem.commit_id == head_commit_id)
-    ).all()
-    head_map = {it.item_key: it.content_hash for it in head_items}
-
     if base_commit_id:
         base_commit = session.scalars(
             select(DatasetCommit).where(
@@ -455,32 +461,117 @@ def diff_commits(
         ).first()
         if base_commit is None:
             raise CommitNotFoundError(f"Base commit '{base_commit_id}' not found")
-        base_items = session.scalars(
-            select(DatasetCommitItem).where(DatasetCommitItem.commit_id == base_commit_id)
-        ).all()
-        base_map = {it.item_key: it.content_hash for it in base_items}
-    else:
-        base_map = {}
 
-    added = sorted(k for k in head_map if k not in base_map)
-    removed = sorted(k for k in base_map if k not in head_map)
-    modified = sorted(k for k in head_map if k in base_map and base_map[k] != head_map[k])
+    limit = max(1, min(int(limit), DIFF_MAX_LIMIT))
+    head = DatasetCommitItem.__table__.alias("h")
+    base = DatasetCommitItem.__table__.alias("b")
+    empty_base = not base_commit_id
+    base_id = base_commit_id or ""
 
+    def _keys(kind: str, count: bool):
+        """Anti/inner joins in SQL: only keys (never items) leave the database."""
+        if kind == "added":
+            sel = select(head.c.item_key).where(head.c.commit_id == head_commit_id)
+            if not empty_base:
+                sel = sel.where(
+                    ~select(base.c.id)
+                    .where(base.c.commit_id == base_id, base.c.item_key == head.c.item_key)
+                    .exists()
+                )
+            key_col = head.c.item_key
+        elif kind == "removed":
+            if empty_base:
+                return None
+            sel = select(base.c.item_key).where(base.c.commit_id == base_id)
+            sel = sel.where(
+                ~select(head.c.id)
+                .where(head.c.commit_id == head_commit_id, head.c.item_key == base.c.item_key)
+                .exists()
+            )
+            key_col = base.c.item_key
+        else:
+            if empty_base:
+                return None
+            sel = select(head.c.item_key).join(
+                base,
+                and_(base.c.commit_id == base_id, base.c.item_key == head.c.item_key),
+            ).where(head.c.commit_id == head_commit_id, base.c.content_hash != head.c.content_hash)
+            key_col = head.c.item_key
+        if count:
+            return sel.with_only_columns(func.count()).order_by(None)
+        if after is not None:
+            sel = sel.where(key_col > after)
+        return sel.order_by(key_col).limit(limit + 1)  # one extra row tells whether more remain
+
+    stats: dict[str, int] = {}
+    page: dict[str, list[str]] = {"added": [], "removed": [], "modified": []}
+    for kind in ("added", "removed", "modified"):
+        count_q = _keys(kind, count=True)
+        stats[kind] = int(session.scalar(count_q) or 0) if count_q is not None else 0
+        rows_q = _keys(kind, count=False)
+        if rows_q is not None:
+            page[kind] = list(session.scalars(rows_q))
+
+    # Merge the three sorted streams and keep the first `limit` keys overall (keyset pagination).
+    tagged = sorted((k, kind) for kind, ks in page.items() for k in ks[:limit])
+    more = len(tagged) > limit or any(len(ks) > limit for ks in page.values())
+    kept = tagged[:limit]
+    out: dict[str, list[str]] = {"added": [], "removed": [], "modified": []}
+    for k, kind in kept:
+        out[kind].append(k)
+    next_cursor = kept[-1][0] if kept and more else None
     return {
         "base_commit_id": base_commit_id,
         "head_commit_id": head_commit_id,
-        "added": added,
-        "removed": removed,
-        "modified": modified,
-        "stats": {
-            "added": len(added),
-            "removed": len(removed),
-            "modified": len(modified),
-        },
+        "added": out["added"],
+        "removed": out["removed"],
+        "modified": out["modified"],
+        "stats": stats,
+        "truncated": next_cursor is not None,
+        "next_cursor": next_cursor,
     }
 
 
 # --- Lowest Common Ancestor (LCA) -----------------------------------------
+
+
+class LcaLimitError(ValueError):
+    """Raised when a commit history is too large to resolve the common ancestor within the cap."""
+
+
+LCA_MAX_ANCESTORS = 100_000
+LCA_BATCH = 500
+
+
+def _collect_ancestors(
+    session: Session, dataset_id: str, root_id: str, parents: dict[str, list[str]], max_ancestors: int
+) -> set[str]:
+    """Ancestors of `root_id` (inclusive) by batched BFS; `parents` caches the rows already read."""
+    seen: set[str] = {root_id}
+    frontier = [root_id]
+    while frontier:
+        missing = [c for c in frontier if c not in parents]
+        for i in range(0, len(missing), LCA_BATCH):
+            chunk = missing[i : i + LCA_BATCH]
+            rows = session.execute(
+                select(DatasetCommit.id, DatasetCommit.parent_commit_id, DatasetCommit.second_parent_commit_id).where(
+                    DatasetCommit.dataset_id == dataset_id, DatasetCommit.id.in_(chunk)
+                )
+            ).all()
+            for cid, p1, p2 in rows:
+                parents[cid] = [p for p in (p1, p2) if p]
+            for cid in chunk:
+                parents.setdefault(cid, [])
+        nxt: list[str] = []
+        for c in frontier:
+            for p in parents.get(c, []):
+                if p not in seen:
+                    seen.add(p)
+                    nxt.append(p)
+        if len(seen) > max_ancestors:
+            raise LcaLimitError(f"commit history exceeds {max_ancestors} ancestors")
+        frontier = nxt
+    return seen
 
 
 def find_lca(
@@ -488,55 +579,29 @@ def find_lca(
     dataset_id: str,
     commit_a_id: str | None,
     commit_b_id: str | None,
+    *,
+    max_ancestors: int = LCA_MAX_ANCESTORS,
 ) -> str | None:
-    """Find the Lowest Common Ancestor (LCA) traversing commit parents."""
+    """Find the Lowest Common Ancestor (LCA) traversing commit parents.
+
+    Reads only the ancestors of the two commits (batched BFS, capped at `max_ancestors` per side)
+    instead of every commit of the dataset, and picks the lowest common ancestors in O(V + E):
+    a common ancestor is lowest when it is not a parent of another common ancestor.
+    """
     if not commit_a_id or not commit_b_id:
         return None
     if commit_a_id == commit_b_id:
         return commit_a_id
 
-    rows = session.execute(
-        select(DatasetCommit.id, DatasetCommit.parent_commit_id, DatasetCommit.second_parent_commit_id).where(
-            DatasetCommit.dataset_id == dataset_id
-        )
-    ).all()
-
-    parents_map: dict[str, list[str]] = {}
-    for cid, p1, p2 in rows:
-        parents: list[str] = []
-        if p1:
-            parents.append(p1)
-        if p2:
-            parents.append(p2)
-        parents_map[cid] = parents
-
-    def get_ancestors(root_id: str) -> set[str]:
-        seen = set()
-        stack = [root_id]
-        while stack:
-            curr = stack.pop()
-            if curr in seen:
-                continue
-            seen.add(curr)
-            for p in parents_map.get(curr, []):
-                if p not in seen:
-                    stack.append(p)
-        return seen
-
-    ancestors_a = get_ancestors(commit_a_id)
-    ancestors_b = get_ancestors(commit_b_id)
+    parents: dict[str, list[str]] = {}
+    ancestors_a = _collect_ancestors(session, dataset_id, commit_a_id, parents, max_ancestors)
+    ancestors_b = _collect_ancestors(session, dataset_id, commit_b_id, parents, max_ancestors)
     common = ancestors_a & ancestors_b
     if not common:
         return None
-
-    # Eliminate any node that is an ancestor of another node in common
-    candidates = set(common)
-    for node in common:
-        for p in parents_map.get(node, []):
-            if p in candidates:
-                candidates -= get_ancestors(p)
-
-    return next(iter(candidates)) if candidates else None
+    covered = {p for node in common for p in parents.get(node, [])}
+    candidates = common - covered
+    return min(candidates) if candidates else None
 
 
 # --- Merge Operations -----------------------------------------------------

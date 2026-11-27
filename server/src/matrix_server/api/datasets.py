@@ -17,6 +17,8 @@ from sqlalchemy.orm import Session
 
 from matrix_server.auth import Principal, Role, project_of, require
 from matrix_server.datasets.versioning import (
+    DIFF_DEFAULT_LIMIT,
+    DIFF_MAX_LIMIT,
     BranchExistsError,
     BranchNotFoundError,
     CommitItemLimitError,
@@ -718,8 +720,10 @@ def diff_route(
     principal: ViewerAuth,
     base: str = Query(...),
     head: str = Query(...),
+    limit: Annotated[int, Query(ge=1, le=DIFF_MAX_LIMIT)] = DIFF_DEFAULT_LIMIT,
+    cursor: str | None = Query(default=None, max_length=200),
 ) -> dict[str, Any]:
-    """Diff items between two commits or branch heads."""
+    """Diff items between two commits or branch heads (key lists paginated by `limit`/`cursor`)."""
     get_dataset_or_404(db, principal.project_id, dataset_id)
 
     def resolve_commit_id(ref: str) -> str:
@@ -755,6 +759,8 @@ def diff_route(
             dataset_id=dataset_id,
             base_commit_id=base_commit_id,
             head_commit_id=head_commit_id,
+            limit=limit,
+            after=cursor,
         )
     except (DatasetNotFoundError, CommitNotFoundError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
